@@ -12,13 +12,15 @@ let package = Package(
             targets: ["SwiftUIDownloads"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/L1MeN9Yu/Elva.git", branch: "main"),
+//        .package(url: "https://github.com/L1MeN9Yu/Elva.git", branch: "main"),
+        .package(url: "https://github.com/NghiaTranUIT/Brotli.git", branch: "master"),
     ],
     targets: [
         .target(
             name: "SwiftUIDownloads",
             dependencies: [
-                .product(name: "Brotli", package: "Elva"), // Only needed for iOS 15 Brotli (somehow missing in simulator at least)
+//                .product(name: "Brotli", package: "Elva"), // Only needed for iOS 15 Brotli (somehow missing in simulator at least)
+                .product(name: "Brotli", package: "Brotli"), // Only needed for iOS 15 Brotli (somehow missing in simulator at least)
             ]),
 //        .testTarget(
 //            name: "SwiftUIDownloadsTests",

@@ -71,20 +71,17 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         task.publisher.receive(on: DispatchQueue.main).sink(receiveCompletion: { [weak self] completion in
             switch completion {
             case .failure(let error):
-            print("PUB fail")
                 self?.isFailed = true
                 self?.isFinishedDownloading = false
                 self?.isActive = false
                 self?.downloadProgress = .completed(destinationLocation: nil, error: error)
             case .finished:
-            print("PUB fin")
                 self?.lastDownloaded = Date()
                 self?.isFailed = false
                 self?.isActive = false
                 self?.isFinishedDownloading = true
             }
         }, receiveValue: { [weak self] progress in
-            print("PUB val \(progress)")
             self?.isActive = true
             self?.downloadProgress = progress
             switch progress {
@@ -113,13 +110,28 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
             // TODO: When dropping iOS 15, switch to native Apple Brotli
             //            let decompressed = try data.decompressed(from: COMPRESSION_BROTLI)
             
-            let decompressConfig = Brotli.DecompressConfig.default
-            let inputMemory = BufferedMemoryStream(startData: data)
-            let decompressMemory = BufferedMemoryStream()
-            try Brotli.decompress(reader: inputMemory, writer: decompressMemory, config: decompressConfig)
-            let decompressed = decompressMemory.representation
+            if data.isEmpty {
+                print("Data is empty for \(compressedFileURL)")
+                do {
+                    try FileManager.default.removeItem(at: compressedFileURL)
+                } catch {
+                    print("Error removing compressedFileURL \(compressedFileURL) \(error.localizedDescription)")
+                }
+                return
+            }
             
-            try decompressed.write(to: localDestination, options: .atomic)
+            let nsData = NSData(data: data)
+            if #available(iOS 16.1, macOS 13.1, *) {
+                let decompressed = try data.decompressed(from: COMPRESSION_BROTLI)
+                try decompressed.write(to: localDestination, options: .atomic)
+            } else {
+                guard let decompressed = nsData.brotliDecompressed() else {
+                    print("Error decompressing \(compressedFileURL.path)")
+                    return
+                }
+                try decompressed.write(to: localDestination, options: .atomic)
+            }
+            
             do {
                 try FileManager.default.removeItem(at: compressedFileURL)
             } catch {
@@ -132,14 +144,18 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
 }
 
 public extension Downloadable {
-    convenience init?(name: String, groupIdentifier: String, parentDirectoryName: String, filename: String? = nil, downloadMirrors: [URL]) {
+    convenience init?(name: String, groupIdentifier: String? = nil, parentDirectoryName: String, filename: String? = nil, downloadMirrors: [URL]) {
         guard let url = downloadMirrors.first else { return nil }
 //        let filename = filename ?? url.lastPathComponent.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? url.lastPathComponent
         let filename = filename ?? url.lastPathComponent
-        guard let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) else { return nil }
+        var containerURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        
+        if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
+            containerURL = sharedContainerURL
+        }
 
-        let folderURL = sharedContainerURL
-            .appendingPathComponent(parentDirectoryName, isDirectory: true)
+        guard let folderURL = containerURL?
+            .appendingPathComponent(parentDirectoryName, isDirectory: true) else { return nil }
         // TODO: macos 13+:   Downloadable(url: URL(string: "https://manabi.io/static/dictionaries/furigana.realm.br")!, mirrorURL: nil, name: "Furigana Data", localDestination: folderURL.appending(component: "furigana.realm")),
         self.init(url: url, mirrorURL: downloadMirrors.dropFirst().first, name: name, localDestination: folderURL.appendingPathComponent(filename))
     }
@@ -155,10 +171,12 @@ public extension Downloadable {
 public class DownloadController: NSObject, ObservableObject {
     public static var shared: DownloadController = {
         let controller = DownloadController()
-        Task.detached { [weak controller] in
-            if #available(macOS 13.0, iOS 16.1, *) {
-                BADownloadManager.shared.delegate = controller
-            } else { }
+        if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
+            Task.detached { [weak controller] in
+                if #available(macOS 13.0, iOS 16.1, *) {
+                    BADownloadManager.shared.delegate = controller
+                } else { }
+            }
         }
         return controller
     }()
@@ -268,24 +286,26 @@ extension DownloadController {
                 return
             }
             
-            if #available(macOS 13, iOS 16.1, *) {
-                Task.detached {
-                    do {
-                        if let baDL = download.backgroundAssetDownload(applicationGroupIdentifier: "group.io.manabi.shared"), try await BADownloadManager.shared.currentDownloads.contains(baDL) {
-                            if #available(iOS 16.4, macOS 13.3, *) {
-                                if !baDL.isEssential {
+            if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
+                if #available(macOS 13, iOS 16.1, *) {
+                    Task.detached {
+                        do {
+                            if let baDL = download.backgroundAssetDownload(applicationGroupIdentifier: "group.io.manabi.shared"), try await BADownloadManager.shared.currentDownloads.contains(baDL) {
+                                if #available(iOS 16.4, macOS 13.3, *) {
+                                    if !baDL.isEssential {
+                                        try BADownloadManager.shared.startForegroundDownload(baDL)
+                                    }
+                                } else {
                                     try BADownloadManager.shared.startForegroundDownload(baDL)
                                 }
-                            } else {
-                                try BADownloadManager.shared.startForegroundDownload(baDL)
+                                return
                             }
-                            return
+                        } catch {
+                            print("Unable to download background asset...")
                         }
-                    } catch {
-                        print("Unable to download background asset...")
                     }
-                }
-            } else { }
+                } else { }
+            }
             
             download.isFromBackgroundAssetsDownloader = false
             Task { @MainActor in
@@ -365,6 +385,7 @@ extension DownloadController {
                 completion(false, nil)
                 return
             }
+
             if modifiedDate > download.lastDownloaded ?? Date(timeIntervalSince1970: 0) {
                 completion(true, modifiedDate)
                 return
@@ -439,16 +460,18 @@ extension DownloadController: BADownloadManagerDelegate {
                 failedDownloads.insert(downloadable)
             }
         }
-        Task { @MainActor in
-            do {
-                if #available(iOS 16.4, macOS 13.3, *) {
-                    if !download.isEssential {
+        if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
+            Task { @MainActor in
+                do {
+                    if #available(iOS 16.4, macOS 13.3, *) {
+                        if !download.isEssential {
+                            try BADownloadManager.shared.startForegroundDownload(download)
+                        }
+                    } else {
                         try BADownloadManager.shared.startForegroundDownload(download)
                     }
-                } else {
-                    try BADownloadManager.shared.startForegroundDownload(download)
-                }
-            } catch { }
+                } catch { }
+            }
         }
     }
 }
