@@ -321,10 +321,12 @@ extension DownloadController {
                 task.cancel()
             }
         }
-        if inDownloadExtension {
-            if #available(iOS 16.1, macOS 13, *) {
-                for download in try await BADownloadManager.shared.currentDownloads {
-                    try BADownloadManager.shared.cancel(download)
+        if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
+            if inDownloadExtension {
+                if #available(iOS 16.1, macOS 13, *) {
+                    for download in try await BADownloadManager.shared.currentDownloads {
+                        try BADownloadManager.shared.cancel(download)
+                    }
                 }
             }
         }
