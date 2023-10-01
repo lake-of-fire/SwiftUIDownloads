@@ -412,6 +412,7 @@ extension DownloadController {
             
             if let etag = httpURLResponse.allHeaderFields["Etag"] as? String, etag != download.lastDownloadedETag {
                 completion(true, nil, httpURLResponse.allHeaderFields["Etag"] as? String)
+                return
             }
             
             completion(false, nil, httpURLResponse.allHeaderFields["Etag"] as? String)
