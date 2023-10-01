@@ -28,6 +28,19 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         hasher.combine(id)
     }
     
+    public var lastDownloadedETag: String? {
+        get {
+            return UserDefaults.standard.object(forKey: "fileLastDownloadedETag:\(url.absoluteString)") as? String
+        }
+        set {
+            if let newValue = newValue {
+                UserDefaults.standard.set(newValue, forKey: "fileLastDownloadedETag:\(url.absoluteString)")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "fileLastDownloadedETag:\(url.absoluteString)")
+            }
+        }
+    }
+    
     public var lastDownloaded: Date? {
         get {
             return UserDefaults.standard.object(forKey: "fileLastDownloadedDate:\(url.absoluteString)") as? Date
@@ -223,10 +236,10 @@ extension DownloadController {
         Task.detached { [weak self] in
             if download.existsLocally() {
                 self?.finishDownload(download)
-                self?.checkFileModifiedAt(download: download) { [weak self] modified, _ in
+                self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
                     if modified {
                         Task { @MainActor [weak self] in
-                            self?.download(download)
+                            self?.download(download, etag: etag)
                         }
                     }
                 }
@@ -240,7 +253,7 @@ extension DownloadController {
     }
     
     @MainActor
-    public func download(_ download: Downloadable) {
+    public func download(_ download: Downloadable, etag: String? = nil) {
         download.$isActive.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] isActive in
             if isActive {
                 self?.activeDownloads.insert(download)
@@ -271,7 +284,7 @@ extension DownloadController {
                 }
                 if let download = download {
                     Task.detached { [weak self] in
-                        self?.finishDownload(download)
+                        self?.finishDownload(download, etag: etag)
                     }
                 }
             } else if let download = download {
@@ -332,7 +345,7 @@ extension DownloadController {
         }
     }
     
-    public func finishDownload(_ download: Downloadable) {
+    public func finishDownload(_ download: Downloadable, etag: String? = nil) {
         do {
             try download.decompressIfNeeded()
 
@@ -340,6 +353,8 @@ extension DownloadController {
             let resourceValues = try download.localDestination.resourceValues(forKeys: [.fileSizeKey])
             guard let fileSize = resourceValues.fileSize, fileSize > 0 else {
                 Task { @MainActor [weak self] in
+                    download.lastDownloadedETag = etag ?? download.lastDownloadedETag
+                    
                     self?.activeDownloads.remove(download)
                     self?.finishedDownloads.remove(download)
                     self?.failedDownloads.insert(download)
@@ -367,32 +382,39 @@ extension DownloadController {
     
     /// Checks if file at given URL is modified.
     /// Using "Last-Modified" header value to compare it with given date.
-    func checkFileModifiedAt(download: Downloadable, completion: @escaping (Bool, Date?) -> Void) {
+    func checkFileModifiedAt(download: Downloadable, completion: @escaping (Bool, Date?, String?) -> Void) {
         var request = URLRequest(url: download.url)
         request.httpMethod = "HEAD"
         URLSession.shared.dataTask(with: request, completionHandler: { (_, response, error) in
             guard let httpURLResponse = response as? HTTPURLResponse,
                   httpURLResponse.statusCode == 200,
-                  let modifiedDateString = httpURLResponse.allHeaderFields["Last-Modified"] as? String,
                   error == nil else {
-                completion(false, nil)
+                completion(false, nil, nil)
                 return
             }
-            let dateFormatter = DateFormatter()
-            dateFormatter.locale = Locale(identifier: "en_US_POSIX")
-            dateFormatter.dateStyle = .medium
-            dateFormatter.timeStyle = .long
-            dateFormatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-            guard let modifiedDate = dateFormatter.date(from: modifiedDateString) else {
-                completion(false, nil)
-                return
+            
+            if let modifiedDateString = httpURLResponse.allHeaderFields["Last-Modified"] as? String {
+                let dateFormatter = DateFormatter()
+                dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+                dateFormatter.dateStyle = .medium
+                dateFormatter.timeStyle = .long
+                dateFormatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+                guard let modifiedDate = dateFormatter.date(from: modifiedDateString) else {
+                    completion(false, nil, httpURLResponse.allHeaderFields["Etag"] as? String)
+                    return
+                }
+                
+                if modifiedDate > download.lastDownloaded ?? Date(timeIntervalSince1970: 0) {
+                    completion(true, modifiedDate, httpURLResponse.allHeaderFields["Etag"] as? String)
+                    return
+                }
             }
-
-            if modifiedDate > download.lastDownloaded ?? Date(timeIntervalSince1970: 0) {
-                completion(true, modifiedDate)
-                return
+            
+            if let etag = httpURLResponse.allHeaderFields["Etag"] as? String, etag != download.lastDownloadedETag {
+                completion(true, nil, httpURLResponse.allHeaderFields["Etag"] as? String)
             }
-            completion(false, nil)
+            
+            completion(false, nil, httpURLResponse.allHeaderFields["Etag"] as? String)
         }).resume()
     }
 }
