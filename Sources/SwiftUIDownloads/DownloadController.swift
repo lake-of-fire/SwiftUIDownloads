@@ -227,6 +227,21 @@ public extension DownloadController {
             ensureDownloaded(download: download)
         }
     }
+    
+    @MainActor
+    func isDownloaded(url: URL) -> Bool {
+        return finishedDownloads.map { $0.url }.contains(url)
+    }
+    
+    @MainActor
+    func isDownloading(url: URL) -> Bool {
+        return activeDownloads.map { $0.url }.contains(url)
+    }
+    
+    @MainActor
+    func isFailed(url: URL) -> Bool {
+        return failedDownloads.map { $0.url }.contains(url)
+    }
 }
 
 extension DownloadController {
