@@ -242,6 +242,11 @@ public extension DownloadController {
     func isFailed(url: URL) -> Bool {
         return failedDownloads.map { $0.url }.contains(url)
     }
+    
+    @MainActor
+    func downloadable(forURL url: URL) -> Downloadable? {
+        return finishedDownloads.first(where: { $0.url == url }) ?? activeDownloads.first(where: { $0.url == url }) ?? failedDownloads.first(where: { $0.url == url }) ?? assuredDownloads.first(where: { $0.url == url })
+    }
 }
 
 extension DownloadController {
