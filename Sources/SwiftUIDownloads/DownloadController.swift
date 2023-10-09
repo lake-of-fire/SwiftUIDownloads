@@ -354,6 +354,18 @@ extension DownloadController {
         }
     }
     
+    public func cancelInProgressDownloads(matchingDownloadURL downloadURL: URL? = nil) async throws {
+        let allTasks = await URLSession.shared.allTasks
+        for task in allTasks.filter({ task in assuredDownloads.contains(where: {
+            if let downloadURL = downloadURL, $0.url != downloadURL {
+                return false
+            }
+            return $0.localDestination.absoluteString == (task.taskDescription ?? "")
+        }) }) {
+            task.cancel()
+        }
+    }
+    
     func cancelInProgressDownloads(inApp: Bool = false, inDownloadExtension: Bool = false) async throws {
         if inApp {
             let allTasks = await URLSession.shared.allTasks
@@ -361,8 +373,8 @@ extension DownloadController {
                 task.cancel()
             }
         }
-        if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
-            if inDownloadExtension {
+        if inDownloadExtension {
+            if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
                 if #available(iOS 16.1, macOS 13, *) {
                     for download in try await BADownloadManager.shared.currentDownloads {
                         try BADownloadManager.shared.cancel(download)
