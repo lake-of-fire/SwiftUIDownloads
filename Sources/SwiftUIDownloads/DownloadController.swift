@@ -6,6 +6,8 @@ import BackgroundAssets
 import Brotli
 
 public class Downloadable: ObservableObject, Identifiable, Hashable {
+    public static var groupIdentifier: String? = nil
+    
     public let url: URL
     let mirrorURL: URL?
     public let name: String
@@ -163,7 +165,7 @@ public extension Downloadable {
         let filename = filename ?? url.lastPathComponent
         var containerURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         
-        if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
+        if let groupIdentifier = groupIdentifier ?? Self.groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
             containerURL = sharedContainerURL
         }
 
@@ -176,7 +178,8 @@ public extension Downloadable {
 
 @available(macOS 13.0, iOS 16.1, *)
 public extension Downloadable {
-    func backgroundAssetDownload(applicationGroupIdentifier: String) -> BAURLDownload? {
+    func backgroundAssetDownload(applicationGroupIdentifier: String? = nil) -> BAURLDownload? {
+        guard let applicationGroupIdentifier = applicationGroupIdentifier ?? Self.groupIdentifier else { return nil }
         return BAURLDownload(identifier: localDestination.absoluteString, request: URLRequest(url: url), applicationGroupIdentifier: applicationGroupIdentifier, priority: .max)
     }
 }
