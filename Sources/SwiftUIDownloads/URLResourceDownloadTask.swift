@@ -34,6 +34,20 @@ public enum URLResourceDownloadTaskProgress { //}: Equatable, CustomStringConver
     case waitingForResponse
     case downloading(progress: Progress)
     case completed(destinationLocation: URL?, error: Error?)
+    
+    public var fractionCompleted: Double {
+        switch self {
+        case .uninitiated:
+            return 0
+        case .waitingForResponse:
+            return 0
+        case .downloading(let progress):
+            return progress.fractionCompleted
+        case .completed(_, let error):
+            guard error == nil else { return 0 }
+            return 1
+        }
+    }
 }
 
 public protocol URLResourceDownloadTaskProtocol {

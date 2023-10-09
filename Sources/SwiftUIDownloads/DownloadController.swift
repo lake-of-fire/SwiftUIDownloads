@@ -30,6 +30,10 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         hasher.combine(id)
     }
     
+    public var fractionCompleted: Double {
+        return downloadProgress.fractionCompleted
+    }
+    
     public var lastDownloadedETag: String? {
         get {
             return UserDefaults.standard.object(forKey: "fileLastDownloadedETag:\(url.absoluteString)") as? String
