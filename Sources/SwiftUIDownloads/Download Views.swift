@@ -180,7 +180,7 @@ public struct DownloadIndicatorView: View {
         } label: {
             if #available(macOS 13, iOS 16, *) {
                 Gauge(value: progress, in: 0...1.0) {
-                    Text("Download Progress")
+                    Text("Download Progress") // included for a11y
                 } currentValueLabel: {
                     Image(systemName: "stop.fill")
                         .renderingMode(.template)
