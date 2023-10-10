@@ -37,9 +37,9 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                 print(error)
                 return error.localizedDescription
             }
-        default:
-            EmptyView()
+        default: break
         }
+        return nil
     }
 
     public var fractionCompleted: Double {
