@@ -5,6 +5,20 @@ import Compression
 import BackgroundAssets
 import Brotli
 
+fileprivate func errorDescription(from error: Error) -> String {
+    let nsError = error as NSError
+    if let urlError = error as? URLError {
+        return urlError.localizedDescription
+    } else if let httpResponse = nsError.userInfo[NSUnderlyingErrorKey] as? HTTPURLResponse {
+        let statusCode = httpResponse.statusCode
+        let statusCodeString = HTTPURLResponse.localizedString(forStatusCode: statusCode)
+        let responseBody = nsError.userInfo[NSLocalizedDescriptionKey] as? String ?? ""
+        return "HTTP Status Code: \(statusCode) - \(statusCodeString)\nResponse Body: \(responseBody)"
+    } else {
+        return "Unknown Error"
+    }
+}
+
 public class Downloadable: ObservableObject, Identifiable, Hashable {
     public static var groupIdentifier: String? = nil
     
@@ -35,7 +49,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         case .completed(_, let error):
             if let error = error {
                 print(error)
-                return error.localizedDescription
+                return errorDescription(from: error)
             }
         default: break
         }
