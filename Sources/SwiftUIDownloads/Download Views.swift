@@ -171,20 +171,18 @@ public struct ActiveDownloadsBox: View {
 }
 
 public struct DownloadProgressView: View {
-    public var size: CGFloat // Size parameter for circle, path, and stop image
-    public var progress: Float
-    public var action: () async -> Void
+    private let size: CGFloat // Size parameter for circle, path, and stop image
+    @ObservedObject private var downloadable: Downloadable
 
-    public init(size: CGFloat, progress: Float, action: @escaping () async -> Void) {
+    public init(size: CGFloat, downloadable: Downloadable) {
         self.size = size
-        self.progress = progress
-        self.action = action
+        self.downloadable = downloadable
     }
 
     public var body: some View {
         Button(action: {
             Task {
-                await action()
+                await DownloadController.shared.cancelInProgressDownloads(matchingDownloadURL: downloadable.url)
             }
         }) {
             ZStack {
@@ -198,7 +196,7 @@ public struct DownloadProgressView: View {
 
                 Path { path in
                     let startAngle = Angle(degrees: 0)
-                    let endAngle = Angle(degrees: Double(360 * min(progress, 1.0)))
+                    let endAngle = Angle(degrees: Double(360 * min(downloadable.fractionCompleted, 1.0)))
                     path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
                 }
                 .stroke(style: StrokeStyle(lineWidth: size / 10, lineCap: .round, lineJoin: .round))
