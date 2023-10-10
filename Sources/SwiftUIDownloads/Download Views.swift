@@ -208,7 +208,7 @@ public struct DownloadProgressView: View {
                 Image(systemName: "stop.fill")
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .padding(6)
+                    .padding(8)
             }
             .frame(width: size, height: size) // Use the size parameter
         }
