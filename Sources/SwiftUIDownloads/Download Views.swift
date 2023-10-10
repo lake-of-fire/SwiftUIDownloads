@@ -169,3 +169,28 @@ public struct ActiveDownloadsBox: View {
         self.title = title
     }
 }
+
+public struct DownloadIndicatorView: View {
+    public let progress: Double
+    public let stopAction: () async throws -> Void
+    
+    public var body: some View {
+        Button {
+            Task { try? await stopAction() }
+        } label: {
+            ProgressView(value: progress) {
+                Image("stop")
+                    .renderingMode(.template)
+                    .foregroundColor(.primary)
+            }
+//            .progressViewStyle(.circular)
+            .progressViewStyle(CircularProgressViewStyle(tint: .accentColor))
+            .controlSize(.small)
+        }
+    }
+    
+    public init(progress: Double, stopAction: @escaping () async throws -> Void) {
+        self.progress = progress
+        self.stopAction = stopAction
+    }
+}
