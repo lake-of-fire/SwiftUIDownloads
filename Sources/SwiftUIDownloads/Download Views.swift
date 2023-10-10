@@ -184,14 +184,17 @@ public struct DownloadIndicatorView: View {
                 } currentValueLabel: {
                     Image(systemName: "stop.fill")
                         .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
                         .foregroundColor(.primary)
                 }
                 .gaugeStyle(.accessoryCircularCapacity)
                 .tint(.accentColor)
-                .controlSize(.small)
             } else {
                 Image(systemName: "stop.fill")
                     .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
                     .foregroundColor(.primary)
             }
         }
