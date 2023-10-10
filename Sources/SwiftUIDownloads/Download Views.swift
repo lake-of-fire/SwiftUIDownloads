@@ -170,7 +170,7 @@ public struct ActiveDownloadsBox: View {
     }
 }
 
-public struct DownloadProgressIndicator: View {
+public struct DownloadProgressView: View {
     public var size: CGFloat // Size parameter for circle, path, and stop image
     public var progress: Float
     public var action: () async -> Void
