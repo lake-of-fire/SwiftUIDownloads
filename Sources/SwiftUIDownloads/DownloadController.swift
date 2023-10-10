@@ -242,7 +242,7 @@ public class DownloadController: NSObject, ObservableObject {
 public extension DownloadController {
     @MainActor
     var failureMessages: [String]? {
-        return failedDownloads.isEmpty ? nil : Array(failedDownloads).sorted(using: [KeyPathComparator(\.url)]).compactMap { $0.failureMessage }
+        return failedDownloads.isEmpty ? nil : Array(failedDownloads).sorted(using: [KeyPathComparator(\.url.absoluteString)]).compactMap { $0.failureMessage }
     }
     
     @MainActor
