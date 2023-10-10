@@ -170,11 +170,17 @@ public struct ActiveDownloadsBox: View {
     }
 }
 
-public struct DownloadProgressView: View {
-    var size: CGFloat // Size parameter for circle, path, and stop image
-    var progress: Float
-    var action: () async -> Void
-    
+public struct DownloadProgressIndicator: View {
+    public var size: CGFloat // Size parameter for circle, path, and stop image
+    public var progress: Float
+    public var action: () async -> Void
+
+    public init(size: CGFloat, progress: Float, action: @escaping () async -> Void) {
+        self.size = size
+        self.progress = progress
+        self.action = action
+    }
+
     public var body: some View {
         Button(action: {
             Task {
@@ -183,32 +189,29 @@ public struct DownloadProgressView: View {
         }) {
             ZStack {
                 Circle()
-                    .stroke(Color.gray, lineWidth: size / 10)
+                    .stroke(Color.gray, lineWidth: size / 10) // Set the stroke color and width
                     .frame(width: size, height: size) // Use the size parameter
-                
+
                 Path { path in
                     let startAngle = Angle(degrees: 0)
                     let endAngle = Angle(degrees: Double(360 * min(progress, 1.0)))
-                    
-                    path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: size / 2 - 5, startAngle: startAngle, endAngle: endAngle, clockwise: false)
+
+                    // Adjust the radius to match the stroked circle size
+                    let radius = size / 2 - size / 20
+                    path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
                 }
                 .stroke(style: StrokeStyle(lineWidth: size / 10, lineCap: .round, lineJoin: .round))
                 .foregroundColor(.accentColor)
                 .frame(width: size, height: size) // Use the size parameter
                 .rotationEffect(Angle(degrees: -90))
                 .animation(.linear)
-                
+
                 Image(systemName: "stop.fill")
                     .resizable()
                     .frame(width: size * 0.2, height: size * 0.2) // Use a fraction of the size parameter
+                    .foregroundColor(.white)
+                    .background(Color.red)
             }
-            .frame(width: size, height: size) // Use the size parameter
         }
-    }
-    
-    public init(size: CGFloat, progress: Float, action: @escaping () async -> Void) {
-        self.size = size
-        self.progress = progress
-        self.action = action
     }
 }
