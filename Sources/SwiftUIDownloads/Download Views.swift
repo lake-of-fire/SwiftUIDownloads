@@ -202,6 +202,7 @@ public struct DownloadProgressView: View {
                     .resizable()
                     .frame(width: size * 0.2, height: size * 0.2) // Use a fraction of the size parameter
             }
+            .frame(width: size, height: size) // Use the size parameter
         }
     }
     
