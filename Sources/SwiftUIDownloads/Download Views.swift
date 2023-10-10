@@ -175,7 +175,7 @@ public struct DownloadProgressView: View {
     var progress: Float
     var action: () async -> Void
     
-    var body: some View {
+    public var body: some View {
         Button(action: {
             Task {
                 await action()
@@ -203,5 +203,11 @@ public struct DownloadProgressView: View {
                     .frame(width: size * 0.2, height: size * 0.2) // Use a fraction of the size parameter
             }
         }
+    }
+    
+    public init(size: CGFloat, progress: Float, action: @escaping () -> Void) {
+        self.size = size
+        self.progress = progress
+        self.action = action
     }
 }
