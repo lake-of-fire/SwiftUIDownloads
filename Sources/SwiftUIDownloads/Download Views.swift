@@ -172,6 +172,7 @@ public struct ActiveDownloadsBox: View {
 
 public struct DownloadIndicatorView: View {
     public let progress: Double
+    public let scale: Double
     public let stopAction: () async throws -> Void
     
     public var body: some View {
@@ -187,6 +188,7 @@ public struct DownloadIndicatorView: View {
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .foregroundColor(.primary)
+                        .scaleEffect(scale)
                 }
                 .gaugeStyle(.accessoryCircularCapacity)
                 .tint(.accentColor)
@@ -196,12 +198,14 @@ public struct DownloadIndicatorView: View {
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .foregroundColor(.primary)
+                    .scaleEffect(scale)
             }
         }
     }
     
-    public init(progress: Double, stopAction: @escaping () async throws -> Void) {
+    public init(progress: Double, scale: Double = 0.5, stopAction: @escaping () async throws -> Void) {
         self.progress = progress
+        self.scale = scale
         self.stopAction = stopAction
     }
 }
