@@ -19,6 +19,20 @@ fileprivate func errorDescription(from error: Error) -> String {
     }
 }
 
+fileprivate extension Array where Element: Hashable {
+    func removingDuplicates() -> [Element] {
+        var addedDict = [Element: Bool]()
+
+        return filter {
+            addedDict.updateValue(true, forKey: $0) == nil
+        }
+    }
+
+    mutating func removeDuplicates() {
+        self = self.removingDuplicates()
+    }
+}
+
 public class Downloadable: ObservableObject, Identifiable, Hashable {
     public static var groupIdentifier: String? = nil
     
@@ -256,7 +270,7 @@ public class DownloadController: NSObject, ObservableObject {
 public extension DownloadController {
     @MainActor
     var failureMessages: [String]? {
-        return failedDownloads.isEmpty ? nil : Array(failedDownloads).sorted(using: [KeyPathComparator(\.url.absoluteString)]).compactMap { $0.failureMessage }
+        return failedDownloads.isEmpty ? nil : Array(failedDownloads).sorted(using: [KeyPathComparator(\.url.absoluteString)]).compactMap { $0.failureMessage }.removingDuplicates()
     }
     
     @MainActor
