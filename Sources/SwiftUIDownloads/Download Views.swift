@@ -171,9 +171,9 @@ public struct ActiveDownloadsBox: View {
 }
 
 fileprivate struct DownloadProgressView: View {
-    var progress: Float
     var action: () async -> Void
     var size: CGFloat // Size parameter for circle, path, and stop image
+    var progress: Float
     
     var body: some View {
         Button(action: {
@@ -183,7 +183,7 @@ fileprivate struct DownloadProgressView: View {
         }) {
             ZStack {
                 Circle()
-                    .stroke(Color.gray, lineWidth: size / 10)
+                    .stroke(Color.gray, lineWidth: 10)
                     .frame(width: size, height: size) // Use the size parameter
                 
                 Path { path in
@@ -192,7 +192,7 @@ fileprivate struct DownloadProgressView: View {
                     
                     path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: size / 2 - 5, startAngle: startAngle, endAngle: endAngle, clockwise: false)
                 }
-                .stroke(style: StrokeStyle(lineWidth: size / 10, lineCap: .round, lineJoin: .round))
+                .stroke(style: StrokeStyle(lineWidth: 10, lineCap: .round, lineJoin: .round))
                 .foregroundColor(.accentColor)
                 .frame(width: size, height: size) // Use the size parameter
                 .rotationEffect(Angle(degrees: -90))
@@ -201,8 +201,8 @@ fileprivate struct DownloadProgressView: View {
                 Image(systemName: "stop.fill")
                     .resizable()
                     .frame(width: size * 0.2, height: size * 0.2) // Use a fraction of the size parameter
-                    //.foregroundColor(.white)
-//                    .background(Color.red)
+                    .foregroundColor(.white)
+                    .background(Color.red)
             }
         }
     }
