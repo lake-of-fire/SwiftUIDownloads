@@ -180,18 +180,25 @@ public struct DownloadIndicatorView: View {
             Task { try? await stopAction() }
         } label: {
             if #available(macOS 13, iOS 16, *) {
-                Gauge(value: progress, in: 0...1.0) {
-                    Text("Download Progress") // included for a11y
-                } currentValueLabel: {
-                    Image(systemName: "stop.fill")
-                        .renderingMode(.template)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .foregroundColor(.primary)
+                ZStack {
+                    Spacer()
                 }
-                .gaugeStyle(.accessoryCircularCapacity)
-                .tint(.accentColor)
-                .scaleEffect(scale)
+                .overlay {
+                    Gauge(value: progress, in: 0...1.0) {
+                        Text("Download Progress") // included for a11y
+                    } currentValueLabel: {
+                        Image(systemName: "stop.fill")
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .foregroundColor(.primary)
+                            .padding(6)
+                    }
+                    .gaugeStyle(.accessoryCircularCapacity)
+                    .tint(.accentColor)
+                    .scaleEffect(scale)
+                    .clipped()
+                }
             } else {
                 Image(systemName: "stop.fill")
                     .renderingMode(.template)
