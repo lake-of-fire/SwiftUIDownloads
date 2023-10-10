@@ -241,6 +241,11 @@ public class DownloadController: NSObject, ObservableObject {
 
 public extension DownloadController {
     @MainActor
+    var failureMessages: [String]? {
+        return failedDownloads.isEmpty ? nil : failedDownloads.compactMap { $0.failureMessage }
+    }
+    
+    @MainActor
     func ensureDownloaded(_ downloads: Set<Downloadable>) {
         for download in downloads {
             ensureDownloaded(download: download)
