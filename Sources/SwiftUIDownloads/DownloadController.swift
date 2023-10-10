@@ -30,6 +30,18 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         hasher.combine(id)
     }
     
+    public var failureMessage: String? {
+        switch downloadProgress {
+        case .completed(_, let error):
+            if let error = error {
+                print(error)
+                return error.localizedDescription
+            }
+        default:
+            EmptyView()
+        }
+    }
+
     public var fractionCompleted: Double {
         return downloadProgress.fractionCompleted
     }
