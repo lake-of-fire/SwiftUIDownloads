@@ -188,16 +188,17 @@ public struct DownloadProgressView: View {
             }
         }) {
             ZStack {
-                Circle()
-                    .stroke(Color.gray, lineWidth: size / 10) // Set the stroke color and width
-                    .frame(width: size, height: size) // Use the size parameter
+                let radius = size / 2 - size / 20
+                Path { path in
+                    path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: Angle(degrees: 0), endAngle: Angle(degrees: 360), clockwise: false)
+                }
+                .stroke(style: StrokeStyle(lineWidth: size / 10, lineCap: .round, lineJoin: .round))
+                .foregroundColor(.gray)
+                .frame(width: size, height: size) // Use the size parameter
 
                 Path { path in
                     let startAngle = Angle(degrees: 0)
                     let endAngle = Angle(degrees: Double(360 * min(progress, 1.0)))
-
-                    // Adjust the radius to match the stroked circle size
-                    let radius = size / 2 - size / 20
                     path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
                 }
                 .stroke(style: StrokeStyle(lineWidth: size / 10, lineCap: .round, lineJoin: .round))
@@ -209,8 +210,6 @@ public struct DownloadProgressView: View {
                 Image(systemName: "stop.fill")
                     .resizable()
                     .frame(width: size * 0.2, height: size * 0.2) // Use a fraction of the size parameter
-                    .foregroundColor(.white)
-                    .background(Color.red)
             }
         }
     }
