@@ -206,7 +206,7 @@ public struct DownloadProgressView: View {
         }
     }
     
-    public init(size: CGFloat, progress: Float, action: @escaping () -> Void) {
+    public init(size: CGFloat, progress: Float, action: @escaping () async -> Void) {
         self.size = size
         self.progress = progress
         self.action = action
