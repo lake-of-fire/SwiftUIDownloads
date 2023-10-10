@@ -170,49 +170,40 @@ public struct ActiveDownloadsBox: View {
     }
 }
 
-public struct DownloadIndicatorView: View {
-    public let progress: Double
-    public let scale: Double
-    public let stopAction: () async throws -> Void
+fileprivate struct DownloadProgressView: View {
+    var progress: Float
+    var action: () async -> Void
+    var size: CGFloat // Size parameter for circle, path, and stop image
     
-    public var body: some View {
-        Button {
-            Task { try? await stopAction() }
-        } label: {
-            if #available(macOS 13, iOS 16, *) {
-                ZStack {
-                    Spacer()
+    var body: some View {
+        Button(action: {
+            Task {
+                await action()
+            }
+        }) {
+            ZStack {
+                Circle()
+                    .stroke(Color.gray, lineWidth: size / 10)
+                    .frame(width: size, height: size) // Use the size parameter
+                
+                Path { path in
+                    let startAngle = Angle(degrees: 0)
+                    let endAngle = Angle(degrees: Double(360 * min(progress, 1.0)))
+                    
+                    path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: size / 2 - 5, startAngle: startAngle, endAngle: endAngle, clockwise: false)
                 }
-                .overlay {
-                    Gauge(value: progress, in: 0...1.0) {
-                        Text("Download Progress") // included for a11y
-                    } currentValueLabel: {
-                        Image(systemName: "stop.fill")
-                            .renderingMode(.template)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .foregroundColor(.primary)
-                            .padding(6)
-                    }
-                    .gaugeStyle(.accessoryCircularCapacity)
-                    .tint(.accentColor)
-                    .scaleEffect(scale)
-                    .clipped()
-                }
-            } else {
+                .stroke(style: StrokeStyle(lineWidth: size / 10, lineCap: .round, lineJoin: .round))
+                .foregroundColor(.accentColor)
+                .frame(width: size, height: size) // Use the size parameter
+                .rotationEffect(Angle(degrees: -90))
+                .animation(.linear)
+                
                 Image(systemName: "stop.fill")
-                    .renderingMode(.template)
                     .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .foregroundColor(.primary)
-                    .scaleEffect(scale)
+                    .frame(width: size * 0.2, height: size * 0.2) // Use a fraction of the size parameter
+                    //.foregroundColor(.white)
+//                    .background(Color.red)
             }
         }
-    }
-    
-    public init(progress: Double, scale: Double = 0.5, stopAction: @escaping () async throws -> Void) {
-        self.progress = progress
-        self.scale = scale
-        self.stopAction = stopAction
     }
 }
