@@ -8,7 +8,60 @@ import Brotli
 fileprivate func errorDescription(from error: Error) -> String {
     let nsError = error as NSError
     if let urlError = error as? URLError {
-        return urlError.localizedDescription
+        switch urlError.code {
+        case .unknown:
+            return "Unknown Error"
+        case .cancelled:
+            return "Request Cancelled"
+        case .badURL:
+            return "Bad URL"
+        case .timedOut:
+            return "Request Timed Out"
+        case .unsupportedURL:
+            return "Unsupported URL"
+        case .cannotFindHost:
+            return "Cannot Find Host"
+        case .cannotConnectToHost:
+            return "Cannot Connect To Host"
+        case .networkConnectionLost:
+            return "Network Connection Lost"
+        case .dnsLookupFailed:
+            return "DNS Lookup Failed"
+        case .httpTooManyRedirects:
+            return "Too Many Redirects"
+        case .resourceUnavailable:
+            return "Resource Unavailable"
+        case .notConnectedToInternet:
+            return "Not Connected To Internet"
+        case .redirectToNonExistentLocation:
+            return "Redirect To Non-Existent Location"
+        case .badServerResponse:
+            return "Bad Server Response"
+        case .userCancelledAuthentication:
+            return "User Cancelled Authentication"
+        case .userAuthenticationRequired:
+            return "User Authentication Required"
+        case .zeroByteResource:
+            return "Zero Byte Resource"
+        case .cannotDecodeRawData:
+            return "Cannot Decode Raw Data"
+        case .cannotDecodeContentData:
+            return "Cannot Decode Content Data"
+        case .cannotParseResponse:
+            return "Cannot Parse Response"
+        case .appTransportSecurityRequiresSecureConnection:
+            return "App Transport Security Requires Secure Connection"
+        case .fileDoesNotExist:
+            return "File Does Not Exist"
+        case .fileIsDirectory:
+            return "File Is Directory"
+        case .noPermissionsToReadFile:
+            return "No Permissions To Read File"
+        case .dataLengthExceedsMaximum:
+            return "Data Length Exceeds Maximum"
+        default:
+            return urlError.localizedDescription
+        }
     } else if let httpResponse = nsError.userInfo[NSUnderlyingErrorKey] as? HTTPURLResponse {
         let statusCode = httpResponse.statusCode
         let statusCodeString = HTTPURLResponse.localizedString(forStatusCode: statusCode)
