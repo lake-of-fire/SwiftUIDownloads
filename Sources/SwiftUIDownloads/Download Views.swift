@@ -178,14 +178,22 @@ public struct DownloadIndicatorView: View {
         Button {
             Task { try? await stopAction() }
         } label: {
-            ProgressView(value: progress) {
-                Image(systemName: "stop")
+            if #available(macOS 13, iOS 16, *) {
+                Gauge(value: progress, in: 0...1.0) {
+                    Text("Download Progress")
+                } currentValueLabel: {
+                    Image(systemName: "stop.fill")
+                        .renderingMode(.template)
+                        .foregroundColor(.primary)
+                }
+                .gaugeStyle(.accessoryCircularCapacity)
+                .tint(.accentColor)
+                .controlSize(.small)
+            } else {
+                Image(systemName: "stop.fill")
                     .renderingMode(.template)
                     .foregroundColor(.primary)
             }
-//            .progressViewStyle(.circular)
-            .progressViewStyle(CircularProgressViewStyle(tint: .accentColor))
-            .controlSize(.small)
         }
     }
     
