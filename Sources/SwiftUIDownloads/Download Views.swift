@@ -188,10 +188,10 @@ public struct DownloadIndicatorView: View {
                         .resizable()
                         .aspectRatio(contentMode: .fit)
                         .foregroundColor(.primary)
-                        .scaleEffect(scale)
                 }
                 .gaugeStyle(.accessoryCircularCapacity)
                 .tint(.accentColor)
+                .scaleEffect(scale)
             } else {
                 Image(systemName: "stop.fill")
                     .renderingMode(.template)
