@@ -334,6 +334,15 @@ public extension DownloadController {
     }
     
     @MainActor
+    func delete(download: Downloadable) async throws {
+        await cancelInProgressDownloads(matchingDownloadURL: download.url)
+        finishedDownloads.remove(download)
+        failedDownloads.remove(download)
+        activeDownloads.remove(download)
+        try FileManager.default.removeItem(at: download.localDestination)
+    }
+    
+    @MainActor
     func isDownloaded(url: URL) -> Bool {
         return finishedDownloads.map { $0.url }.contains(url)
     }
@@ -452,7 +461,7 @@ extension DownloadController {
         }
     }
     
-    public func cancelInProgressDownloads(matchingDownloadURL downloadURL: URL? = nil) async throws {
+    public func cancelInProgressDownloads(matchingDownloadURL downloadURL: URL? = nil) async {
         let allTasks = await URLSession.shared.allTasks
         for task in allTasks.filter({ task in assuredDownloads.contains(where: {
             if let downloadURL = downloadURL, $0.url != downloadURL {
