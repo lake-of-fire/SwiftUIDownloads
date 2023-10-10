@@ -179,7 +179,7 @@ public struct DownloadIndicatorView: View {
             Task { try? await stopAction() }
         } label: {
             ProgressView(value: progress) {
-                Image("stop")
+                Image(systemName: "stop")
                     .renderingMode(.template)
                     .foregroundColor(.primary)
             }
