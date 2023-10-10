@@ -209,7 +209,7 @@ public struct DownloadProgressView: View {
 
                 Image(systemName: "stop.fill")
                     .resizable()
-                    .frame(width: size * 0.2, height: size * 0.2) // Use a fraction of the size parameter
+                    .padding(6)
             }
         }
     }

@@ -499,8 +499,6 @@ extension DownloadController {
             let resourceValues = try download.localDestination.resourceValues(forKeys: [.fileSizeKey])
             guard let fileSize = resourceValues.fileSize, fileSize > 0 else {
                 Task { @MainActor [weak self] in
-                    download.lastDownloadedETag = etag ?? download.lastDownloadedETag
-                    
                     self?.activeDownloads.remove(download)
                     self?.finishedDownloads.remove(download)
                     self?.failedDownloads.insert(download)
@@ -510,6 +508,7 @@ extension DownloadController {
 //              print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
             
             Task { @MainActor [weak self] in
+                download.lastDownloadedETag = etag ?? download.lastDownloadedETag
                 self?.failedDownloads.remove(download)
                 self?.activeDownloads.remove(download)
                 self?.finishedDownloads.insert(download)
