@@ -467,7 +467,7 @@ extension DownloadController {
             if let downloadURL = downloadURL, $0.url != downloadURL {
                 return false
             }
-            return $0.localDestination.absoluteString == (task.taskDescription ?? "")
+            return $0.url.absoluteString == (task.taskDescription ?? "")
         }) }) {
             task.cancel()
         }
@@ -476,7 +476,7 @@ extension DownloadController {
     func cancelInProgressDownloads(inApp: Bool = false, inDownloadExtension: Bool = false) async throws {
         if inApp {
             let allTasks = await URLSession.shared.allTasks
-            for task in allTasks.filter({ task in assuredDownloads.contains(where: { $0.localDestination.absoluteString == (task.taskDescription ?? "") }) }) {
+            for task in allTasks.filter({ task in assuredDownloads.contains(where: { $0.url.absoluteString == (task.taskDescription ?? "") }) }) {
                 task.cancel()
             }
         }
