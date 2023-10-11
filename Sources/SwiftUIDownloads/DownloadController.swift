@@ -327,9 +327,9 @@ public extension DownloadController {
     }
     
     @MainActor
-    func ensureDownloaded(_ downloads: Set<Downloadable>) {
+    func ensureDownloaded(_ downloads: Set<Downloadable>) async {
         for download in downloads {
-            ensureDownloaded(download: download)
+            await ensureDownloaded(download: download)
         }
     }
     
@@ -364,10 +364,10 @@ public extension DownloadController {
 }
 
 extension DownloadController {
-    func ensureDownloaded(download: Downloadable) {
+    func ensureDownloaded(download: Downloadable) async {
         //        for download in assuredDownloads {
         assuredDownloads.insert(download)
-        Task.detached { [weak self] in
+        await Task.detached { [weak self] in
             if download.existsLocally() {
                 self?.finishDownload(download)
                 self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
@@ -382,7 +382,7 @@ extension DownloadController {
                     self?.download(download)
                 }
             }
-        }
+        }.value
         //        }
     }
     

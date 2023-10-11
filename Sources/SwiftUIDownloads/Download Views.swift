@@ -121,7 +121,9 @@ public struct ActiveDownloadsList: View {
             LazyVStack {
                 ForEach(downloadController.unfinishedDownloads) { download in
                     DownloadProgress(download: download, retryAction: {
-                        downloadController.ensureDownloaded([download])
+                        Task { @MainActor in
+                            await downloadController.ensureDownloaded([download])
+                        }
                     }, redownloadAction: {
                         downloadController.download(download)
                     })
