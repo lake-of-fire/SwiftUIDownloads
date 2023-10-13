@@ -364,6 +364,7 @@ public extension DownloadController {
 }
 
 extension DownloadController {
+    @MainActor
     func ensureDownloaded(download: Downloadable) async {
         //        for download in assuredDownloads {
         assuredDownloads.insert(download)
