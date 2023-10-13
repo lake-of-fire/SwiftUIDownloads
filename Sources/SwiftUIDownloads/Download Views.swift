@@ -214,5 +214,6 @@ public struct DownloadProgressView: View {
             }
             .frame(width: size, height: size) // Use the size parameter
         }
+        .buttonStyle(.plain)
     }
 }
