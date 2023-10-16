@@ -182,9 +182,19 @@ public struct DownloadProgressView: View {
     }
 
     public var body: some View {
+        InnerDownloadProgressView(size: size, url: downloadable.url, fractionCompleted: downloadable.fractionCompleted)
+    }
+}
+
+struct InnerDownloadProgressView: View {
+    let size: CGFloat // Size parameter for circle, path, and stop image
+    let url: URL
+    let fractionCompleted: Double
+
+    public var body: some View {
         Button(action: {
             Task {
-                await DownloadController.shared.cancelInProgressDownloads(matchingDownloadURL: downloadable.url)
+                await DownloadController.shared.cancelInProgressDownloads(matchingDownloadURL: url)
             }
         }) {
             ZStack {
@@ -198,7 +208,7 @@ public struct DownloadProgressView: View {
 
                 Path { path in
                     let startAngle = Angle(degrees: 0)
-                    let endAngle = Angle(degrees: Double(360 * min(downloadable.fractionCompleted, 1.0)))
+                    let endAngle = Angle(degrees: Double(360 * min(fractionCompleted, 1.0)))
                     path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
                 }
                 .stroke(style: StrokeStyle(lineWidth: size / 10, lineCap: .round, lineJoin: .round))
@@ -217,3 +227,15 @@ public struct DownloadProgressView: View {
         .buttonStyle(.plain)
     }
 }
+
+struct DownloadProgressView_Previews: PreviewProvider {
+    static var previews: some View {
+        Text("hi")
+//            .previewLayout(.sizeThatFits)
+    }
+}
+
+//#Preview("Download in Progress") {
+////    InnerDownloadProgressView(size: 100, url: URL(string: "https://example.example")!, fractionCompleted: 0.6)
+//    Text("hi")
+//}
