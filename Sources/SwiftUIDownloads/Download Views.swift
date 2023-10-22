@@ -204,6 +204,7 @@ struct InnerDownloadProgressView: View {
                 }
                 .stroke(style: StrokeStyle(lineWidth: size / 10, lineCap: .round, lineJoin: .round))
                 .foregroundColor(.gray)
+                .opacity(0.5)
                 .frame(width: size, height: size) // Use the size parameter
 
                 Path { path in
