@@ -365,7 +365,7 @@ public extension DownloadController {
 
 extension DownloadController {
     @MainActor
-    func ensureDownloaded(download: Downloadable) async {
+    public func ensureDownloaded(download: Downloadable) async {
         //        for download in assuredDownloads {
         assuredDownloads.insert(download)
         await Task.detached { [weak self] in
