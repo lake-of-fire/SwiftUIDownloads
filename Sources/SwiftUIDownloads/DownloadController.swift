@@ -188,7 +188,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         let units = ["B", "KB", "MB", "GB", "TB"]
         var size = Double(fileSize), unitIndex = 0
         while size > 1024 && unitIndex < units.count - 1 { size /= 1024; unitIndex += 1 }
-        return String(format: "%.1f \(units[unitIndex])", size)
+        return unitIndex < 2 ? String(format: "%.0f \(units[unitIndex])", size) : String(format: "%.1f \(units[unitIndex])", size)
     }
     
     func existsLocally() -> Bool {
