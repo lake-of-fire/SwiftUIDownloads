@@ -183,6 +183,14 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         return try? String(contentsOf: localDestination)
     }
     
+    public var humanizedFileSize: String? {
+        guard let fileSize = fileSize else { return nil }
+        let units = ["B", "KB", "MB", "GB", "TB"]
+        var size = Double(fileSize), unitIndex = 0
+        while size > 1024 && unitIndex < units.count - 1 { size /= 1024; unitIndex += 1 }
+        return String(format: "%.1f \(units[unitIndex])", size)
+    }
+    
     func existsLocally() -> Bool {
         return FileManager.default.fileExists(atPath: localDestination.path) || FileManager.default.fileExists(atPath: compressedFileURL.path)
     }
