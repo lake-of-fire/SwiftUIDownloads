@@ -187,7 +187,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     }
     
     @MainActor
-    func fetchRemoteFileSize() async {
+    public func fetchRemoteFileSize() async {
         if !existsLocally() {
             let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 15.0)
             if let fileSize = (try? await URLSession.shared.data(for: request))?.1.expectedContentLength {
