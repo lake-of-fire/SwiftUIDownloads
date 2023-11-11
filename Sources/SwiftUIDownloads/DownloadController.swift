@@ -160,15 +160,6 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         self.name = name
         self.localDestination = localDestination
         self.isFromBackgroundAssetsDownloader = isFromBackgroundAssetsDownloader
-        
-        Task { @MainActor in
-            if !existsLocally() {
-                let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 15.0)
-                if let fileSize = (try? await URLSession.shared.data(for: request))?.1.expectedContentLength {
-                    self.fileSize = UInt64(fileSize)
-                }
-            }
-        }
     }
     
     public static func == (lhs: Downloadable, rhs: Downloadable) -> Bool {
@@ -194,6 +185,17 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     func existsLocally() -> Bool {
         return FileManager.default.fileExists(atPath: localDestination.path) || FileManager.default.fileExists(atPath: compressedFileURL.path)
     }
+    
+    @MainActor
+    func fetchRemoteFileSize() async {
+        if !existsLocally() {
+            let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 15.0)
+            if let fileSize = (try? await URLSession.shared.data(for: request))?.1.expectedContentLength {
+                self.fileSize = UInt64(fileSize)
+            }
+        }
+    }
+
     
     func download() -> URLResourceDownloadTask {
         let destination = url.pathExtension == "br" ? compressedFileURL : localDestination
