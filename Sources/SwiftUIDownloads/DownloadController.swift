@@ -100,6 +100,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     @Published public var isActive = false
     @Published public var isFinishedDownloading = false
     @Published public var isFinishedProcessing = false
+    @Published public var fileSize: UInt64? = nil
     
     private var cancellables = Set<AnyCancellable>()
     
@@ -159,6 +160,15 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         self.name = name
         self.localDestination = localDestination
         self.isFromBackgroundAssetsDownloader = isFromBackgroundAssetsDownloader
+        
+        Task { @MainActor in
+            if !existsLocally() {
+                let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 15.0)
+                if let fileSize = (try? await URLSession.shared.data(for: request))?.1.expectedContentLength {
+                    self.fileSize = UInt64(fileSize)
+                }
+            }
+        }
     }
     
     public static func == (lhs: Downloadable, rhs: Downloadable) -> Bool {
@@ -196,6 +206,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         }, receiveValue: { [weak self] progress in
             self?.isActive = true
             self?.downloadProgress = progress
+            // CHATGPT: INSERT self?.fileSize = ((uint64 here...))
             switch progress {
             case .completed(let destinationLocation, let urlError):
                 guard urlError == nil, let destinationLocation = destinationLocation else {
@@ -208,6 +219,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                 self?.isFinishedDownloading = true
                 self?.isActive = false
                 self?.isFailed = false
+            case .downloading(let progress):
+                self?.fileSize = UInt64(progress.totalUnitCount)
             default:
                 break
             }
@@ -216,8 +229,23 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         return task
     }
     
+    func sizeForLocalFile() -> UInt64 {
+        do {
+            let fileAttributes = try FileManager.default.attributesOfItem(atPath: localDestination.path)
+            if let fileSize = fileAttributes[FileAttributeKey.size]  {
+                return (fileSize as! NSNumber).uint64Value
+            } else {
+                print("Failed to get a size attribute from path: \(localDestination)")
+            }
+        } catch {
+            print("Failed to get file attributes for local path: \(localDestination) with error: \(error)")
+        }
+        return 0
+    }
+    
     func decompressIfNeeded() throws {
         if FileManager.default.fileExists(atPath: compressedFileURL.path) {
+            fileSize = sizeForLocalFile()
             let data = try Data(contentsOf: compressedFileURL)
             // TODO: When dropping iOS 15, switch to native Apple Brotli
             //            let decompressed = try data.decompressed(from: COMPRESSION_BROTLI)
