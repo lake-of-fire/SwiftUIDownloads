@@ -186,6 +186,64 @@ public struct DownloadProgressView: View {
     }
 }
 
+public struct DownloadButton: View {
+    @ObservedObject var downloadable: Downloadable
+    @Binding var downloadURLs: [String]
+    
+    public init(downloadable: Downloadable, downloadURLs: Binding<[String]>) {
+        self.downloadable = downloadable
+        _downloadURLs = downloadURLs
+    }
+    
+    public var body: some View {
+        Group {
+            if #available(macOS 14, iOS 16, *) {
+                Button(action: {
+                    downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.id])))
+                }) {
+                    Text("Download")
+                }
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.capsule)
+            } else {
+                Button(action: {
+                    downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.id])))
+                }) {
+                    Text("Download")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+//#if os(iOS)
+//        .textCase(.uppercase)
+//#endif
+    }
+}
+
+public struct FailureMessagesButton: View {
+    var messages: [String]?
+    
+    public init(messages: [String]? = nil) {
+        self.messages = messages
+    }
+    
+    public var body: some View {
+        Group {
+            if let messages = messages, !messages.isEmpty {
+                Menu {
+                    ForEach(messages, id: \.self) { message in
+                        Text(message)
+                    }
+                } label: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .symbolRenderingMode(.multicolor)
+                }
+                .menuIndicator(.hidden)
+            }
+        }
+    }
+}
+
 struct InnerDownloadProgressView: View {
     let size: CGFloat // Size parameter for circle, path, and stop image
     let url: URL
@@ -198,11 +256,13 @@ struct InnerDownloadProgressView: View {
             }
         }) {
             ZStack {
+                Color.init(white: 1, opacity: 0.00000000001) // Clickability
+                
                 let radius = size / 2 - size / 20
                 Path { path in
                     path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: Angle(degrees: 0), endAngle: Angle(degrees: 360), clockwise: false)
                 }
-                .stroke(style: StrokeStyle(lineWidth: size / 10, lineCap: .round, lineJoin: .round))
+                .stroke(style: StrokeStyle(lineWidth: size / 7, lineCap: .round, lineJoin: .round))
                 .foregroundColor(.gray)
                 .opacity(0.5)
                 .frame(width: size, height: size) // Use the size parameter
@@ -212,16 +272,16 @@ struct InnerDownloadProgressView: View {
                     let endAngle = Angle(degrees: Double(360 * min(fractionCompleted, 1.0)))
                     path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
                 }
-                .stroke(style: StrokeStyle(lineWidth: size / 10, lineCap: .round, lineJoin: .round))
+                .stroke(style: StrokeStyle(lineWidth: size / 7, lineCap: .round, lineJoin: .round))
                 .foregroundColor(.accentColor)
                 .frame(width: size, height: size) // Use the size parameter
                 .rotationEffect(Angle(degrees: -90))
                 .animation(.linear)
 
-                Image(systemName: "stop.fill")
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .padding(8)
+//                Image(systemName: "stop.fill")
+//                    .resizable()
+//                    .aspectRatio(contentMode: .fit)
+//                    .padding(8)
             }
             .frame(width: size, height: size) // Use the size parameter
         }
@@ -229,14 +289,63 @@ struct InnerDownloadProgressView: View {
     }
 }
 
-struct DownloadProgressView_Previews: PreviewProvider {
-    static var previews: some View {
-        Text("hi")
-//            .previewLayout(.sizeThatFits)
+public struct DownloadControls: View {
+    @ObservedObject var downloadable: Downloadable
+    @Binding var downloadURLs: [String]
+    
+    @ObservedObject private var downloadController = DownloadController.shared
+    @ScaledMetric(relativeTo: .callout) private var downloadProgressSize: CGFloat = 20
+    
+    public init(downloadable: Downloadable, downloadURLs: Binding<[String]>) {
+        self.downloadable = downloadable
+        _downloadURLs = downloadURLs
+    }
+    
+    public var body: some View {
+        Group {
+            if let humanizedFileSize = downloadable.humanizedFileSize {
+                Text(humanizedFileSize)
+                    .bold()
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if downloadable.isActive {
+                DownloadProgressView(size: downloadProgressSize, downloadable: downloadable)
+            } else if downloadable.isFinishedDownloading {
+                modelDeleteButton
+            } else {
+                DownloadButton(downloadable: downloadable, downloadURLs: $downloadURLs)
+                //                    .onChange(of: viewModel.selectedDownloadable) { downloadable in
+                //                    }
+                
+                FailureMessagesButton(messages: downloadController.failureMessages)
+            }
+        }
+    }
+    
+    private var modelDeleteButton: some View {
+        Button {
+            downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.name])))
+            Task { try? await downloadController.delete(download: downloadable) }
+        } label: {
+            Image(systemName: "trash")
+                .font(.callout)
+        }
+        .buttonStyle(.borderless)
+        .tint(.secondary)
     }
 }
-
+//struct DownloadProgressView_Previews: PreviewProvider {
+//    static var previews: some View {
+//        Text("hi")
+////            .previewLayout(.sizeThatFits)
+//    }
+//}
+//
+//#Preview {
+//    Text("hiuyiui2")
+//}
 //#Preview("Download in Progress") {
 ////    InnerDownloadProgressView(size: 100, url: URL(string: "https://example.example")!, fractionCompleted: 0.6)
-//    Text("hi")
+//    Text("hiuyiui")
 //}
