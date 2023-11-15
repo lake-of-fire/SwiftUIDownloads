@@ -175,14 +175,16 @@ public struct ActiveDownloadsBox: View {
 public struct DownloadProgressView: View {
     private let size: CGFloat // Size parameter for circle, path, and stop image
     @ObservedObject private var downloadable: Downloadable
+    @Binding var downloadURLs: [String]
 
-    public init(size: CGFloat, downloadable: Downloadable) {
+    public init(size: CGFloat, downloadable: Downloadable, downloadURLs: Binding<[String]>) {
         self.size = size
         self.downloadable = downloadable
+        _downloadURLs = downloadURLs
     }
 
     public var body: some View {
-        InnerDownloadProgressView(size: size, url: downloadable.url, fractionCompleted: downloadable.fractionCompleted)
+        InnerDownloadProgressView(size: size, url: downloadable.url, fractionCompleted: downloadable.fractionCompleted, downloadURLs: $downloadURLs)
     }
 }
 
@@ -220,6 +222,28 @@ public struct DownloadButton: View {
     }
 }
 
+struct CancelDownloadButton: View {
+    @ObservedObject var downloadable: Downloadable
+    @Binding var downloadURLs: [String]
+    
+    public init(downloadable: Downloadable, downloadURLs: Binding<[String]>) {
+        self.downloadable = downloadable
+        _downloadURLs = downloadURLs
+    }
+    
+    public var body: some View {
+        Button(role: .cancel, action: {
+            Task { @MainActor in
+                downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString])))
+                await DownloadController.shared.cancelInProgressDownloads(matchingDownloadURL: downloadable.url)
+            }
+        }) {
+            Text("Cancel")
+        }
+        .buttonStyle(.borderless)
+    }
+}
+    
 public struct FailureMessagesButton: View {
     var messages: [String]?
     
@@ -248,10 +272,12 @@ struct InnerDownloadProgressView: View {
     let size: CGFloat // Size parameter for circle, path, and stop image
     let url: URL
     let fractionCompleted: Double
+    @Binding var downloadURLs: [String]
 
     public var body: some View {
         Button(action: {
             Task {
+                downloadURLs = Array(Set(downloadURLs).subtracting(Set([url.absoluteString])))
                 await DownloadController.shared.cancelInProgressDownloads(matchingDownloadURL: url)
             }
         }) {
@@ -310,7 +336,8 @@ public struct DownloadControls: View {
                     .foregroundStyle(.secondary)
             }
             if downloadable.isActive {
-                DownloadProgressView(size: downloadProgressSize, downloadable: downloadable)
+                DownloadProgressView(size: downloadProgressSize, downloadable: downloadable, downloadURLs: $downloadURLs)
+                CancelDownloadButton(downloadable: downloadable, downloadURLs: $downloadURLs)
             } else if downloadable.isFinishedDownloading {
                 modelDeleteButton
             } else {
@@ -325,7 +352,7 @@ public struct DownloadControls: View {
     
     private var modelDeleteButton: some View {
         Button {
-            downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.name])))
+            downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString])))
             Task { try? await downloadController.delete(download: downloadable) }
         } label: {
             Image(systemName: "trash")
