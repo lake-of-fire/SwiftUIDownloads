@@ -339,6 +339,8 @@ public class DownloadController: NSObject, ObservableObject {
     @Published public var finishedDownloads = Set<Downloadable>()
     @Published public var failedDownloads = Set<Downloadable>()
     
+    public let debugUUID = UUID()
+    
     public var unfinishedDownloads: [Downloadable] {
         let downloads: [Downloadable] = Array(Set(activeDownloads).union(Set(failedDownloads)))
         return downloads.sorted(by: { $0.name > $1.name })
