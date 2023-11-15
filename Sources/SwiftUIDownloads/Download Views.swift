@@ -263,6 +263,8 @@ public struct FailureMessagesButton: View {
                         .symbolRenderingMode(.multicolor)
                 }
                 .menuIndicator(.hidden)
+                .buttonStyle(.borderless)
+                .fixedSize()
             }
         }
     }
