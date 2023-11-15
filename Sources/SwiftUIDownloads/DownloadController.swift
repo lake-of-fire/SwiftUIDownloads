@@ -94,6 +94,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     public let name: String
     public let localDestination: URL
     var isFromBackgroundAssetsDownloader: Bool? = nil
+    
+    public let debugUUID = UUID()
 
     @Published internal var downloadProgress: URLResourceDownloadTaskProgress = .uninitiated
     @Published public var isFailed = false
@@ -195,7 +197,6 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
             }
         }
     }
-
     
     func download() -> URLResourceDownloadTask {
         let destination = url.pathExtension == "br" ? compressedFileURL : localDestination
