@@ -377,6 +377,7 @@ public extension DownloadController {
     @MainActor
     func delete(download: Downloadable) async throws {
         await cancelInProgressDownloads(matchingDownloadURL: download.url)
+        assuredDownloads.remove(download)
         finishedDownloads.remove(download)
         failedDownloads.remove(download)
         activeDownloads.remove(download)
