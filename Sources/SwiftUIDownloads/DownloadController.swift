@@ -382,6 +382,11 @@ public extension DownloadController {
         failedDownloads.remove(download)
         activeDownloads.remove(download)
         try FileManager.default.removeItem(at: download.localDestination)
+        download.isActive = false
+        download.isFinishedProcessing = false
+        download.isFinishedDownloading = false
+        download.isFailed = false
+        download.downloadProgress = .uninitiated
     }
     
     @MainActor
