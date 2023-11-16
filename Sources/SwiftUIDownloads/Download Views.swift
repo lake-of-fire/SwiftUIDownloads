@@ -354,8 +354,10 @@ public struct DownloadControls: View {
     
     private var modelDeleteButton: some View {
         Button {
-            downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString])))
-            Task { try? await downloadController.delete(download: downloadable) }
+            Task { @MainActor in
+                downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString])))
+                try? await downloadController.delete(download: downloadable)
+            }
         } label: {
             Image(systemName: "trash")
                 .font(.callout)
