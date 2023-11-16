@@ -554,6 +554,9 @@ extension DownloadController {
                 self?.failedDownloads.remove(download)
                 self?.activeDownloads.remove(download)
                 self?.finishedDownloads.insert(download)
+                download.isFailed = false
+                download.isActive = false
+                download.isFinishedDownloading = true
                 download.isFinishedProcessing = true
             }
         } catch {
