@@ -296,7 +296,9 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
 
 public extension Downloadable {
     convenience init?(name: String, groupIdentifier: String? = nil, parentDirectoryName: String, filename: String? = nil, downloadMirrors: [URL]) {
-        guard let url = downloadMirrors.first else { return nil }
+        guard let url = downloadMirrors.first else {
+            return nil
+        }
 //        let filename = filename ?? url.lastPathComponent.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? url.lastPathComponent
         let filename = filename ?? url.lastPathComponent
         var containerURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
