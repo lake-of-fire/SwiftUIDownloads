@@ -306,7 +306,9 @@ public extension Downloadable {
         }
 
         guard let folderURL = containerURL?
-            .appendingPathComponent(parentDirectoryName, isDirectory: true) else { return nil }
+            .appendingPathComponent(parentDirectoryName, isDirectory: true) else {
+            return nil
+        }
         // TODO: macos 13+:   Downloadable(url: URL(string: "https://manabi.io/static/dictionaries/furigana.realm.br")!, mirrorURL: nil, name: "Furigana Data", localDestination: folderURL.appending(component: "furigana.realm")),
         self.init(url: url, mirrorURL: downloadMirrors.dropFirst().first, name: name, localDestination: folderURL.appendingPathComponent(filename))
     }
