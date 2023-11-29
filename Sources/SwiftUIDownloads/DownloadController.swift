@@ -62,7 +62,7 @@ fileprivate func errorDescription(from error: Error) -> String {
         default:
             return urlError.localizedDescription
         }
-    if let posixError = error as? POSIXError {
+    } else if let posixError = error as? POSIXError {
         switch posixError.code {
         case .ENOSPC: // No space on device
             return "No space left on device."
