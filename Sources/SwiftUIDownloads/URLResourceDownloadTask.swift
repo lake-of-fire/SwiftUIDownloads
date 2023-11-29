@@ -52,7 +52,7 @@ public enum URLResourceDownloadTaskProgress { //}: Equatable, CustomStringConver
 
 public protocol URLResourceDownloadTaskProtocol {
 
-    typealias PublisherType = AnyPublisher<URLResourceDownloadTaskProgress, URLError>
+    typealias PublisherType = AnyPublisher<URLResourceDownloadTaskProgress, Error>
 
     var taskIdentifier: Int { get }
 
@@ -69,7 +69,7 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol 
 
     private let downloadTask: URLSessionDownloadTask
 
-    public typealias PublisherType = AnyPublisher<URLResourceDownloadTaskProgress, URLError>
+    public typealias PublisherType = AnyPublisher<URLResourceDownloadTaskProgress, Error>
 
     fileprivate let subject: PassthroughSubject<PublisherType.Output, PublisherType.Failure>
 
@@ -159,9 +159,12 @@ extension URLResourceDownloadTask: URLSessionTaskDelegate {
             return
         }
 
-        if let urlError: URLError = error as? URLError {
+        if let urlError = error as? URLError {
             subject.send(.completed(destinationLocation: nil, error: urlError))
             subject.send(completion: .failure(urlError))
+        } else if let posixError = error as? POSIXError {
+            subject.send(.completed(destinationLocation: nil, error: posixError))
+            subject.send(completion: .failure(posixError))
         } else if let httpResponse = task.response as? HTTPURLResponse, httpResponse.statusCode < 200 || httpResponse.statusCode > 299 {
             let error = URLError(.fileDoesNotExist)
             subject.send(.completed(destinationLocation: nil, error: error))
