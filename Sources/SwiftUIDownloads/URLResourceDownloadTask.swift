@@ -139,16 +139,16 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
         guard session == self.session, downloadTask == self.downloadTask else {
             return
         }
-
-        #if false
+        
+#if false
         // This is not very accurate ..
         subject.send(.downloading(progress: downloadTask.progress))
-        #else
-        let progress = Progress(totalUnitCount: downloadTask.countOfBytesExpectedToReceive)
+#else
+        let progress = Progress(totalUnitCount: max(0, downloadTask.countOfBytesExpectedToReceive))
         progress.completedUnitCount = downloadTask.countOfBytesReceived
         progress.completedUnitCount = downloadTask.countOfBytesReceived
         subject.send(.downloading(progress: progress))
-        #endif
+#endif
     }
 }
 

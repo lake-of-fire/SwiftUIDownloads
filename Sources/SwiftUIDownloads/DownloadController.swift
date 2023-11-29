@@ -143,6 +143,19 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         }
     }
     
+    public var lastCheckedETagAt: Date? {
+        get {
+            return UserDefaults.standard.object(forKey: "fileLastCheckedETagAt:\(url.absoluteString)") as? Date
+        }
+        set {
+            if let newValue = newValue {
+                UserDefaults.standard.set(newValue, forKey: "fileLastCheckedETagAt:\(url.absoluteString)")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "fileLastCheckedETagAt:\(url.absoluteString)")
+            }
+        }
+    }
+    
     public var lastDownloaded: Date? {
         get {
             return UserDefaults.standard.object(forKey: "fileLastDownloadedDate:\(url.absoluteString)") as? Date
@@ -236,6 +249,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                 break
             }
         }).store(in: &cancellables)
+        print("Downloading \(url) to \(destination)")
         task.resume()
         return task
     }
@@ -256,6 +270,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     
     func decompressIfNeeded() throws {
         if FileManager.default.fileExists(atPath: compressedFileURL.path) {
+            print("Attempting decompression for \(compressedFileURL)")
             fileSize = sizeForLocalFile()
             let data = try Data(contentsOf: compressedFileURL)
             // TODO: When dropping iOS 15, switch to native Apple Brotli
@@ -422,10 +437,14 @@ extension DownloadController {
         await Task.detached { [weak self] in
             if download.existsLocally() {
                 self?.finishDownload(download)
-                self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
-                    if modified {
-                        Task { @MainActor [weak self] in
-                            self?.download(download, etag: etag)
+                if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60) {
+                    self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
+                        download.lastCheckedETagAt = Date()
+                        if modified {
+                            print("Download \(download.url) modified upstream.")
+                            Task { @MainActor [weak self] in
+                                self?.download(download, etag: etag)
+                            }
                         }
                     }
                 }
@@ -564,6 +583,9 @@ extension DownloadController {
                 self?.failedDownloads.remove(download)
                 self?.activeDownloads.remove(download)
                 self?.finishedDownloads.insert(download)
+                if !download.isFinishedDownloading {
+                    print("Download \(download.url) finished downloading")
+                }
                 download.isFailed = false
                 download.isActive = false
                 download.isFinishedDownloading = true
