@@ -33,7 +33,7 @@ public enum URLResourceDownloadTaskProgress { //}: Equatable, CustomStringConver
     case uninitiated
     case waitingForResponse
     case downloading(progress: Progress)
-    case completed(destinationLocation: URL?, error: Error?)
+    case completed(destinationLocation: URL?, etag: String?, error: Error?)
     
     public var fractionCompleted: Double {
         switch self {
@@ -43,7 +43,7 @@ public enum URLResourceDownloadTaskProgress { //}: Equatable, CustomStringConver
             return 0
         case .downloading(let progress):
             return progress.fractionCompleted
-        case .completed(_, let error):
+        case .completed(_, _, let error):
             guard error == nil else { return 0 }
             return 1
         }
@@ -114,7 +114,7 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
 
         if let httpResponse = downloadTask.response as? HTTPURLResponse, httpResponse.statusCode < 200 || httpResponse.statusCode > 299 {
             let error = URLError(.fileDoesNotExist)
-            subject.send(.completed(destinationLocation: location, error: error))
+            subject.send(.completed(destinationLocation: location, etag: nil, error: error))
             subject.send(completion: .failure(error))
         } else {
             do {
@@ -123,7 +123,7 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
             } catch {
                 print("Error moving: \(error)")
             }
-            subject.send(.completed(destinationLocation: location, error: nil))
+            subject.send(.completed(destinationLocation: location, etag: (downloadTask.response as? HTTPURLResponse)?.allHeaderFields["Etag"] as? String, error: nil))
             subject.send(completion: .finished)
         }
     }
@@ -160,14 +160,14 @@ extension URLResourceDownloadTask: URLSessionTaskDelegate {
         }
 
         if let urlError = error as? URLError {
-            subject.send(.completed(destinationLocation: nil, error: urlError))
+            subject.send(.completed(destinationLocation: nil, etag: nil, error: urlError))
             subject.send(completion: .failure(urlError))
         } else if let posixError = error as? POSIXError {
-            subject.send(.completed(destinationLocation: nil, error: posixError))
+            subject.send(.completed(destinationLocation: nil, etag: nil, error: posixError))
             subject.send(completion: .failure(posixError))
         } else if let httpResponse = task.response as? HTTPURLResponse, httpResponse.statusCode < 200 || httpResponse.statusCode > 299 {
             let error = URLError(.fileDoesNotExist)
-            subject.send(.completed(destinationLocation: nil, error: error))
+            subject.send(.completed(destinationLocation: nil, etag: nil, error: error))
             subject.send(completion: .failure(error))
         }
     }

@@ -19,7 +19,7 @@ public struct DownloadProgress: View {
             return str
         case .waitingForResponse:
             return "Waiting for response from server…"
-        case .completed(let destinationLocation, let error):
+        case .completed(let destinationLocation, _, let error):
             if let error = error {
                 return "Error: \(error.localizedDescription)"
             } else if destinationLocation != nil {
@@ -37,7 +37,7 @@ public struct DownloadProgress: View {
     
     private var isFailed: Bool {
         switch download.downloadProgress {
-        case .completed(_, let urlError):
+        case .completed(_, _, let urlError):
             return urlError != nil
         default:
             return false
@@ -51,7 +51,7 @@ public struct DownloadProgress: View {
         switch download.downloadProgress {
         case .downloading(let progress):
             return progress.fractionCompleted
-        case .completed(let destinationLocation, let error):
+        case .completed(let destinationLocation, _, let error):
             return destinationLocation != nil && error == nil ? 1.0 : 0
         default:
             return 0

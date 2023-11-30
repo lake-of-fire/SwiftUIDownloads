@@ -123,7 +123,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     
     public var failureMessage: String? {
         switch downloadProgress {
-        case .completed(_, let error):
+        case .completed(_, _, let error):
             if let error = error {
                 print(error)
                 return errorDescription(from: error)
@@ -227,7 +227,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                 self?.isFailed = true
                 self?.isFinishedDownloading = false
                 self?.isActive = false
-                self?.downloadProgress = .completed(destinationLocation: nil, error: error)
+                self?.downloadProgress = .completed(destinationLocation: nil, etag: nil, error: error)
             case .finished:
                 self?.lastDownloaded = Date()
                 self?.isFailed = false
@@ -239,13 +239,14 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
             self?.downloadProgress = progress
             // CHATGPT: INSERT self?.fileSize = ((uint64 here...))
             switch progress {
-            case .completed(let destinationLocation, let urlError):
+            case .completed(let destinationLocation, let etag, let urlError):
                 guard urlError == nil, let destinationLocation = destinationLocation else {
                     self?.isFailed = true
                     self?.isFinishedDownloading = false
                     self?.isActive = false
                     return
                 }
+                self?.lastDownloadedETag = etag
                 self?.lastDownloaded = Date()
                 self?.isFinishedDownloading = true
                 self?.isActive = false
@@ -444,7 +445,7 @@ extension DownloadController {
         await Task.detached { [weak self] in
             if download.existsLocally() {
                 self?.finishDownload(download)
-                if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60) {
+                if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 60) {
                     self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
                         download.lastCheckedETagAt = Date()
                         if modified {
@@ -708,7 +709,7 @@ extension DownloadController: BADownloadManagerDelegate {
     public func download(_ download: BADownload, failedWithError error: Error) {
         if let downloadable = assuredDownloads.downloadable(forDownload: download) {
             Task { @MainActor in
-                downloadable.downloadProgress = .completed(destinationLocation: nil, error: error)
+                downloadable.downloadProgress = .completed(destinationLocation: nil, etag: nil, error: error)
                 finishedDownloads.remove(downloadable)
                 activeDownloads.remove(downloadable)
                 failedDownloads.insert(downloadable)
