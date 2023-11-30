@@ -201,7 +201,7 @@ public struct DownloadButton: View {
         Group {
             if #available(macOS 14, iOS 16, *) {
                 Button(action: {
-                    downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.id])))
+                    downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.url.absoluteString])))
                 }) {
                     Text("Download")
                 }
@@ -209,7 +209,7 @@ public struct DownloadButton: View {
                 .buttonBorderShape(.capsule)
             } else {
                 Button(action: {
-                    downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.id])))
+                    downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.url.absoluteString])))
                 }) {
                     Text("Download")
                 }
