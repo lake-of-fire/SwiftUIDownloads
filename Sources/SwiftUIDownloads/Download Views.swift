@@ -340,6 +340,7 @@ public struct DownloadControls: View {
             if downloadable.isActive {
                 DownloadProgressView(size: downloadProgressSize, downloadable: downloadable, downloadURLs: $downloadURLs)
                 CancelDownloadButton(downloadable: downloadable, downloadURLs: $downloadURLs)
+                    .foregroundStyle(.secondary)
             } else if downloadable.isFinishedDownloading {
                 modelDeleteButton
             } else {
