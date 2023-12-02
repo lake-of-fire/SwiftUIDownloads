@@ -356,7 +356,8 @@ public struct DownloadControls: View {
     private var modelDeleteButton: some View {
         Button {
             Task { @MainActor in
-                downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString])))
+                print("!! Updating DL URLs from \(downloadURLs) to \(Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString]))).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })")
+                downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString]))).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                 try? await downloadController.delete(download: downloadable)
             }
         } label: {
