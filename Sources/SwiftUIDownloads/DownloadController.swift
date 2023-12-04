@@ -209,14 +209,15 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     }
     
     @MainActor
-    public func fetchRemoteFileSize() async {
+    public func fetchRemoteFileSize() async throws {
         if !existsLocally() {
             let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 15.0)
             do {
                 let fileSize = try await URLSession.shared.data(for: request))?.1.expectedContentLength
                 self.fileSize = UInt64(fileSize)
             } catch {
-                print("Failed to fetch remote file size for url \(url.absoluteString): \(error)"
+                print("Failed to fetch remote file size for url \(url.absoluteString): \(error)")
+                throw(error)
             }
         }
     }
