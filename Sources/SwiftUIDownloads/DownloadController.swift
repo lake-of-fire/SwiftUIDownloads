@@ -456,14 +456,14 @@ extension DownloadController {
                         if modified {
                             print("Download \(download.url) modified upstream.")
                             Task { @MainActor [weak self] in
-                                self?.download(download, etag: etag)
+                                await self?.download(download, etag: etag)
                             }
                         }
                     }
                 }
             } else {
                 await Task { @MainActor [weak self] in
-                    self?.download(download)
+                    await self?.download(download)
                 }.value
             }
         }.value
@@ -471,7 +471,7 @@ extension DownloadController {
     }
     
     @MainActor
-    public func download(_ download: Downloadable, etag: String? = nil) {
+    public func download(_ download: Downloadable, etag: String? = nil) async {
         download.$isActive.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] isActive in
             if isActive {
                 self?.activeDownloads.insert(download)
@@ -510,7 +510,7 @@ extension DownloadController {
             }
         }.store(in: &cancellables)
 
-        Task.detached {
+        await Task.detached {
             let allTasks = await URLSession.shared.allTasks
             if allTasks.first(where: { $0.taskDescription == download.url.absoluteString }) != nil {
                 // Task exists.
@@ -539,10 +539,17 @@ extension DownloadController {
             }
             
             download.isFromBackgroundAssetsDownloader = false
-            Task { @MainActor in
-                _ = download.download()
-            }
-        }
+            // Wait for DL to finish or error.
+            await Task { @MainActor in
+                let task = download.download()
+                _ = try? await task.publisher.values.first(where: { progress in
+                    switch progress {
+                    case .completed(_, _, _): return true
+                    default: return false
+                    }
+                })
+            }.value
+        }.value
     }
     
     public func cancelInProgressDownloads(matchingDownloadURL downloadURL: URL? = nil) async {
