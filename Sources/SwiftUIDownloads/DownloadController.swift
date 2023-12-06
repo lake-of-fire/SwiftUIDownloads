@@ -462,9 +462,9 @@ extension DownloadController {
                     }
                 }
             } else {
-                Task { @MainActor [weak self] in
+                await Task { @MainActor [weak self] in
                     self?.download(download)
-                }
+                }.value
             }
         }.value
         //        }
