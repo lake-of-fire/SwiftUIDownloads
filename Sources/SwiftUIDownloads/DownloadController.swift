@@ -407,7 +407,7 @@ public extension DownloadController {
     }
     
     @MainActor
-    func delete(download: Downloadable) async throws {
+    func delete(download: Downloadable) async throws -> Downloadable {
         await cancelInProgressDownloads(matchingDownloadURL: download.url)
         try FileManager.default.removeItem(at: download.localDestination)
         assuredDownloads = assuredDownloads.filter { $0.url != download.url }
@@ -419,6 +419,7 @@ public extension DownloadController {
         download.isFinishedDownloading = false
         download.isFailed = false
         download.downloadProgress = .uninitiated
+        return download
     }
     
     @MainActor
