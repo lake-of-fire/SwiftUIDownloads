@@ -125,7 +125,9 @@ public struct ActiveDownloadsList: View {
                             await downloadController.ensureDownloaded([download])
                         }
                     }, redownloadAction: {
-                        downloadController.download(download)
+                        Task { @MainActor in
+                            await downloadController.download(download)
+                        }
                     })
                     .padding(.horizontal, 12)
                     Divider()
