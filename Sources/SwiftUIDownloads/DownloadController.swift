@@ -450,7 +450,7 @@ extension DownloadController {
         assuredDownloads.insert(download)
         await Task.detached { [weak self] in
             if download.existsLocally() {
-                self?.finishDownload(download)
+                await self?.finishDownload(download)
                 if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 60) {
                     self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
                         download.lastCheckedETagAt = Date()
@@ -503,7 +503,7 @@ extension DownloadController {
                 }
                 if let download = download {
                     Task.detached { [weak self] in
-                        self?.finishDownload(download, etag: etag)
+                        await self?.finishDownload(download, etag: etag)
                     }
                 }
             } else if let download = download {
@@ -583,23 +583,23 @@ extension DownloadController {
         }
     }
     
-    public func finishDownload(_ download: Downloadable, etag: String? = nil) {
+    public func finishDownload(_ download: Downloadable, etag: String? = nil) async {
         do {
             try download.decompressIfNeeded()
 
             // Confirm non-empty
             let resourceValues = try download.localDestination.resourceValues(forKeys: [.fileSizeKey])
             guard let fileSize = resourceValues.fileSize, fileSize > 0 else {
-                Task { @MainActor [weak self] in
+                await Task { @MainActor [weak self] in
                     self?.activeDownloads.remove(download)
                     self?.finishedDownloads.remove(download)
                     self?.failedDownloads.insert(download)
-                }
+                }.value
                 return
             }
 //              print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
             
-            Task { @MainActor [weak self] in
+            await Task { @MainActor [weak self] in
                 download.lastDownloadedETag = etag ?? download.lastDownloadedETag
                 self?.failedDownloads.remove(download)
                 self?.activeDownloads.remove(download)
@@ -611,15 +611,15 @@ extension DownloadController {
                 download.isActive = false
                 download.isFinishedDownloading = true
                 download.isFinishedProcessing = true
-            }
+            }.value
         } catch {
-            Task { @MainActor [weak self] in
+            await Task { @MainActor [weak self] in
                 self?.failedDownloads.insert(download)
                 self?.activeDownloads.remove(download)
                 self?.finishedDownloads.remove(download)
                 try? FileManager.default.removeItem(at: download.compressedFileURL)
                 try? FileManager.default.removeItem(at: download.localDestination)
-            }
+            }.value
         }
     }
     
@@ -708,7 +708,7 @@ extension DownloadController: BADownloadManagerDelegate {
                         try FileManager.default.moveItem(at: fileURL, to: destination)
                     } catch { }
                     Task.detached { [weak self] in
-                        self?.finishDownload(downloadable)
+                        await self?.finishDownload(downloadable)
                         Task { @MainActor [weak self] in
                             try await self?.cancelInProgressDownloads(inApp: true)
                         }
