@@ -608,13 +608,23 @@ extension DownloadController {
     
     public func cancelInProgressDownloads(matchingDownloadURL downloadURL: URL? = nil) async {
         let allTasks = await URLSession.shared.allTasks
-        for task in allTasks.filter({ task in assuredDownloads.contains(where: {
-            if let downloadURL = downloadURL, $0.url != downloadURL {
-                return false
-            }
-            return $0.url.absoluteString == (task.taskDescription ?? "")
-        }) }) {
+        for (task, download) in allTasks.map({ task in
+            let download = assuredDownloads.first(where: {
+                if let downloadURL = downloadURL, $0.url != downloadURL {
+                    return false
+                }
+                return $0.url.absoluteString == (task.taskDescription ?? "")
+            })
+            return (task, download)
+        }) {
             task.cancel()
+            if let destination = download?.localDestination {
+                do {
+                    try FileManager.default.removeItem(at: destination)
+                } catch {
+                    print("ERROR deleting \(destination.absoluteString): \(error)")
+                }
+            }
         }
     }
     
