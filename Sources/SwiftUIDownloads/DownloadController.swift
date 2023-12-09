@@ -407,6 +407,22 @@ public extension DownloadController {
     }
     
     @MainActor
+    func deleteOrphanFiles(inDirectories directories: [URL]) async throws {
+        var saveFiles = Set<URL>(assuredDownloads.map { $0.localDestination }).union(Set(assuredDownloads.map { $0.compressedFileURL }))
+        for dir in directories {
+            let path = dir.path
+            let enumerator = FileManager.default.enumerator(atPath: path)
+            while let filename = enumerator?.nextObject() as? String {
+                let fileURL = URL(fileURLWithPath: filename, relativeTo: dir).absoluteURL
+                if !saveFiles.contains(fileURL) {
+                    print("DownloadController: deleting orphan \(fileURL)")
+                    try FileManager.default.removeItem(at: fileURL)
+                }
+            }
+        }
+    }
+    
+    @MainActor
     func delete(download: Downloadable) async throws -> Downloadable {
         await cancelInProgressDownloads(matchingDownloadURL: download.url)
         try FileManager.default.removeItem(at: download.localDestination)
