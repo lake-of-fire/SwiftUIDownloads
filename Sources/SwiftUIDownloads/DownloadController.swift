@@ -322,7 +322,34 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     }
 }
 
+public enum DownloadLocation {
+    case local(parentDirectoryName: String, groupIdentifier: String?)
+    
+    var directoryURL: URL? {
+        switch self {
+        case .local(let parentDirectoryName, let groupIdentifier):
+            var containerURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
+                containerURL = sharedContainerURL
+            }
+            return containerURL?.appendingPathComponent(parentDirectoryName, isDirectory: true)
+        }
+    }
+}
+
 public extension Downloadable {
+    convenience init?(name: String, destination: DownloadLocation, filename: String? = nil, downloadMirrors: [URL]) {
+        guard let url = downloadMirrors.first else {
+            return nil
+        }
+//        let filename = filename ?? url.lastPathComponent.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? url.lastPathComponent
+        let filename = filename ?? url.lastPathComponent
+        // TODO: macos 13+:   Downloadable(url: URL(string: "https://manabi.io/static/dictionaries/furigana.realm.br")!, mirrorURL: nil, name: "Furigana Data", localDestination: folderURL.appending(component: "furigana.realm")),
+        guard let directoryURL = destination.directoryURL else { return nil }
+        self.init(url: url, mirrorURL: downloadMirrors.dropFirst().first, name: name, localDestination: directoryURL.appendingPathComponent(filename))
+    }
+    
+    #warning("Deprecated; remove in favor of above w/ DownloadLocation")
     convenience init?(name: String, groupIdentifier: String? = nil, parentDirectoryName: String, filename: String? = nil, downloadMirrors: [URL]) {
         guard let url = downloadMirrors.first else {
             return nil
@@ -400,16 +427,21 @@ public extension DownloadController {
     }
     
     @MainActor
-    func ensureDownloaded(_ downloads: Set<Downloadable>) async {
+    func ensureDownloaded(_ downloads: Set<Downloadable>, deletingOrphansIn: [DownloadLocation] = []) async {
         for download in downloads {
-            await ensureDownloaded(download: download)
+            await ensureDownloaded(download: download, deletingOrphansIn: deletingOrphansIn)
         }
     }
     
     @MainActor
-    func deleteOrphanFiles(inDirectories directories: [URL]) async throws {
-        var saveFiles = Set<URL>(assuredDownloads.map { $0.localDestination }).union(Set(assuredDownloads.map { $0.compressedFileURL }))
-        for dir in directories {
+    func deleteOrphanFiles(in locations: [DownloadLocation]) async throws {
+        guard !locations.isEmpty else { return }
+        let saveFiles = Set<URL>(assuredDownloads.map { $0.localDestination }).union(Set(assuredDownloads.map { $0.compressedFileURL }))
+        for location in locations {
+            guard let dir = location.directoryURL else {
+                print("WARNING: No directoryURL for download location")
+                continue
+            }
             let path = dir.path
             let enumerator = FileManager.default.enumerator(atPath: path)
             while let filename = enumerator?.nextObject() as? String {
@@ -461,9 +493,14 @@ public extension DownloadController {
 
 extension DownloadController {
     @MainActor
-    public func ensureDownloaded(download: Downloadable) async {
+    public func ensureDownloaded(download: Downloadable, deletingOrphansIn: [DownloadLocation] = []) async {
         //        for download in assuredDownloads {
         assuredDownloads.insert(download)
+        do {
+            try await deleteOrphanFiles(in: deletingOrphansIn)
+        } catch {
+            print("ERROR Failed to delete orphan files. \(error)")
+        }
         await Task.detached { [weak self] in
             if download.existsLocally() {
                 await self?.finishDownload(download)
