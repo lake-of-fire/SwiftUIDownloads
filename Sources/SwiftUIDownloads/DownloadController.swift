@@ -322,7 +322,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     }
 }
 
-public enum DownloadLocation {
+public enum DownloadDirectory {
     case local(parentDirectoryName: String, groupIdentifier: String?)
     
     var directoryURL: URL? {
@@ -338,7 +338,7 @@ public enum DownloadLocation {
 }
 
 public extension Downloadable {
-    convenience init?(name: String, destination: DownloadLocation, filename: String? = nil, downloadMirrors: [URL]) {
+    convenience init?(name: String, destination: DownloadDirectory, filename: String? = nil, downloadMirrors: [URL]) {
         guard let url = downloadMirrors.first else {
             return nil
         }
@@ -349,7 +349,7 @@ public extension Downloadable {
         self.init(url: url, mirrorURL: downloadMirrors.dropFirst().first, name: name, localDestination: directoryURL.appendingPathComponent(filename))
     }
     
-    #warning("Deprecated; remove in favor of above w/ DownloadLocation")
+    #warning("Deprecated; remove in favor of above w/ DownloadDirectory")
     convenience init?(name: String, groupIdentifier: String? = nil, parentDirectoryName: String, filename: String? = nil, downloadMirrors: [URL]) {
         guard let url = downloadMirrors.first else {
             return nil
@@ -427,14 +427,14 @@ public extension DownloadController {
     }
     
     @MainActor
-    func ensureDownloaded(_ downloads: Set<Downloadable>, deletingOrphansIn: [DownloadLocation] = []) async {
+    func ensureDownloaded(_ downloads: Set<Downloadable>, deletingOrphansIn: [DownloadDirectory] = []) async {
         for download in downloads {
             await ensureDownloaded(download: download, deletingOrphansIn: deletingOrphansIn)
         }
     }
     
     @MainActor
-    func deleteOrphanFiles(in locations: [DownloadLocation]) async throws {
+    func deleteOrphanFiles(in locations: [DownloadDirectory]) async throws {
         guard !locations.isEmpty else { return }
         let saveFiles = Set<URL>(assuredDownloads.map { $0.localDestination }).union(Set(assuredDownloads.map { $0.compressedFileURL }))
         for location in locations {
@@ -493,7 +493,7 @@ public extension DownloadController {
 
 extension DownloadController {
     @MainActor
-    public func ensureDownloaded(download: Downloadable, deletingOrphansIn: [DownloadLocation] = []) async {
+    public func ensureDownloaded(download: Downloadable, deletingOrphansIn: [DownloadDirectory] = []) async {
         //        for download in assuredDownloads {
         assuredDownloads.insert(download)
         do {
