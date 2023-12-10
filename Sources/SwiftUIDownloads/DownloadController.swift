@@ -429,7 +429,15 @@ public extension DownloadController {
     @MainActor
     func ensureDownloaded(_ downloads: Set<Downloadable>, deletingOrphansIn: [DownloadDirectory] = []) async {
         for download in downloads {
-            await ensureDownloaded(download: download, deletingOrphansIn: deletingOrphansIn)
+            assuredDownloads.insert(download)
+        }
+        do {
+            try await deleteOrphanFiles(in: deletingOrphansIn)
+        } catch {
+            print("ERROR Failed to delete orphan files. \(error)")
+        }
+        for download in downloads {
+            await ensureDownloaded(download: download)
         }
     }
     
