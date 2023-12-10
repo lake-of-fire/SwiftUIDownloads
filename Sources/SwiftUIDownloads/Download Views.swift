@@ -324,7 +324,7 @@ public struct DownloadControls: View {
     @Binding var downloadURLs: [String]
     
     @ObservedObject private var downloadController = DownloadController.shared
-    @ScaledMetric(relativeTo: .callout) private var downloadProgressSize: CGFloat = 20
+    @ScaledMetric(relativeTo: .caption) private var downloadProgressSize: CGFloat = 20
     
     public init(downloadable: Downloadable, downloadURLs: Binding<[String]>) {
         self.downloadable = downloadable
@@ -364,7 +364,7 @@ public struct DownloadControls: View {
             }
         } label: {
             Image(systemName: "trash")
-                .font(.callout)
+                .font(.caption)
         }
         .buttonStyle(.borderless)
         .tint(.secondary)
