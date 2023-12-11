@@ -2,8 +2,8 @@ import SwiftUI
 
 public struct DownloadProgress: View {
     @ObservedObject var download: Downloadable
-    let retryAction: (() -> Void)
-    let redownloadAction: (() -> Void)
+    let retryAction: (() async throws -> Void)
+    let redownloadAction: (() async throws -> Void)
     
     private var statusText: String {
         if download.isFinishedProcessing {
@@ -90,14 +90,18 @@ public struct DownloadProgress: View {
             .font(.callout)
             if isFailed {
                 Button("Retry") {
-                    retryAction()
+                    Task { @MainActor in
+                        try? await retryAction()
+                    }
                 }
                 .buttonStyle(.borderedProminent)
             }
             if download.isFinishedProcessing && !isFailed {
                 Menu {
                     Button("Re-download") {
-                        redownloadAction()
+                        Task { @MainActor in
+                            try? await redownloadAction()
+                        }
                     }
                 } label: {
                     Image(systemName: "ellipsis.circle")
@@ -106,7 +110,7 @@ public struct DownloadProgress: View {
         }
     }
     
-    public init(download: Downloadable, retryAction: @escaping (() -> Void), redownloadAction: @escaping (() -> Void)) {
+    public init(download: Downloadable, retryAction: @escaping (() async throws -> Void), redownloadAction: @escaping (() async throws -> Void)) {
         self.download = download
         self.retryAction = retryAction
         self.redownloadAction = redownloadAction
