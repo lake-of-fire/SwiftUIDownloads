@@ -323,11 +323,11 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
 }
 
 public enum DownloadDirectory {
-    case local(parentDirectoryName: String, groupIdentifier: String?)
+    case documents(parentDirectoryName: String, groupIdentifier: String?)
     
     public var directoryURL: URL? {
         switch self {
-        case .local(let parentDirectoryName, let groupIdentifier):
+        case .documents(let parentDirectoryName, let groupIdentifier):
             var containerURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
             if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
                 containerURL = sharedContainerURL
