@@ -106,6 +106,7 @@ public struct DownloadProgress: View {
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
+                .menuStyle(.borderlessButton)
             }
         }
     }
@@ -319,7 +320,7 @@ struct InnerDownloadProgressView: View {
             }
             .frame(width: size, height: size) // Use the size parameter
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.borderless)
     }
 }
 

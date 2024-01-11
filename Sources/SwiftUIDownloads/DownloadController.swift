@@ -204,6 +204,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         return unitIndex < 2 ? String(format: "%.0f \(units[unitIndex])", size) : String(format: "%.1f \(units[unitIndex])", size)
     }
     
+    @MainActor
     func existsLocally() -> Bool {
         return FileManager.default.fileExists(atPath: localDestination.path) || FileManager.default.fileExists(atPath: compressedFileURL.path)
     }
@@ -267,6 +268,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         return task
     }
     
+    @MainActor
     func sizeForLocalFile() -> UInt64 {
         do {
             let fileAttributes = try FileManager.default.attributesOfItem(atPath: localDestination.path)
@@ -281,6 +283,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         return 0
     }
     
+    @MainActor
     func decompressIfNeeded() throws {
         if FileManager.default.fileExists(atPath: compressedFileURL.path) {
             print("Attempting decompression for \(compressedFileURL)")
@@ -510,7 +513,7 @@ extension DownloadController {
             print("ERROR Failed to delete orphan files. \(error)")
         }
         await Task.detached { [weak self] in
-            if download.existsLocally() {
+            if await download.existsLocally() {
                 await self?.finishDownload(download)
                 if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 60) {
                     self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
@@ -654,6 +657,7 @@ extension DownloadController {
         }
     }
     
+    @MainActor
     public func finishDownload(_ download: Downloadable, etag: String? = nil) async {
         do {
             try download.decompressIfNeeded()
