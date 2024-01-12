@@ -515,7 +515,7 @@ extension DownloadController {
         await Task.detached { [weak self] in
             if await download.existsLocally() {
                 await self?.finishDownload(download)
-                if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 60) {
+                if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 12) {
                     self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
                         download.lastCheckedETagAt = Date()
                         if modified {
@@ -722,7 +722,7 @@ extension DownloadController {
                     return
                 }
                 
-                if modifiedDate > download.lastDownloaded ?? Date(timeIntervalSince1970: 0) {
+                if modifiedDate > (download.lastDownloaded ?? Date(timeIntervalSince1970: 0)) {
                     completion(true, modifiedDate, httpURLResponse.allHeaderFields["Etag"] as? String)
                     return
                 }
