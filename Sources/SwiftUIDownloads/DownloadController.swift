@@ -241,29 +241,38 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                 self?.isFinishedDownloading = true
             }
         }, receiveValue: { [weak self] progress in
-            self?.isActive = true
-            self?.downloadProgress = progress
+            guard let self = self else { return }
+            isActive = true
+            downloadProgress = progress
             // CHATGPT: INSERT self?.fileSize = ((uint64 here...))
             switch progress {
             case .completed(let destinationLocation, let etag, let urlError):
                 guard urlError == nil, let destinationLocation = destinationLocation else {
-                    self?.isFailed = true
-                    self?.isFinishedDownloading = false
-                    self?.isActive = false
+                    isFailed = true
+                    isFinishedDownloading = false
+                    isActive = false
                     return
                 }
-                self?.lastDownloadedETag = etag
-                self?.lastDownloaded = Date()
-                self?.isFinishedDownloading = true
-                self?.isActive = false
-                self?.isFailed = false
+                lastDownloadedETag = etag
+                lastDownloaded = Date()
+                isFinishedDownloading = true
+                isActive = false
+                isFailed = false
             case .downloading(let progress):
-                self?.fileSize = UInt64(progress.totalUnitCount)
+                fileSize = UInt64(progress.totalUnitCount)
+                if !progress.isFinished, !progress.isCancelled {
+                    isFailed = false
+                    isActive = true
+                    isFinishedDownloading = false
+                }
             default:
                 break
             }
         }).store(in: &cancellables)
         print("Downloading \(url) to \(destination)")
+        isFinishedDownloading = false
+        isActive = true
+        isFailed = false
         task.resume()
         return task
     }
