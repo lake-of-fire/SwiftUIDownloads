@@ -110,6 +110,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     @Published public var isFinishedDownloading = false
     @Published public var isFinishedProcessing = false
     @Published public var fileSize: UInt64? = nil
+    @Published public var finishedDownloadingAt: Date?
     
     private var cancellables = Set<AnyCancellable>()
     
@@ -524,7 +525,7 @@ extension DownloadController {
         await Task.detached { [weak self] in
             if await download.existsLocally() {
                 await self?.finishDownload(download)
-                if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 12) {
+                if true || download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 12) {
                     self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
                         download.lastCheckedETagAt = Date()
                         if modified {
@@ -794,6 +795,7 @@ extension DownloadController: BADownloadManagerDelegate {
                     Task.detached { [weak self] in
                         await self?.finishDownload(downloadable)
                         Task { @MainActor [weak self] in
+                            downloadable.finishedDownloadingAt = Date()
                             try await self?.cancelInProgressDownloads(inApp: true)
                         }
                     }
