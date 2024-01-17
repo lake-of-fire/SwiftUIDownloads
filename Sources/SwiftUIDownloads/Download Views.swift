@@ -98,15 +98,19 @@ public struct DownloadProgress: View {
             }
             if download.isFinishedProcessing && !isFailed {
                 Menu {
-                    Button("Re-download") {
+                    Button {
                         Task { @MainActor in
                             try? await redownloadAction()
                         }
+                    } label: {
+                        Label("Redownload", systemImage: "arrow.clockwise")
                     }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
                 .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
             }
         }
     }
