@@ -110,7 +110,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     @Published public var isFinishedDownloading = false
     @Published public var isFinishedProcessing = false
     @Published public var fileSize: UInt64? = nil
-    @Published public var finishedDownloadingAt: Date?
+    @Published public var finishedDownloadingDuringCurrentLaunchAt: Date?
     
     private var cancellables = Set<AnyCancellable>()
     
@@ -236,6 +236,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                 self?.isActive = false
                 self?.downloadProgress = .completed(destinationLocation: nil, etag: nil, error: error)
             case .finished:
+                self?.finishedDownloadingDuringCurrentLaunchAt = Date()
                 self?.lastDownloaded = Date()
                 self?.isFailed = false
                 self?.isActive = false
@@ -247,18 +248,19 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
             downloadProgress = progress
             // CHATGPT: INSERT self?.fileSize = ((uint64 here...))
             switch progress {
-            case .completed(let destinationLocation, let etag, let urlError):
-                guard urlError == nil, let destinationLocation = destinationLocation else {
-                    isFailed = true
-                    isFinishedDownloading = false
-                    isActive = false
-                    return
-                }
-                lastDownloadedETag = etag
-                lastDownloaded = Date()
-                isFinishedDownloading = true
-                isActive = false
-                isFailed = false
+//            case .completed(let destinationLocation, let etag, let urlError):
+//                guard urlError == nil, let destinationLocation = destinationLocation else {
+//                    isFailed = true
+//                    isFinishedDownloading = false
+//                    isActive = false
+//                    return
+//                }
+//                finishedDownloadingDuringCurrentLaunchAt = Date()
+//                lastDownloadedETag = etag
+//                lastDownloaded = Date()
+//                isFinishedDownloading = true
+//                isActive = false
+//                isFailed = false
             case .downloading(let progress):
                 fileSize = UInt64(progress.totalUnitCount)
                 if !progress.isFinished, !progress.isCancelled {
@@ -525,11 +527,10 @@ extension DownloadController {
         await Task.detached { [weak self] in
             if await download.existsLocally() {
                 await self?.finishDownload(download)
-                if true || download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 12) {
+                if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 12) {
                     self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
                         download.lastCheckedETagAt = Date()
                         if modified {
-                            print("Download \(download.url) modified upstream.")
                             Task { @MainActor [weak self] in
                                 await self?.download(download, etag: etag)
                             }
@@ -795,7 +796,7 @@ extension DownloadController: BADownloadManagerDelegate {
                     Task.detached { [weak self] in
                         await self?.finishDownload(downloadable)
                         Task { @MainActor [weak self] in
-                            downloadable.finishedDownloadingAt = Date()
+                            downloadable.finishedDownloadingDuringCurrentLaunchAt = Date()
                             try await self?.cancelInProgressDownloads(inApp: true)
                         }
                     }
