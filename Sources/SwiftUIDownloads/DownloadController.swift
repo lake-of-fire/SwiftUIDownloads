@@ -110,7 +110,10 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     @Published public var isFinishedDownloading = false
     @Published public var isFinishedProcessing = false
     @Published public var fileSize: UInt64? = nil
+    
+    // Helpers to make sure we don't double-import the same thing multiple times
     @Published public var finishedDownloadingDuringCurrentLaunchAt: Date?
+    @Published public var finishedLoadingDuringCurrentLaunchAt: Date?
     
     private var cancellables = Set<AnyCancellable>()
     
@@ -469,6 +472,7 @@ public extension DownloadController {
             let enumerator = FileManager.default.enumerator(atPath: path)
             while let filename = enumerator?.nextObject() as? String {
                 let fileURL = URL(fileURLWithPath: filename, relativeTo: dir).absoluteURL
+                // TODO: Don't delete realm management/lock files
                 if !saveFiles.contains(fileURL) {
                     print("DownloadController: deleting orphan \(fileURL)")
                     try FileManager.default.removeItem(at: fileURL)
