@@ -715,7 +715,7 @@ extension DownloadController {
     
     /// Checks if file at given URL is modified.
     /// Using "Last-Modified" header value to compare it with given date.
-    func checkFileModifiedAt(download: Downloadable, completion: @escaping (Bool, Date?, String?) -> Void) {
+    public func checkFileModifiedAt(download: Downloadable, completion: @escaping (Bool, Date?, String?) -> Void) {
         var request = URLRequest(url: download.url)
         request.httpMethod = "HEAD"
         URLSession.shared.dataTask(with: request, completionHandler: { (_, response, error) in
