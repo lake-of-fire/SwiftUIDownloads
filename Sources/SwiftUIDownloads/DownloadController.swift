@@ -209,7 +209,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     }
     
     @MainActor
-    func existsLocally() -> Bool {
+    public func existsLocally() -> Bool {
         return FileManager.default.fileExists(atPath: localDestination.path) || FileManager.default.fileExists(atPath: compressedFileURL.path)
     }
     
@@ -234,6 +234,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         task.publisher.receive(on: DispatchQueue.main).sink(receiveCompletion: { [weak self] completion in
             switch completion {
             case .failure(let error):
+                print(error)
                 self?.isFailed = true
                 self?.isFinishedDownloading = false
                 self?.isActive = false
@@ -695,7 +696,7 @@ extension DownloadController {
                 self?.activeDownloads.remove(download)
                 self?.finishedDownloads.insert(download)
                 if !download.isFinishedDownloading {
-                    print("Download \(download.url) finished downloading")
+                    print("Download \(download.url) finished downloading to \(download.localDestination)")
                 }
                 download.isFailed = false
                 download.isActive = false

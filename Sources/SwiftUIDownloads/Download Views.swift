@@ -202,29 +202,49 @@ public struct DownloadProgressView: View {
 public struct DownloadButton: View {
     @ObservedObject var downloadable: Downloadable
     @Binding var downloadURLs: [String]
+    let text: String
+    let downloadAction: ((Downloadable) async -> Void)?
     
-    public init(downloadable: Downloadable, downloadURLs: Binding<[String]>) {
+    @ScaledMetric(relativeTo: .caption) private var downloadButtonHorizontalPadding = 6
+    
+    public init(downloadable: Downloadable, downloadURLs: Binding<[String]> = .constant([]), text: String = "Download", downloadAction: ((Downloadable) async -> Void)? = nil) {
         self.downloadable = downloadable
         _downloadURLs = downloadURLs
+        self.text = text
+        self.downloadAction = downloadAction
+    }
+    
+    @ViewBuilder private var button: some View {
+        Button(action: {
+            downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.url.absoluteString])))
+            if let downloadAction = downloadAction {
+                Task {
+                    await downloadAction(downloadable)
+                }
+            }
+        }) {
+            Text(text)
+#if os(macOS)
+                .padding(.horizontal, downloadButtonHorizontalPadding)
+                .padding(.vertical, 1)
+                .overlay {
+                    Capsule(style: .continuous)
+                        .stroke(.primary, lineWidth: 1)
+                }
+#endif
+        }
+#if os(macOS)
+        .buttonStyle(.plain)
+#endif
     }
     
     public var body: some View {
         Group {
-            if #available(macOS 14, iOS 16, *) {
-                Button(action: {
-                    downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.url.absoluteString])))
-                }) {
-                    Text("Download")
-                }
-                .buttonStyle(.borderedProminent)
-                .buttonBorderShape(.capsule)
+            if #available(iOS 16, macOS 14, *) {
+                button
+                    .buttonBorderShape(.capsule)
             } else {
-                Button(action: {
-                    downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.url.absoluteString])))
-                }) {
-                    Text("Download")
-                }
-                .buttonStyle(.borderedProminent)
+                button
             }
         }
 //#if os(iOS)
@@ -328,6 +348,58 @@ struct InnerDownloadProgressView: View {
     }
 }
 
+public struct HidingDownloadButton: View {
+    @ObservedObject var downloadable: Downloadable
+    @Binding var downloadURLs: [String]
+    let downloadText: String
+    let downloadedText: String?
+    let downloadAction: ((Downloadable) async -> Void)?
+    
+    @State private var downloadExistedOnDisk = false
+    
+    @ObservedObject private var downloadController = DownloadController.shared
+    @ScaledMetric(relativeTo: .caption) private var downloadProgressSize: CGFloat = 20
+    @ScaledMetric(relativeTo: .body) private var downloadedRadius: CGFloat = 4
+    @ScaledMetric(relativeTo: .body) private var downloadButtonHorizontalPadding = 6
+    
+    public init(downloadable: Downloadable, downloadURLs: Binding<[String]> = .constant([]), downloadText: String = "Download", downloadedText: String? = nil, downloadAction: ((Downloadable) async -> Void)? = nil) {
+        self.downloadable = downloadable
+        _downloadURLs = downloadURLs
+        self.downloadText = downloadText
+        self.downloadedText = downloadedText
+        self.downloadAction = downloadAction
+    }
+    
+    public var body: some View {
+        VStack(spacing: 0) {
+            if downloadExistedOnDisk, let downloadedText = downloadedText {
+                Text(downloadedText)
+                    .padding(.horizontal, downloadButtonHorizontalPadding)
+                    .padding(.vertical, 1)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: downloadedRadius)
+                            .stroke(.secondary, lineWidth: 1)
+                    }
+                    .foregroundStyle(.secondary)
+            } else if !downloadExistedOnDisk {
+                if downloadable.isActive {
+                    DownloadProgressView(size: downloadProgressSize, downloadable: downloadable, downloadURLs: $downloadURLs)
+                    CancelDownloadButton(downloadable: downloadable, downloadURLs: $downloadURLs)
+                        .foregroundStyle(.secondary)
+                } else if !downloadable.isFinishedDownloading {
+                    DownloadButton(downloadable: downloadable, downloadURLs: $downloadURLs, text: downloadText, downloadAction: downloadAction)
+                    //                    .onChange(of: viewModel.selectedDownloadable) { downloadable in
+                    //                    }
+                }
+            }
+        }
+        .task { @MainActor in
+            downloadExistedOnDisk = downloadable.existsLocally()
+            downloadable.isFinishedDownloading = downloadExistedOnDisk
+        }
+    }
+}
+
 public struct DownloadControls: View {
     @ObservedObject var downloadable: Downloadable
     @Binding var downloadURLs: [String]
@@ -356,6 +428,7 @@ public struct DownloadControls: View {
                 modelDeleteButton
             } else {
                 DownloadButton(downloadable: downloadable, downloadURLs: $downloadURLs)
+                    .buttonStyle(.borderedProminent)
                 //                    .onChange(of: viewModel.selectedDownloadable) { downloadable in
                 //                    }
                 
