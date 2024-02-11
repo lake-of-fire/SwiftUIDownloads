@@ -205,7 +205,7 @@ public struct DownloadButton: View {
     let text: String
     let downloadAction: ((Downloadable) async -> Void)?
     
-    @ScaledMetric(relativeTo: .caption) private var downloadButtonHorizontalPadding = 6
+    @ScaledMetric(relativeTo: .caption) private var downloadButtonHorizontalPadding = 8
     
     public init(downloadable: Downloadable, downloadURLs: Binding<[String]> = .constant([]), text: String = "Download", downloadAction: ((Downloadable) async -> Void)? = nil) {
         self.downloadable = downloadable
@@ -224,14 +224,12 @@ public struct DownloadButton: View {
             }
         }) {
             Text(text)
-#if os(macOS)
                 .padding(.horizontal, downloadButtonHorizontalPadding)
-                .padding(.vertical, 1)
+                .padding(.vertical, 2)
                 .overlay {
                     Capsule(style: .continuous)
                         .stroke(.primary, lineWidth: 1)
                 }
-#endif
         }
 #if os(macOS)
         .buttonStyle(.plain)
@@ -359,8 +357,8 @@ public struct HidingDownloadButton: View {
     
     @ObservedObject private var downloadController = DownloadController.shared
     @ScaledMetric(relativeTo: .caption) private var downloadProgressSize: CGFloat = 20
-    @ScaledMetric(relativeTo: .body) private var downloadedRadius: CGFloat = 4
-    @ScaledMetric(relativeTo: .body) private var downloadButtonHorizontalPadding = 6
+    @ScaledMetric(relativeTo: .body) private var downloadedRadius: CGFloat = 3
+    @ScaledMetric(relativeTo: .body) private var downloadButtonHorizontalPadding = 8
     
     public init(downloadable: Downloadable, downloadURLs: Binding<[String]> = .constant([]), downloadText: String = "Download", downloadedText: String? = nil, downloadAction: ((Downloadable) async -> Void)? = nil) {
         self.downloadable = downloadable
@@ -375,7 +373,7 @@ public struct HidingDownloadButton: View {
             if downloadExistedOnDisk, let downloadedText = downloadedText {
                 Text(downloadedText)
                     .padding(.horizontal, downloadButtonHorizontalPadding)
-                    .padding(.vertical, 1)
+                    .padding(.vertical, 2)
                     .overlay {
                         RoundedRectangle(cornerRadius: downloadedRadius)
                             .stroke(.secondary, lineWidth: 1)
