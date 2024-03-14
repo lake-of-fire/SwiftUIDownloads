@@ -78,16 +78,19 @@ public struct DownloadProgress: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("\(download.isActive ? "Downloading " : "")\(download.name)")
                     .font(.callout)
-                ProgressView(value: fractionCompleted)
-                    .progressViewStyle(.linear)
-                    .frame(height: 5)
-                    .clipShape(Capsule())
+                if fractionCompleted < 1 {
+                    ProgressView(value: fractionCompleted)
+                        .progressViewStyle(.linear)
+                        .frame(height: 5)
+                        .clipShape(Capsule())
+                }
                 Text(statusText)
                     .font(.caption)
                     .monospacedDigit()
                     .foregroundColor(isFailed ? .red : .secondary)
             }
             .font(.callout)
+            .frame(maxWidth: .infinity, alignment: .leading)
             if isFailed {
                 Button("Retry") {
                     Task { @MainActor in
