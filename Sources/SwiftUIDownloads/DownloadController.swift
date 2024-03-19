@@ -473,8 +473,7 @@ public extension DownloadController {
             let enumerator = FileManager.default.enumerator(atPath: path)
             while let filename = enumerator?.nextObject() as? String {
                 let fileURL = URL(fileURLWithPath: filename, relativeTo: dir).absoluteURL
-                // TODO: Don't delete realm management/lock files
-                if !saveFiles.contains(fileURL) {
+                if !saveFiles.contains(fileURL) && !(fileURL.lastPathComponent.hasSuffix(".realm.lock") || fileURL.lastPathComponent.hasSuffix(".realm.management") || fileURL.lastPathComponent.hasSuffix(".realm.note")) {
                     print("DownloadController: deleting orphan \(fileURL)")
                     try FileManager.default.removeItem(at: fileURL)
                 }

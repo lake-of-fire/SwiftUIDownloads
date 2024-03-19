@@ -395,9 +395,16 @@ public struct HidingDownloadButton: View {
             }
         }
         .task { @MainActor in
-            downloadExistedOnDisk = downloadable.existsLocally()
-            downloadable.isFinishedDownloading = downloadExistedOnDisk
+            refreshDownloadable()
         }
+        .onChange(of: downloadable.isFinishedDownloading) { _ in
+            refreshDownloadable()
+        }
+    }
+    
+    private func refreshDownloadable() {
+        downloadExistedOnDisk = downloadable.existsLocally()
+        downloadable.isFinishedDownloading = downloadExistedOnDisk
     }
 }
 
