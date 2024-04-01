@@ -102,8 +102,6 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     public let localDestination: URL
     var isFromBackgroundAssetsDownloader: Bool? = nil
     
-    public let debugUUID = UUID()
-
     @Published internal var downloadProgress: URLResourceDownloadTaskProgress = .uninitiated
     @Published public var isFailed = false
     @Published public var isActive = false
@@ -416,8 +414,6 @@ public class DownloadController: NSObject, ObservableObject {
     @Published public var activeDownloads = Set<Downloadable>()
     @Published public var finishedDownloads = Set<Downloadable>()
     @Published public var failedDownloads = Set<Downloadable>()
-    
-    public let debugUUID = UUID()
     
     public var unfinishedDownloads: [Downloadable] {
         let downloads: [Downloadable] = Array(Set(activeDownloads).union(Set(failedDownloads)))
