@@ -468,6 +468,21 @@ public extension DownloadController {
             let path = dir.path
             let enumerator = FileManager.default.enumerator(atPath: path)
             while let filename = enumerator?.nextObject() as? String {
+                // Skipping directories and files under ".realm.management" or ending with ".realm.management"
+                let fullPath = URL(fileURLWithPath: filename, relativeTo: dir).absoluteURL
+                var shouldSkip = false
+                var currentPath = fullPath
+                while currentPath.path != dir.path {
+                    if currentPath.lastPathComponent.hasSuffix(".realm.management") {
+                        shouldSkip = true
+                        break
+                    }
+                    currentPath.deleteLastPathComponent()
+                }
+                if shouldSkip {
+                    continue
+                }
+                
                 let fileURL = URL(fileURLWithPath: filename, relativeTo: dir).absoluteURL
                 if !saveFiles.contains(fileURL) && !(fileURL.lastPathComponent.hasSuffix(".realm.lock") || fileURL.lastPathComponent.hasSuffix(".realm.management") || fileURL.lastPathComponent.hasSuffix(".realm.note")) {
                     print("DownloadController: deleting orphan \(fileURL)")
