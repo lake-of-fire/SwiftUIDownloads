@@ -342,28 +342,24 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
 public enum DownloadDirectory {
     case documents(parentDirectoryName: String, groupIdentifier: String?)
     
-    public var directoryURL: URL? {
+    public var directoryURL: URL {
         switch self {
         case .documents(let parentDirectoryName, let groupIdentifier):
-            var containerURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            var containerURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
             if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
                 containerURL = sharedContainerURL
             }
-            return containerURL?.appendingPathComponent(parentDirectoryName, isDirectory: true)
+            return containerURL.appendingPathComponent(parentDirectoryName, isDirectory: true)
         }
     }
 }
 
 public extension Downloadable {
-    convenience init?(name: String, destination: DownloadDirectory, filename: String? = nil, downloadMirrors: [URL]) {
-        guard let url = downloadMirrors.first else {
-            return nil
-        }
+    convenience init(name: String, destination: DownloadDirectory, filename: String? = nil, url: URL) {
 //        let filename = filename ?? url.lastPathComponent.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? url.lastPathComponent
         let filename = filename ?? url.lastPathComponent
         // TODO: macos 13+:   Downloadable(url: URL(string: "https://manabi.io/static/dictionaries/furigana.realm.br")!, mirrorURL: nil, name: "Furigana Data", localDestination: folderURL.appending(component: "furigana.realm")),
-        guard let directoryURL = destination.directoryURL else { return nil }
-        self.init(url: url, mirrorURL: downloadMirrors.dropFirst().first, name: name, localDestination: directoryURL.appendingPathComponent(filename))
+        self.init(url: url, mirrorURL: url, name: name, localDestination: destination.directoryURL.appendingPathComponent(filename))
     }
     
     #warning("Deprecated; remove in favor of above w/ DownloadDirectory")
@@ -461,10 +457,7 @@ public extension DownloadController {
         guard !locations.isEmpty else { return }
         let saveFiles = Set<URL>(assuredDownloads.map { $0.localDestination }).union(Set(assuredDownloads.map { $0.compressedFileURL }))
         for location in locations {
-            guard let dir = location.directoryURL else {
-                print("WARNING: No directoryURL for download location")
-                continue
-            }
+            let dir = location.directoryURL
             let path = dir.path
             let enumerator = FileManager.default.enumerator(atPath: path)
             while let filename = enumerator?.nextObject() as? String {
