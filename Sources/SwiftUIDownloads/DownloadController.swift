@@ -234,6 +234,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
             case .failure(let error):
                 print(error)
                 self?.isFailed = true
+                print("!! dling fail \(self?.url) \(error)")
                 self?.isFinishedDownloading = false
                 self?.isActive = false
                 self?.downloadProgress = .completed(destinationLocation: nil, etag: nil, error: error)
@@ -246,7 +247,6 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
             }
         }, receiveValue: { [weak self] progress in
             guard let self = self else { return }
-            isActive = true
             downloadProgress = progress
             // CHATGPT: INSERT self?.fileSize = ((uint64 here...))
             switch progress {
@@ -270,11 +270,17 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                     isActive = true
                     isFinishedDownloading = false
                 }
-            default:
-                break
+            case .uninitiated:
+                isActive = true
+            case .completed(_, _, _):
+                isActive = true
+            case .waitingForResponse:
+                isActive = true
             }
         }).store(in: &cancellables)
         print("Downloading \(url) to \(destination)")
+        
+        print("!! dling start \(url) \(destination)")
         isFinishedDownloading = false
         isActive = true
         isFailed = false
@@ -440,22 +446,14 @@ public extension DownloadController {
     @MainActor
     func ensureDownloaded(_ downloads: Set<Downloadable>, deletingOrphansIn: [DownloadDirectory] = []) async {
         for download in downloads {
-            assuredDownloads.insert(download)
-        }
-        do {
-            try await deleteOrphanFiles(in: deletingOrphansIn)
-        } catch {
-            print("ERROR Failed to delete orphan files. \(error)")
-        }
-        for download in downloads {
-            await ensureDownloaded(download: download)
+            await ensureDownloaded(download: download, excludingFromDeletion: downloads)
         }
     }
     
     @MainActor
-    func deleteOrphanFiles(in locations: [DownloadDirectory]) async throws {
+    func deleteOrphanFiles(in locations: [DownloadDirectory], excluding: Set<Downloadable> = Set()) async throws {
         guard !locations.isEmpty else { return }
-        let saveFiles = Set<URL>(assuredDownloads.map { $0.localDestination }).union(Set(assuredDownloads.map { $0.compressedFileURL }))
+        let saveFiles = Set<URL>(assuredDownloads.union(excluding).map { $0.localDestination }).union(Set(assuredDownloads.union(excluding).map { $0.compressedFileURL }))
         for location in locations {
             let dir = location.directoryURL
             let path = dir.path
@@ -524,19 +522,22 @@ public extension DownloadController {
 
 extension DownloadController {
     @MainActor
-    public func ensureDownloaded(download: Downloadable, deletingOrphansIn: [DownloadDirectory] = []) async {
-        //        for download in assuredDownloads {
+    public func ensureDownloaded(download: Downloadable, deletingOrphansIn: [DownloadDirectory] = [], excludingFromDeletion: Set<Downloadable> = Set()) async {
+        if assuredDownloads.contains(where: { $0.url == download.url }) && !failedDownloads.contains(where: { $0.url == download.url }) {
+            return
+        }
         assuredDownloads.insert(download)
         do {
-            try await deleteOrphanFiles(in: deletingOrphansIn)
+            try await deleteOrphanFiles(in: deletingOrphansIn, excluding: excludingFromDeletion)
         } catch {
             print("ERROR Failed to delete orphan files. \(error)")
         }
         await Task.detached { [weak self] in
+            guard let self = self else { return }
             if await download.existsLocally() {
-                await self?.finishDownload(download)
+                await finishDownload(download)
                 if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 12) {
-                    self?.checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
+                    checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
                         download.lastCheckedETagAt = Date()
                         if modified {
                             Task { @MainActor [weak self] in
