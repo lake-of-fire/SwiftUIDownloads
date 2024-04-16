@@ -280,7 +280,6 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         }).store(in: &cancellables)
         print("Downloading \(url) to \(destination)")
         
-        print("!! dling start \(url) \(destination)")
         isFinishedDownloading = false
         isActive = true
         isFailed = false
