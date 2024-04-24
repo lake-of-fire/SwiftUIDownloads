@@ -234,7 +234,6 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
             case .failure(let error):
                 print(error)
                 self?.isFailed = true
-                print("!! dling fail \(self?.url) \(error)")
                 self?.isFinishedDownloading = false
                 self?.isActive = false
                 self?.downloadProgress = .completed(destinationLocation: nil, etag: nil, error: error)
