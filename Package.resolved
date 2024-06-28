@@ -1,0 +1,14 @@
+{
+  "pins" : [
+    {
+      "identity" : "brotli",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/NghiaTranUIT/Brotli.git",
+      "state" : {
+        "branch" : "master",
+        "revision" : "57aae2129a6d5e56a6476b1a3891ed7049bc0a9a"
+      }
+    }
+  ],
+  "version" : 2
+}
