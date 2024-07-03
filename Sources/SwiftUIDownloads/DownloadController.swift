@@ -245,37 +245,39 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                 self?.isFinishedDownloading = true
             }
         }, receiveValue: { [weak self] progress in
-            guard let self = self else { return }
-            downloadProgress = progress
-            // CHATGPT: INSERT self?.fileSize = ((uint64 here...))
-            switch progress {
-//            case .completed(let destinationLocation, let etag, let urlError):
-//                guard urlError == nil, let destinationLocation = destinationLocation else {
-//                    isFailed = true
-//                    isFinishedDownloading = false
-//                    isActive = false
-//                    return
-//                }
-//                finishedDownloadingDuringCurrentLaunchAt = Date()
-//                lastDownloadedETag = etag
-//                lastDownloaded = Date()
-//                isFinishedDownloading = true
-//                isActive = false
-//                isFailed = false
-            case .downloading(let progress):
-                fileSize = UInt64(progress.totalUnitCount)
-                if !progress.isFinished, !progress.isCancelled {
-                    isFailed = false
+//            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                downloadProgress = progress
+                // CHATGPT: INSERT self?.fileSize = ((uint64 here...))
+                switch progress {
+                    //            case .completed(let destinationLocation, let etag, let urlError):
+                    //                guard urlError == nil, let destinationLocation = destinationLocation else {
+                    //                    isFailed = true
+                    //                    isFinishedDownloading = false
+                    //                    isActive = false
+                    //                    return
+                    //                }
+                    //                finishedDownloadingDuringCurrentLaunchAt = Date()
+                    //                lastDownloadedETag = etag
+                    //                lastDownloaded = Date()
+                    //                isFinishedDownloading = true
+                    //                isActive = false
+                    //                isFailed = false
+                case .downloading(let progress):
+                    fileSize = UInt64(progress.totalUnitCount)
+                    if !progress.isFinished, !progress.isCancelled {
+                        isFailed = false
+                        isActive = true
+                        isFinishedDownloading = false
+                    }
+                case .uninitiated:
                     isActive = true
-                    isFinishedDownloading = false
+                case .completed(_, _, _):
+                    isActive = true
+                case .waitingForResponse:
+                    isActive = true
                 }
-            case .uninitiated:
-                isActive = true
-            case .completed(_, _, _):
-                isActive = true
-            case .waitingForResponse:
-                isActive = true
-            }
+//            }
         }).store(in: &cancellables)
         print("Downloading \(url) to \(destination)")
         
