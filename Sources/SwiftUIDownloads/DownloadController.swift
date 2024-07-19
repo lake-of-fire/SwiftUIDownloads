@@ -303,11 +303,9 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         return 0
     }
     
-    @MainActor
-    func decompressIfNeeded() throws {
+    func decompressIfNeeded() async throws {
         if FileManager.default.fileExists(atPath: compressedFileURL.path) {
             print("Attempting decompression for \(compressedFileURL)")
-            fileSize = sizeForLocalFile()
             let data = try Data(contentsOf: compressedFileURL)
             // TODO: When dropping iOS 15, switch to native Apple Brotli
             //            let decompressed = try data.decompressed(from: COMPRESSION_BROTLI)
@@ -333,6 +331,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                 }
                 try decompressed.write(to: localDestination, options: .atomic)
             }
+            
+            await fileSize = sizeForLocalFile()
             
             do {
                 try FileManager.default.removeItem(at: compressedFileURL)
@@ -680,8 +680,10 @@ extension DownloadController {
     @MainActor
     public func finishDownload(_ download: Downloadable, etag: String? = nil) async {
         do {
-            try download.decompressIfNeeded()
-
+            try await Task.detached(priority: .utility) {
+                try await download.decompressIfNeeded()
+            }.value
+            
             // Confirm non-empty
             let resourceValues = try download.localDestination.resourceValues(forKeys: [.fileSizeKey])
             guard let fileSize = resourceValues.fileSize, fileSize > 0 else {
