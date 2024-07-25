@@ -332,7 +332,11 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                 try decompressed.write(to: localDestination, options: .atomic)
             }
             
-            await fileSize = sizeForLocalFile()
+            Task { @MainActor [weak self] in
+                if let sizeToSet = self?.sizeForLocalFile() {
+                    self?.fileSize = sizeToSet
+                }
+            }
             
             do {
                 try FileManager.default.removeItem(at: compressedFileURL)
