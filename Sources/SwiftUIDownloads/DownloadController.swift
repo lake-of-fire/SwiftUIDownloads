@@ -332,6 +332,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
                 try decompressed.write(to: localDestination, options: .atomic)
             }
             
+            print("Decompressed \(compressedFileURL)")
             Task { @MainActor [weak self] in
                 if let sizeToSet = self?.sizeForLocalFile() {
                     self?.fileSize = sizeToSet
@@ -406,7 +407,7 @@ public class DownloadController: NSObject, ObservableObject {
     public static var shared: DownloadController = {
         let controller = DownloadController()
         if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
-            Task.detached { [weak controller] in
+            Task.detached(priority: .utility) { [weak controller] in
                 if #available(macOS 13.0, iOS 16.1, *) {
                     BADownloadManager.shared.delegate = controller
                 } else { }
@@ -536,11 +537,11 @@ extension DownloadController {
         } catch {
             print("ERROR Failed to delete orphan files. \(error)")
         }
-        await Task.detached { [weak self] in
+        await Task.detached(priority: .utility) { [weak self] in
             guard let self = self else { return }
             if await download.existsLocally() {
                 await finishDownload(download)
-                if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60 * 60 * 12) {
+                if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60) {//} TimeInterval(60 * 60 * 2) {
                     checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
                         download.lastCheckedETagAt = Date()
                         if modified {
@@ -590,7 +591,7 @@ extension DownloadController {
                     }
                 }
                 if let download = download {
-                    Task.detached { [weak self] in
+                    Task.detached(priority: .utility) { [weak self] in
                         await self?.finishDownload(download, etag: etag)
                     }
                 }
@@ -599,7 +600,7 @@ extension DownloadController {
             }
         }.store(in: &cancellables)
 
-        await Task.detached {
+        await Task.detached(priority: .utility) {
             let allTasks = await URLSession.shared.allTasks
             if allTasks.first(where: { $0.taskDescription == download.url.absoluteString }) != nil {
                 // Task exists.
@@ -608,7 +609,7 @@ extension DownloadController {
             
             if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
                 if #available(macOS 13, iOS 16.1, *) {
-                    Task.detached {
+                    Task.detached(priority: .utility) {
                         do {
                             if let baDL = download.backgroundAssetDownload(applicationGroupIdentifier: "group.io.manabi.shared"), try await BADownloadManager.shared.currentDownloads.contains(baDL) {
                                 if #available(iOS 16.4, macOS 13.3, *) {
@@ -808,7 +809,7 @@ extension DownloadController: BADownloadManagerDelegate {
                         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
                         try FileManager.default.moveItem(at: fileURL, to: destination)
                     } catch { }
-                    Task.detached { [weak self] in
+                    Task.detached(priority: .utility) { [weak self] in
                         await self?.finishDownload(downloadable)
                         Task { @MainActor [weak self] in
                             downloadable.finishedDownloadingDuringCurrentLaunchAt = Date()
