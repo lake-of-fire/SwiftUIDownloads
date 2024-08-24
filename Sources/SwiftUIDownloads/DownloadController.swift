@@ -552,9 +552,10 @@ extension DownloadController {
                     }
                 }
             } else {
-                await Task { @MainActor [weak self] in
+                async let task = { @MainActor [weak self] in
                     await self?.download(download)
-                }.value
+                }()
+                try? await task
             }
         }.value
         //        }
@@ -600,7 +601,7 @@ extension DownloadController {
             }
         }.store(in: &cancellables)
 
-        await Task.detached(priority: .utility) {
+        async let task = {
             let allTasks = await URLSession.shared.allTasks
             if allTasks.first(where: { $0.taskDescription == download.url.absoluteString }) != nil {
                 // Task exists.
@@ -630,7 +631,7 @@ extension DownloadController {
             
             download.isFromBackgroundAssetsDownloader = false
             // Wait for DL to finish or error.
-            await Task { @MainActor in
+            async let task = { @MainActor in
                 let task = download.download()
                 _ = try? await task.publisher.values.first(where: { progress in
                     switch progress {
@@ -638,8 +639,10 @@ extension DownloadController {
                     default: return false
                     }
                 })
-            }.value
-        }.value
+            }()
+            try await task
+        }()
+        try? await task
     }
     
     public func cancelInProgressDownloads(matchingDownloadURL downloadURL: URL? = nil) async {
@@ -692,16 +695,17 @@ extension DownloadController {
             // Confirm non-empty
             let resourceValues = try download.localDestination.resourceValues(forKeys: [.fileSizeKey])
             guard let fileSize = resourceValues.fileSize, fileSize > 0 else {
-                await Task { @MainActor [weak self] in
+                async let task = { @MainActor [weak self] in
                     self?.activeDownloads.remove(download)
                     self?.finishedDownloads.remove(download)
                     self?.failedDownloads.insert(download)
-                }.value
+                }()
+                try await task
                 return
             }
 //              print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
             
-            await Task { @MainActor [weak self] in
+            async let task = { @MainActor [weak self] in
                 download.lastDownloadedETag = etag ?? download.lastDownloadedETag
                 self?.failedDownloads.remove(download)
                 self?.activeDownloads.remove(download)
@@ -713,15 +717,17 @@ extension DownloadController {
                 download.isActive = false
                 download.isFinishedDownloading = true
                 download.isFinishedProcessing = true
-            }.value
+            }()
+            try await task
         } catch {
-            await Task { @MainActor [weak self] in
+            async let task = { @MainActor [weak self] in
                 self?.failedDownloads.insert(download)
                 self?.activeDownloads.remove(download)
                 self?.finishedDownloads.remove(download)
                 try? FileManager.default.removeItem(at: download.compressedFileURL)
                 try? FileManager.default.removeItem(at: download.localDestination)
-            }.value
+            }()
+            try await task
         }
     }
     
