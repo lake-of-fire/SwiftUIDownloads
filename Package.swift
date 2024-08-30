@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .library(
             name: "SwiftUIDownloads",
+            type: .dynamic,
             targets: ["SwiftUIDownloads"]),
     ],
     dependencies: [
