@@ -207,6 +207,21 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     }
     
     @MainActor
+    public func awaitCompletionOrFailure() async throws {
+        guard !(isFinishedProcessing || isFailed) else { return }
+        
+        try await withCheckedThrowingContinuation { continuation in
+            var cancellable: AnyCancellable?
+            cancellable = $isFailed.combineLatest($isFinishedProcessing)
+                .filter { $0 || $1 }
+                .sink { _ in
+                    continuation.resume()
+                    cancellable?.cancel() // Clean up after finishing
+                }
+        }
+    }
+    
+    @MainActor
     public func existsLocally() -> Bool {
         return FileManager.default.fileExists(atPath: localDestination.path) || FileManager.default.fileExists(atPath: compressedFileURL.path)
     }
@@ -229,10 +244,11 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     func download() -> URLResourceDownloadTask {
         let destination = url.pathExtension == "br" ? compressedFileURL : localDestination
         let task = URLResourceDownloadTask(session: URLSession.shared, url: url, destination: destination)
+        
         task.publisher.receive(on: DispatchQueue.main).sink(receiveCompletion: { [weak self] completion in
             switch completion {
             case .failure(let error):
-                print(error)
+                debugPrint("Download failed", error)
                 self?.isFailed = true
                 self?.isFinishedDownloading = false
                 self?.isActive = false
@@ -351,16 +367,36 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
 }
 
 public enum DownloadDirectory {
-    case documents(parentDirectoryName: String, groupIdentifier: String?)
+    // TODO: Cache and App Support destinations
+    
+    case documents(
+        parentDirectoryName: String?,
+        subdirectoryName: String? = nil,
+        groupIdentifier: String?
+    )
     
     public var directoryURL: URL {
         switch self {
-        case .documents(let parentDirectoryName, let groupIdentifier):
+        case .documents(
+            let parentDirectoryName,
+            let subdirectoryName,
+            let groupIdentifier
+        ):
             var containerURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
             if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
                 containerURL = sharedContainerURL
             }
-            return containerURL.appendingPathComponent(parentDirectoryName, isDirectory: true)
+            var url = containerURL.appendingPathComponent("swiftui-downloads", isDirectory: true)
+            
+            if let parentDirectoryName {
+               url = containerURL.appendingPathComponent(parentDirectoryName, isDirectory: true)
+            }
+            
+            if let subdirectoryName {
+                url = url.appendingPathComponent(subdirectoryName, isDirectory: true)
+            }
+                
+            return url
         }
     }
 }
@@ -454,20 +490,26 @@ public extension DownloadController {
             await ensureDownloaded(download: download, deletingOrphansIn: deletingOrphansIn, excludingFromDeletion: downloads)
         }
     }
-    
     @MainActor
     func deleteOrphanFiles(in locations: [DownloadDirectory], excluding: Set<Downloadable> = Set()) async throws {
         guard !locations.isEmpty else { return }
-        let saveFiles = Set<URL>(assuredDownloads.union(excluding).map { $0.localDestination }).union(Set(assuredDownloads.union(excluding).map { $0.compressedFileURL }))
+        
+        let saveFiles = Set<URL>(assuredDownloads.union(excluding).map { $0.localDestination })
+            .union(Set(assuredDownloads.union(excluding).map { $0.compressedFileURL }))
+        
+        var potentialOrphanDirs = Set<URL>()
+        var seenSavedFiles = Set<URL>()
+        
         for location in locations {
             let dir = location.directoryURL
             let path = dir.path
             let enumerator = FileManager.default.enumerator(atPath: path)
+            
             while let filename = enumerator?.nextObject() as? String {
-                // Skipping directories and files under ".realm.management" or ending with ".realm.management"
-                let fullPath = URL(fileURLWithPath: filename, relativeTo: dir).absoluteURL
+                let fileURL = URL(fileURLWithPath: filename, relativeTo: dir).absoluteURL
+                
                 var shouldSkip = false
-                var currentPath = fullPath
+                var currentPath = fileURL
                 while currentPath.path != dir.path {
                     if currentPath.lastPathComponent.hasSuffix(".realm.management") {
                         shouldSkip = true
@@ -475,15 +517,27 @@ public extension DownloadController {
                     }
                     currentPath.deleteLastPathComponent()
                 }
-                if shouldSkip {
+                if shouldSkip { continue }
+                
+                if saveFiles.contains(fileURL) || fileURL.lastPathComponent.hasSuffix(".realm.lock") || fileURL.lastPathComponent.hasSuffix(".realm.management") || fileURL.lastPathComponent.hasSuffix(".realm.note") {
+                    seenSavedFiles.insert(fileURL)
                     continue
                 }
                 
-                let fileURL = URL(fileURLWithPath: filename, relativeTo: dir).absoluteURL
-                if !saveFiles.contains(fileURL) && !(fileURL.lastPathComponent.hasSuffix(".realm.lock") || fileURL.lastPathComponent.hasSuffix(".realm.management") || fileURL.lastPathComponent.hasSuffix(".realm.note")) {
+                var isDirectory: ObjCBool = false
+                if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                    potentialOrphanDirs.insert(fileURL)
+                } else {
                     print("DownloadController: deleting orphan \(fileURL)")
                     try FileManager.default.removeItem(at: fileURL)
                 }
+            }
+        }
+        
+        for orphanDir in potentialOrphanDirs {
+            if !seenSavedFiles.contains(where: { $0.path.hasPrefix(orphanDir.path) }) {
+                print("DownloadController: deleting orphan directory \(orphanDir)")
+                try FileManager.default.removeItem(at: orphanDir)
             }
         }
     }
@@ -539,6 +593,7 @@ extension DownloadController {
         }
         await Task.detached(priority: .utility) { [weak self] in
             guard let self = self else { return }
+            
             if await download.existsLocally() {
                 await finishDownload(download)
                 if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60) {//} TimeInterval(60 * 60 * 2) {
@@ -691,7 +746,7 @@ extension DownloadController {
             try await Task.detached(priority: .utility) {
                 try await download.decompressIfNeeded()
             }.value
-            
+         
             // Confirm non-empty
             let resourceValues = try download.localDestination.resourceValues(forKeys: [.fileSizeKey])
             guard let fileSize = resourceValues.fileSize, fileSize > 0 else {
