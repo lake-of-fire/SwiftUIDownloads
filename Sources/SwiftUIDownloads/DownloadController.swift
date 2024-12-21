@@ -206,16 +206,26 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         return unitIndex < 2 ? String(format: "%.0f \(units[unitIndex])", size) : String(format: "%.1f \(units[unitIndex])", size)
     }
     
+    /// Returns whether it became downloaded.
     @MainActor
-    public func awaitCompletionOrFailure() async throws {
-        guard !(isFinishedProcessing || isFailed) else { return }
+    public func awaitCompletionOrFailure() async throws -> Bool {
+        guard !(isFinishedProcessing || isFailed) else {
+            return isFinishedProcessing // Return `true` if finished, `false` if failed
+        }
         
-        try await withCheckedThrowingContinuation { continuation in
+        return try await withCheckedThrowingContinuation { continuation in
             var cancellable: AnyCancellable?
             cancellable = $isFailed.combineLatest($isFinishedProcessing)
                 .filter { $0 || $1 }
-                .sink { _ in
-                    continuation.resume()
+                .sink { isFailed, isFinishedProcessing in
+                    if isFailed {
+//                        continuation.resume(throwing: NSError(domain: "DownloadError", code: 1, userInfo: nil)) // Replace with a specific error if available
+                        continuation.resume(returning: false)
+                    } else if isFinishedProcessing {
+                        continuation.resume(returning: true)
+                    } else {
+                        continuation.resume(returning: false)
+                    }
                     cancellable?.cancel() // Clean up after finishing
                 }
         }
