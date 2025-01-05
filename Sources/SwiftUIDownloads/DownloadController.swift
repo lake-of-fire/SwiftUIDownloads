@@ -190,6 +190,10 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         return lhs.url == rhs.url && lhs.mirrorURL == rhs.mirrorURL && lhs.name == rhs.name && lhs.localDestination == rhs.localDestination
     }
     
+    public var localDestinationFilename: String {
+        return localDestination.lastPathComponent
+    }
+    
     public var compressedFileURL: URL {
         return localDestination.appendingPathExtension("br")
     }
