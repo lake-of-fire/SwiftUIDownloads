@@ -100,6 +100,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     let mirrorURL: URL?
     public let name: String
     public let localDestination: URL
+    /// If the file is compressed, this is the post-decompression checksum.
+    public let localDestinationChecksum: String?
     var isFromBackgroundAssetsDownloader: Bool? = nil
     
     @Published internal var downloadProgress: URLResourceDownloadTaskProgress = .uninitiated
@@ -178,16 +180,26 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
         }
     }
     
-    public init(url: URL, mirrorURL: URL? = nil, name: String, localDestination: URL, isFromBackgroundAssetsDownloader: Bool? = nil) {
+    /// localDestinationChecksum is currently NOT checked.
+    // TODO: Verify localDestinationChecksum after download and decompress (was originally added for use in Cache)
+    public init(
+        url: URL,
+        mirrorURL: URL? = nil,
+        name: String,
+        localDestination: URL,
+        localDestinationChecksum: String? = nil,
+        isFromBackgroundAssetsDownloader: Bool? = nil
+    ) {
         self.url = url
         self.mirrorURL = mirrorURL
         self.name = name
         self.localDestination = localDestination
+        self.localDestinationChecksum = localDestinationChecksum
         self.isFromBackgroundAssetsDownloader = isFromBackgroundAssetsDownloader
     }
     
     public static func == (lhs: Downloadable, rhs: Downloadable) -> Bool {
-        return lhs.url == rhs.url && lhs.mirrorURL == rhs.mirrorURL && lhs.name == rhs.name && lhs.localDestination == rhs.localDestination
+        return lhs.url == rhs.url && lhs.mirrorURL == rhs.mirrorURL && lhs.name == rhs.name && lhs.localDestination == rhs.localDestination && lhs.localDestinationChecksum == rhs.localDestinationChecksum
     }
     
     public var localDestinationFilename: String {
@@ -416,11 +428,23 @@ public enum DownloadDirectory {
 }
 
 public extension Downloadable {
-    convenience init(name: String, destination: DownloadDirectory, filename: String? = nil, url: URL) {
+    convenience init(
+        name: String,
+        destination: DownloadDirectory,
+        filename: String? = nil,
+        url: URL,
+        localDestinationChecksum: String? = nil
+    ) {
 //        let filename = filename ?? url.lastPathComponent.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? url.lastPathComponent
         let filename = filename ?? url.lastPathComponent
         // TODO: macos 13+:   Downloadable(url: URL(string: "https://manabi.io/static/dictionaries/furigana.realm.br")!, mirrorURL: nil, name: "Furigana Data", localDestination: folderURL.appending(component: "furigana.realm")),
-        self.init(url: url, mirrorURL: url, name: name, localDestination: destination.directoryURL.appendingPathComponent(filename))
+        self.init(
+            url: url,
+            mirrorURL: url,
+            name: name,
+            localDestination: destination.directoryURL.appendingPathComponent(filename),
+            localDestinationChecksum: localDestinationChecksum
+        )
     }
     
     #warning("Deprecated; remove in favor of above w/ DownloadDirectory")
