@@ -701,26 +701,26 @@ extension DownloadController {
                 return
             }
             
-            if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
-                if #available(macOS 13, iOS 16.1, *) {
-                    Task.detached(priority: .utility) {
-                        do {
-                            if let baDL = download.backgroundAssetDownload(applicationGroupIdentifier: "group.io.manabi.shared"), try await BADownloadManager.shared.currentDownloads.contains(baDL) {
-                                if #available(iOS 16.4, macOS 13.3, *) {
-                                    if !baDL.isEssential {
-                                        try BADownloadManager.shared.startForegroundDownload(baDL)
-                                    }
-                                } else {
-                                    try BADownloadManager.shared.startForegroundDownload(baDL)
-                                }
-                                return
-                            }
-                        } catch {
-                            print("Unable to download background asset...")
-                        }
-                    }
-                } else { }
-            }
+//            if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
+//                if #available(macOS 13, iOS 16.1, *) {
+//                    Task.detached(priority: .utility) {
+//                        do {
+//                            if let baDL = download.backgroundAssetDownload(applicationGroupIdentifier: ""), try await BADownloadManager.shared.currentDownloads.contains(baDL) {
+//                                if #available(iOS 16.4, macOS 13.3, *) {
+//                                    if !baDL.isEssential {
+//                                        try BADownloadManager.shared.startForegroundDownload(baDL)
+//                                    }
+//                                } else {
+//                                    try BADownloadManager.shared.startForegroundDownload(baDL)
+//                                }
+//                                return
+//                            }
+//                        } catch {
+//                            print("Unable to download background asset...")
+//                        }
+//                    }
+//                } else { }
+//            }
             
             download.isFromBackgroundAssetsDownloader = false
             // Wait for DL to finish or error.
