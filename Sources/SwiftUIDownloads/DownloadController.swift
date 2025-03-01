@@ -223,7 +223,6 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     }
     
     /// Returns whether it became downloaded.
-    @MainActor
     public func awaitCompletionOrFailure() async throws -> Bool {
         guard !(isFinishedProcessing || isFailed) else {
             return isFinishedProcessing // Return `true` if finished, `false` if failed
