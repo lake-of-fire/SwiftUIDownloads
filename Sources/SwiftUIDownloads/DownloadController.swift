@@ -112,8 +112,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
     @Published public var fileSize: UInt64? = nil
     
     // Helpers to make sure we don't double-import the same thing multiple times
-    @Published public var finishedDownloadingDuringCurrentLaunchAt: Date?
-    @Published public var finishedLoadingDuringCurrentLaunchAt: Date?
+    public var finishedDownloadingDuringCurrentLaunchAt: Date?
+    public var finishedLoadingDuringCurrentLaunchAt: Date?
     
     private var cancellables = Set<AnyCancellable>()
     
