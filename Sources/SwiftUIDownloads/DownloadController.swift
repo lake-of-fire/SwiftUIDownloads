@@ -392,9 +392,15 @@ public class Downloadable: ObservableObject, Identifiable, Hashable {
 }
 
 public enum DownloadDirectory {
-    // TODO: Cache and App Support destinations
+    // TODO: Cache destinations
     
     case documents(
+        parentDirectoryName: String?,
+        subdirectoryName: String? = nil,
+        groupIdentifier: String?
+    )
+    
+    case appSupport(
         parentDirectoryName: String?,
         subdirectoryName: String? = nil,
         groupIdentifier: String?
@@ -414,13 +420,27 @@ public enum DownloadDirectory {
             var url = containerURL.appendingPathComponent("swiftui-downloads", isDirectory: true)
             
             if let parentDirectoryName {
-               url = containerURL.appendingPathComponent(parentDirectoryName, isDirectory: true)
+                url = containerURL.appendingPathComponent(parentDirectoryName, isDirectory: true)
             }
             
             if let subdirectoryName {
                 url = url.appendingPathComponent(subdirectoryName, isDirectory: true)
             }
-                
+            
+            return url
+            
+        case .appSupport(let parentDirectoryName, let subdirectoryName, let groupIdentifier):
+            var containerURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
+                containerURL = sharedContainerURL
+            }
+            var url = containerURL
+            if let parentDirectoryName {
+                url = url.appendingPathComponent(parentDirectoryName, isDirectory: true)
+            }
+            if let subdirectoryName {
+                url = url.appendingPathComponent(subdirectoryName, isDirectory: true)
+            }
             return url
         }
     }
