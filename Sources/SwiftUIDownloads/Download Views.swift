@@ -7,7 +7,7 @@ public struct DownloadProgress: View {
     
     private var statusText: String {
         if download.isFinishedProcessing {
-            return "Finished"
+            return "Installed"
         }
         switch download.downloadProgress {
         case .downloading(let progress):
@@ -24,7 +24,7 @@ public struct DownloadProgress: View {
                 return "Error: \(error.localizedDescription)"
             } else if destinationLocation != nil {
                 if download.isFinishedProcessing {
-                    return "Finished"
+                    return "Installed"
                 } else {
                     return "Installing…"
                 }
@@ -114,6 +114,7 @@ public struct DownloadProgress: View {
                 .menuStyle(.borderlessButton)
                 .menuIndicator(.hidden)
                 .fixedSize()
+                .tint(.secondary)
             }
         }
     }
