@@ -528,7 +528,7 @@ public class DownloadController: NSObject, ObservableObject {
         
         $activeDownloads.removeDuplicates().combineLatest($failedDownloads.removeDuplicates())
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] (active, failed) in
+            .sink { @MainActor [weak self] (active, failed) in
                 self?.isPending = !(active.isEmpty && failed.isEmpty)
             }
             .store(in: &cancellables)
@@ -675,14 +675,14 @@ extension DownloadController {
     
     @MainActor
     public func download(_ download: Downloadable, etag: String? = nil) async {
-        download.$isActive.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] isActive in
+        download.$isActive.removeDuplicates().receive(on: DispatchQueue.main).sink { @MainActor [weak self] isActive in
             if isActive {
                 self?.activeDownloads.insert(download)
             } else {
                 self?.activeDownloads.remove(download)
             }
         }.store(in: &cancellables)
-        download.$isFailed.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] isFailed in
+        download.$isFailed.removeDuplicates().receive(on: DispatchQueue.main).sink { @MainActor [weak self] isFailed in
             if isFailed {
                 self?.finishedDownloads.remove(download)
                 self?.failedDownloads.insert(download)
@@ -691,7 +691,7 @@ extension DownloadController {
                 self?.failedDownloads.remove(download)
             }
         }.store(in: &cancellables)
-        download.$isFinishedDownloading.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self, weak download] isFinishedDownloading in
+        download.$isFinishedDownloading.removeDuplicates().receive(on: DispatchQueue.main).sink { @MainActor [weak self, weak download] isFinishedDownloading in
             if isFinishedDownloading {
                 if let download = download {
                     self?.failedDownloads.remove(download)
