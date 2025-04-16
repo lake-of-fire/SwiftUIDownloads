@@ -6,7 +6,7 @@ import BackgroundAssets
 import Brotli
 
 @globalActor
-internal actor DownloadActor {
+public actor DownloadActor {
     public static var shared = DownloadActor()
 }
 
@@ -154,6 +154,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
         return downloadProgress.fractionCompleted
     }
     
+    @MainActor
     public var lastDownloadedETag: String? {
         get {
             return UserDefaults.standard.object(forKey: "fileLastDownloadedETag:\(url.absoluteString)") as? String
@@ -167,6 +168,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
         }
     }
     
+    @MainActor
     public var lastCheckedETagAt: Date? {
         get {
             return UserDefaults.standard.object(forKey: "fileLastCheckedETagAt:\(url.absoluteString)") as? Date
@@ -180,6 +182,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
         }
     }
     
+    @MainActor
     public var lastDownloaded: Date? {
         get {
             return UserDefaults.standard.object(forKey: "fileLastDownloadedDate:\(url.absoluteString)") as? Date
@@ -262,13 +265,13 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
     }
     
     @DownloadActor
-    public func existsLocally() -> Bool {
-        return FileManager.default.fileExists(atPath: localDestination.path) || FileManager.default.fileExists(atPath: compressedFileURL.path)
+    public func existsLocally() async -> Bool {
+        return await FileManager.default.fileExists(atPath: localDestination.path) || FileManager.default.fileExists(atPath: compressedFileURL.path)
     }
     
     @DownloadActor
     public func fetchRemoteFileSize() async throws {
-        if !existsLocally() {
+        if await !existsLocally() {
             var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 6)
             request.httpMethod = "HEAD"
             do {
@@ -691,7 +694,7 @@ extension DownloadController {
             await finishDownload(download)
             if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60) {//} TimeInterval(60 * 60 * 2) {
                 await checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
-                    Task { @DownloadActor [weak self] in
+                    Task { @MainActor [weak self] in
                         download.lastCheckedETagAt = Date()
                         if modified {
                             await self?.download(download, etag: etag)
