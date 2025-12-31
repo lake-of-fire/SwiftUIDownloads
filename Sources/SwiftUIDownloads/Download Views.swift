@@ -5,6 +5,10 @@ public struct DownloadProgress: View {
     let retryAction: (() async throws -> Void)
     let redownloadAction: (() async throws -> Void)
     
+    private var displayName: String {
+        return download.name
+    }
+
     private var statusText: String {
         if download.isFinishedProcessing {
             return "Installed"
@@ -26,6 +30,10 @@ public struct DownloadProgress: View {
                 if download.isFinishedProcessing {
                     return "Installed"
                 } else {
+                    if let importable = download as? ImportableDownloadable,
+                       let status = importable.importStatusText {
+                        return status
+                    }
                     return "Installing…"
                 }
             }
@@ -52,7 +60,14 @@ public struct DownloadProgress: View {
         case .downloading(let progress):
             return progress.fractionCompleted
         case .completed(let destinationLocation, _, let error):
-            return destinationLocation != nil && error == nil ? 1.0 : 0
+            if destinationLocation != nil && error == nil {
+                if let importable = download as? ImportableDownloadable,
+                   let importProgress = importable.importProgress {
+                    return importProgress
+                }
+                return 1.0
+            }
+            return 0
         default:
             return 0
         }
@@ -69,15 +84,11 @@ public struct DownloadProgress: View {
                     Image(systemName: "exclamationmark.circle")
                         .foregroundColor(.red)
                         .font(.title)
-                } else {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .scaleEffect(0.75, anchor: .center)
                 }
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(download.isActive ? "Downloading " : "")\(download.name)")
-                    .font(.callout)
+                Text(displayName)
+                    .font(.caption)
                 if fractionCompleted < 1 {
                     ProgressView(value: fractionCompleted)
                         .progressViewStyle(.linear)
@@ -89,7 +100,6 @@ public struct DownloadProgress: View {
                     .monospacedDigit()
                     .foregroundColor(isFailed ? .red : .secondary)
             }
-            .font(.callout)
             .frame(maxWidth: .infinity, alignment: .leading)
             if isFailed {
                 Button("Retry") {

@@ -5,6 +5,8 @@ import Compression
 import BackgroundAssets
 import Brotli
 
+// TODO: Extract download state transitions + import handling into a small processor/state machine once behavior stabilizes.
+
 @globalActor
 public actor DownloadActor {
     public static var shared = DownloadActor()
@@ -108,6 +110,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
     /// If the file is compressed, this is the post-decompression checksum.
     public let localDestinationChecksum: String?
     var isFromBackgroundAssetsDownloader: Bool? = nil
+    public let metadataStore: any DownloadableMetadataStore
+    @MainActor public var shouldCheckForUpdates: Bool = true
     
     @MainActor
     @Published internal var downloadProgress: URLResourceDownloadTaskProgress = .uninitiated
@@ -156,42 +160,44 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
     
     @MainActor
     public var lastDownloadedETag: String? {
-        get {
-            return UserDefaults.standard.object(forKey: "fileLastDownloadedETag:\(url.absoluteString)") as? String
-        }
+        get { metadataStore.lastDownloadedETag(for: url) }
         set {
-            if let newValue = newValue {
-                UserDefaults.standard.set(newValue, forKey: "fileLastDownloadedETag:\(url.absoluteString)")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "fileLastDownloadedETag:\(url.absoluteString)")
+            let value = newValue
+            Task { @DownloadActor in
+                metadataStore.setLastDownloadedETag(value, for: url)
             }
         }
     }
     
     @MainActor
     public var lastCheckedETagAt: Date? {
-        get {
-            return UserDefaults.standard.object(forKey: "fileLastCheckedETagAt:\(url.absoluteString)") as? Date
-        }
+        get { metadataStore.lastCheckedETagAt(for: url) }
         set {
-            if let newValue = newValue {
-                UserDefaults.standard.set(newValue, forKey: "fileLastCheckedETagAt:\(url.absoluteString)")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "fileLastCheckedETagAt:\(url.absoluteString)")
+            let value = newValue
+            Task { @DownloadActor in
+                metadataStore.setLastCheckedETagAt(value, for: url)
             }
         }
     }
     
     @MainActor
     public var lastDownloaded: Date? {
-        get {
-            return UserDefaults.standard.object(forKey: "fileLastDownloadedDate:\(url.absoluteString)") as? Date
-        }
+        get { metadataStore.lastDownloaded(for: url) }
         set {
-            if let newValue = newValue {
-                UserDefaults.standard.set(newValue, forKey: "fileLastDownloadedDate:\(url.absoluteString)")
-            } else {
-                UserDefaults.standard.removeObject(forKey: "fileLastDownloadedDate:\(url.absoluteString)")
+            let value = newValue
+            Task { @DownloadActor in
+                metadataStore.setLastDownloaded(value, for: url)
+            }
+        }
+    }
+
+    @MainActor
+    public var lastModifiedAt: Date? {
+        get { metadataStore.lastModifiedAt(for: url) }
+        set {
+            let value = newValue
+            Task { @DownloadActor in
+                metadataStore.setLastModifiedAt(value, for: url)
             }
         }
     }
@@ -204,7 +210,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
         name: String,
         localDestination: URL,
         localDestinationChecksum: String? = nil,
-        isFromBackgroundAssetsDownloader: Bool? = nil
+        isFromBackgroundAssetsDownloader: Bool? = nil,
+        metadataStore: (any DownloadableMetadataStore)? = nil
     ) {
         self.url = url
         self.mirrorURL = mirrorURL
@@ -212,6 +219,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
         self.localDestination = localDestination
         self.localDestinationChecksum = localDestinationChecksum
         self.isFromBackgroundAssetsDownloader = isFromBackgroundAssetsDownloader
+        self.metadataStore = metadataStore ?? UserDefaultsDownloadableMetadataStore()
     }
     
     public static func == (lhs: Downloadable, rhs: Downloadable) -> Bool {
@@ -245,23 +253,16 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
         guard !(isFinishedProcessing || isFailed) else {
             return isFinishedProcessing // Return `true` if finished, `false` if failed
         }
-        
-        return try await withCheckedThrowingContinuation { continuation in
-            var cancellable: AnyCancellable?
-            cancellable = $isFailed.combineLatest($isFinishedProcessing)
-                .filter { $0 || $1 }
-                .sink { isFailed, isFinishedProcessing in
-                    if isFailed {
-//                        continuation.resume(throwing: NSError(domain: "DownloadError", code: 1, userInfo: nil)) // Replace with a specific error if available
-                        continuation.resume(returning: false)
-                    } else if isFinishedProcessing {
-                        continuation.resume(returning: true)
-                    } else {
-                        continuation.resume(returning: false)
-                    }
-                    cancellable?.cancel() // Clean up after finishing
-                }
+
+        for await (isFailed, isFinishedProcessing) in $isFailed.combineLatest($isFinishedProcessing).values {
+            if isFailed {
+                return false
+            }
+            if isFinishedProcessing {
+                return true
+            }
         }
+        return false
     }
     
     @DownloadActor
@@ -480,7 +481,8 @@ public extension Downloadable {
         destination: DownloadDirectory,
         filename: String? = nil,
         url: URL,
-        localDestinationChecksum: String? = nil
+        localDestinationChecksum: String? = nil,
+        metadataStore: (any DownloadableMetadataStore)? = nil
     ) {
 //        let filename = filename ?? url.lastPathComponent.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? url.lastPathComponent
         let filename = filename ?? url.lastPathComponent
@@ -490,7 +492,8 @@ public extension Downloadable {
             mirrorURL: url,
             name: name,
             localDestination: destination.directoryURL.appendingPathComponent(filename),
-            localDestinationChecksum: localDestinationChecksum
+            localDestinationChecksum: localDestinationChecksum,
+            metadataStore: metadataStore
         )
     }
     
@@ -690,12 +693,22 @@ extension DownloadController {
             print("ERROR Failed to delete orphan files. \(error)")
         }
         
-        if await download.existsLocally() {
-            await finishDownload(download)
-            if download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60) {//} TimeInterval(60 * 60 * 2) {
-                await checkFileModifiedAt(download: download) { [weak self] modified, _, etag in
+        let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
+        let localExists = await download.existsLocally()
+        if localExists || isImported {
+            if isImported && !localExists {
+                await markDownloadAsProcessed(download)
+            } else {
+                await finishDownload(download)
+            }
+            if download.shouldCheckForUpdates,
+               download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60) {//} TimeInterval(60 * 60 * 2) {
+                await checkFileModifiedAt(download: download) { [weak self] modified, modifiedAt, etag in
                     Task { @MainActor [weak self] in
                         download.lastCheckedETagAt = Date()
+                        if let modifiedAt {
+                            download.lastModifiedAt = modifiedAt
+                        }
                         if modified {
                             await self?.download(download, etag: etag)
                         }
@@ -751,6 +764,32 @@ extension DownloadController {
             }
         }.store(in: &cancellables)
         
+        if download.url.isFileURL {
+            await { @MainActor in
+                download.isActive = true
+                download.isFailed = false
+            }()
+            do {
+                try FileManager.default.createDirectory(
+                    at: download.localDestination.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                if FileManager.default.fileExists(atPath: download.localDestination.path) {
+                    try FileManager.default.removeItem(at: download.localDestination)
+                }
+                try FileManager.default.copyItem(at: download.url, to: download.localDestination)
+                await finishDownload(download, etag: etag)
+            } catch {
+                await { @MainActor in
+                    download.isFailed = true
+                    download.isActive = false
+                    download.isFinishedDownloading = false
+                    download.isFinishedProcessing = false
+                }()
+            }
+            return
+        }
+
         try await {
             let allTasks = await URLSession.shared.allTasks
             if allTasks.first(where: { $0.taskDescription == download.url.absoluteString }) != nil {
@@ -852,6 +891,29 @@ extension DownloadController {
                 try await task
                 return
             }
+            
+            if let importable = download as? ImportableDownloadable {
+                await { @MainActor in
+                    importable.lastImportError = nil
+                    importable.importProgress = 0
+                    importable.importStatusText = "Importing…"
+                }()
+                let progressHandler: ImportableDownloadable.ImportProgressHandler = { [weak importable] progress, status in
+                    Task { @MainActor in
+                        guard let importable else { return }
+                        if let progress {
+                            importable.importProgress = min(max(progress, 0), 1)
+                        }
+                        if let status {
+                            importable.importStatusText = status
+                        }
+                    }
+                }
+                try await importable.importHandler(download.localDestination, progressHandler)
+                if importable.deleteAfterImport {
+                    try? FileManager.default.removeItem(at: download.localDestination)
+                }
+            }
 //              print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
             
             async let task = { @MainActor [weak self] in
@@ -866,18 +928,42 @@ extension DownloadController {
                 download.isActive = false
                 download.isFinishedDownloading = true
                 download.isFinishedProcessing = true
+                if let importable = download as? ImportableDownloadable {
+                    importable.importProgress = nil
+                    importable.importStatusText = nil
+                }
             }()
             try await task
         } catch {
             async let task = { @MainActor [weak self] in
+                if let importable = download as? ImportableDownloadable {
+                    importable.lastImportError = error
+                    importable.importStatusText = "Import failed"
+                }
                 self?.failedDownloads.insert(download)
                 self?.activeDownloads.remove(download)
                 self?.finishedDownloads.remove(download)
+                let shouldDeleteLocal = (download as? ImportableDownloadable)?.deleteAfterImport ?? true
                 try? FileManager.default.removeItem(at: download.compressedFileURL)
-                try? FileManager.default.removeItem(at: download.localDestination)
+                if shouldDeleteLocal {
+                    try? FileManager.default.removeItem(at: download.localDestination)
+                }
             }()
             try await task
         }
+    }
+
+    @DownloadActor
+    private func markDownloadAsProcessed(_ download: Downloadable) async {
+        await { @MainActor [weak self] in
+            download.isFailed = false
+            download.isActive = false
+            download.isFinishedDownloading = true
+            download.isFinishedProcessing = true
+            self?.failedDownloads.remove(download)
+            self?.activeDownloads.remove(download)
+            self?.finishedDownloads.insert(download)
+        }()
     }
     
     /// Checks if file at given URL is modified.
@@ -905,7 +991,8 @@ extension DownloadController {
                     return
                 }
                 
-                if modifiedDate > (download.lastDownloaded ?? Date(timeIntervalSince1970: 0)) {
+                let baseline = download.lastModifiedAt ?? download.lastDownloaded ?? Date(timeIntervalSince1970: 0)
+                if modifiedDate > baseline {
                     completion(true, modifiedDate, httpURLResponse.allHeaderFields["Etag"] as? String)
                     return
                 }
