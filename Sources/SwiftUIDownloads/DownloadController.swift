@@ -893,6 +893,13 @@ extension DownloadController {
             }
             
             if let importable = download as? ImportableDownloadable {
+                #if DEBUG
+                debugPrint(
+                    "# YOMITANIMPORT finishDownload",
+                    "url=\(download.url.absoluteString)",
+                    "destination=\(download.localDestination.lastPathComponent)"
+                )
+                #endif
                 await { @MainActor in
                     importable.lastImportError = nil
                     importable.importProgress = 0
