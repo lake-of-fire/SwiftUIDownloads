@@ -52,6 +52,31 @@ public struct DownloadProgress: View {
         }
     }
     
+    private enum ProgressStyle {
+        case none
+        case indeterminate
+        case determinate(Double)
+    }
+    
+    private var progressStyle: ProgressStyle {
+        if download.isFinishedProcessing {
+            return .none
+        }
+        switch download.downloadProgress {
+        case .downloading(let progress):
+            return .determinate(progress.fractionCompleted)
+        case .completed(let destinationLocation, _, let error):
+            guard destinationLocation != nil, error == nil else { return .none }
+            if let importable = download as? ImportableDownloadable,
+               let importProgress = importable.importProgress {
+                return .determinate(importProgress)
+            }
+            return .indeterminate
+        default:
+            return .indeterminate
+        }
+    }
+    
     private var fractionCompleted: Double {
         if download.isFinishedProcessing {
             return 1.0
@@ -89,11 +114,21 @@ public struct DownloadProgress: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(displayName)
                     .font(.caption)
-                if fractionCompleted < 1 {
-                    ProgressView(value: fractionCompleted)
+                switch progressStyle {
+                case .none:
+                    EmptyView()
+                case .indeterminate:
+                    ProgressView()
                         .progressViewStyle(.linear)
                         .frame(height: 5)
                         .clipShape(Capsule())
+                case .determinate(let progress):
+                    if progress < 1 {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                            .frame(height: 5)
+                            .clipShape(Capsule())
+                    }
                 }
                 Text(statusText)
                     .font(.caption)
@@ -142,7 +177,7 @@ public struct ActiveDownloadsList: View {
     public var body: some View {
         ScrollView {
             LazyVStack {
-                ForEach(downloadController.unfinishedDownloads) { download in
+                ForEach(downloadController.unfinishedDownloadsIncludingImports) { download in
                     DownloadProgress(download: download, retryAction: {
                         Task { @MainActor in
                             await downloadController.ensureDownloaded([download])

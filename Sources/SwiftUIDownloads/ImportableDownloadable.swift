@@ -9,6 +9,7 @@ public final class ImportableDownloadable: Downloadable {
     public let importHandler: ImportHandler
     public let isImported: ImportedCheck
     public let deleteAfterImport: Bool
+    public let glossaryFTSEnabled: Bool
     @MainActor @Published public var lastImportError: Error?
     @MainActor @Published public var importProgress: Double?
     @MainActor @Published public var importStatusText: String?
@@ -20,6 +21,7 @@ public final class ImportableDownloadable: Downloadable {
         localDestination: URL,
         localDestinationChecksum: String? = nil,
         deleteAfterImport: Bool = true,
+        glossaryFTSEnabled: Bool = false,
         metadataStore: (any DownloadableMetadataStore)? = nil,
         isImported: @escaping ImportedCheck,
         importHandler: @escaping ImportHandler
@@ -27,6 +29,7 @@ public final class ImportableDownloadable: Downloadable {
         self.importHandler = importHandler
         self.isImported = isImported
         self.deleteAfterImport = deleteAfterImport
+        self.glossaryFTSEnabled = glossaryFTSEnabled
         super.init(
             url: url,
             mirrorURL: mirrorURL,

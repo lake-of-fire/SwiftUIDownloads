@@ -556,6 +556,15 @@ public class DownloadController: NSObject, ObservableObject {
         let downloads: [Downloadable] = Array(Set(activeDownloads).union(Set(failedDownloads)))
         return downloads.sorted(by: { $0.name > $1.name })
     }
+
+    @MainActor
+    public var unfinishedDownloadsIncludingImports: [Downloadable] {
+        let importing = finishedDownloads.filter { !$0.isFinishedProcessing }
+        let downloads = Set(activeDownloads)
+            .union(Set(failedDownloads))
+            .union(Set(importing))
+        return Array(downloads).sorted(by: { $0.name > $1.name })
+    }
     
     private var observation: NSKeyValueObservation?
     private var cancellables = Set<AnyCancellable>()
@@ -812,6 +821,15 @@ extension DownloadController {
                 download.isFailed = false
             }()
             do {
+                if download.url == download.localDestination {
+                    guard FileManager.default.fileExists(atPath: download.localDestination.path) else {
+                        throw NSError(domain: "DownloadController", code: 404, userInfo: [
+                            NSLocalizedDescriptionKey: "Local file missing for import at \(download.localDestination.path)"
+                        ])
+                    }
+                    await finishDownload(download, etag: etag)
+                    return
+                }
                 try FileManager.default.createDirectory(
                     at: download.localDestination.deletingLastPathComponent(),
                     withIntermediateDirectories: true
@@ -928,6 +946,16 @@ extension DownloadController {
                 #endif
                 return
             }
+            if let importable = download as? ImportableDownloadable,
+               FileManager.default.fileExists(atPath: download.compressedFileURL.path) {
+                await { @MainActor in
+                    importable.importStatusText = "Expanding…"
+                    if importable.importProgress == nil {
+                        let downloadFraction = download.downloadProgress.fractionCompleted
+                        importable.importProgress = min(downloadFraction, 0.999)
+                    }
+                }()
+            }
             try await Task.detached(priority: .utility) {
                 try await download.decompressIfNeeded()
             }.value
@@ -963,6 +991,16 @@ extension DownloadController {
                     "destination=\(download.localDestination.lastPathComponent)"
                 )
                 #endif
+                #if DEBUG
+                let importStart = Date()
+                debugPrint(
+                    "# DOWNLOADABLEIMPORT start",
+                    "url=\(download.url.absoluteString)",
+                    "name=\(download.name)"
+                )
+                var lastLoggedProgress: Double?
+                var lastLoggedStatus: String?
+                #endif
                 await { @MainActor in
                     importable.lastImportError = nil
                     importable.importProgress = 0
@@ -977,9 +1015,43 @@ extension DownloadController {
                         if let status {
                             importable.importStatusText = status
                         }
+                        #if DEBUG
+                        let clampedProgress = importable.importProgress
+                        let currentStatus = importable.importStatusText
+                        let progressDelta: Double
+                        if let clampedProgress, let lastLoggedProgress {
+                            progressDelta = abs(clampedProgress - lastLoggedProgress)
+                        } else {
+                            progressDelta = 1
+                        }
+                        let statusChanged = currentStatus != lastLoggedStatus
+                        if statusChanged || progressDelta >= 0.05 {
+                            lastLoggedProgress = clampedProgress
+                            lastLoggedStatus = currentStatus
+                            debugPrint(
+                                "# DOWNLOADABLEIMPORT progress",
+                                "url=\(download.url.absoluteString)",
+                                "name=\(download.name)",
+                                "progress=\(clampedProgress.map { String(format: "%.2f", $0) } ?? "nil")",
+                                "status=\(currentStatus ?? "nil")"
+                            )
+                        }
+                        #endif
                     }
                 }
                 try await importable.importHandler(download.localDestination, progressHandler)
+                #if DEBUG
+                let importElapsed = Date().timeIntervalSince(importStart)
+                await MainActor.run {
+                    debugPrint(
+                        "# DOWNLOADABLEIMPORT finish",
+                        "url=\(download.url.absoluteString)",
+                        "name=\(download.name)",
+                        "elapsed=\(String(format: "%.2fs", importElapsed))",
+                        "error=\(String(describing: importable.lastImportError))"
+                    )
+                }
+                #endif
                 if importable.deleteAfterImport {
                     try? FileManager.default.removeItem(at: download.localDestination)
                 }
@@ -1041,6 +1113,9 @@ extension DownloadController {
                 self?.failedDownloads.insert(download)
                 self?.activeDownloads.remove(download)
                 self?.finishedDownloads.remove(download)
+                download.isFailed = true
+                download.isActive = false
+                download.isFinishedProcessing = true
                 let shouldDeleteLocal = (download as? ImportableDownloadable)?.deleteAfterImport ?? true
                 try? FileManager.default.removeItem(at: download.compressedFileURL)
                 if shouldDeleteLocal {
