@@ -77,6 +77,13 @@ public struct DownloadProgress: View {
         }
     }
     
+    private var shouldShowProgress: Bool {
+        if download.isFinishedProcessing {
+            return false
+        }
+        return !isFailed
+    }
+    
     private var fractionCompleted: Double {
         if download.isFinishedProcessing {
             return 1.0
@@ -114,17 +121,15 @@ public struct DownloadProgress: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(displayName)
                     .font(.caption)
-                switch progressStyle {
-                case .none:
-                    EmptyView()
-                case .indeterminate:
-                    ProgressView()
-                        .progressViewStyle(.linear)
-                        .frame(height: 5)
-                        .clipShape(Capsule())
-                case .determinate(let progress):
-                    if progress < 1 {
-                        ProgressView(value: progress)
+                if shouldShowProgress {
+                    switch progressStyle {
+                    case .determinate(let progress):
+                        ProgressView(value: min(max(progress, 0), 1))
+                            .progressViewStyle(.linear)
+                            .frame(height: 5)
+                            .clipShape(Capsule())
+                    default:
+                        ProgressView()
                             .progressViewStyle(.linear)
                             .frame(height: 5)
                             .clipShape(Capsule())
