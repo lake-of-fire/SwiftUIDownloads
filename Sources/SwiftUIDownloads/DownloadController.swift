@@ -550,6 +550,10 @@ public class DownloadController: NSObject, ObservableObject {
     @Published public var finishedDownloads = Set<Downloadable>()
     @MainActor
     @Published public var failedDownloads = Set<Downloadable>()
+
+#if DEBUG
+    private var loggedEnsureDownloadedStates: [URL: String] = [:]
+#endif
     
     @MainActor
     public var unfinishedDownloads: [Downloadable] {
@@ -723,24 +727,36 @@ extension DownloadController {
         let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
         let localExists = await download.existsLocally()
         #if DEBUG
-        debugPrint(
-            "# YOMITANIMPORT ensureDownloaded.state",
-            "url=\(download.url.absoluteString)",
+        let stateKey = [
             "localExists=\(localExists)",
             "isImported=\(isImported)",
             "isFinishedProcessing=\(download.isFinishedProcessing)",
             "isActive=\(download.isActive)",
             "isFailed=\(download.isFailed)"
-        )
+        ].joined(separator: "|")
+        if loggedEnsureDownloadedStates[download.url] != stateKey {
+            loggedEnsureDownloadedStates[download.url] = stateKey
+            debugPrint(
+                "# YOMITANIMPORT ensureDownloaded.state",
+                "url=\(download.url.absoluteString)",
+                "localExists=\(localExists)",
+                "isImported=\(isImported)",
+                "isFinishedProcessing=\(download.isFinishedProcessing)",
+                "isActive=\(download.isActive)",
+                "isFailed=\(download.isFailed)"
+            )
+        }
         #endif
         if localExists || isImported {
-            if isImported && !localExists {
+            if isImported {
                 await markDownloadAsProcessed(download)
             } else {
                 await finishDownload(download)
             }
+            let updateCheckInterval = TimeInterval(60 * 60 * 2)
             if download.shouldCheckForUpdates,
-               download.lastCheckedETagAt == nil || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > TimeInterval(60) {//} TimeInterval(60 * 60 * 2) {
+               download.lastCheckedETagAt == nil
+                || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > updateCheckInterval {
                 await checkFileModifiedAt(download: download) { [weak self] modified, modifiedAt, etag in
                     Task { @MainActor [weak self] in
                         download.lastCheckedETagAt = Date()
