@@ -372,12 +372,54 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
         }
         return 0
     }
+
+    private func logLocalHeaderIfNeeded(label: String) {
+        #if DEBUG
+        guard let handle = try? FileHandle(forReadingFrom: localDestination) else {
+            debugPrint(
+                "# YOMITANPROFILE",
+                "download.decompress.header",
+                "label=\(label)",
+                "error=file_open_failed"
+            )
+            return
+        }
+        defer { try? handle.close() }
+        let header = handle.readData(ofLength: 4)
+        if header.isEmpty {
+            debugPrint(
+                "# YOMITANPROFILE",
+                "download.decompress.header",
+                "label=\(label)",
+                "error=read_failed"
+            )
+            return
+        }
+        let bytes = [UInt8](header)
+        let hex = bytes.map { String(format: "%02x", $0) }.joined()
+        debugPrint(
+            "# YOMITANPROFILE",
+            "download.decompress.header",
+            "label=\(label)",
+            "bytes=\(header.count)",
+            "hex=\(hex)"
+        )
+        #endif
+    }
     
     @DownloadActor
     func decompressIfNeeded() async throws {
         if FileManager.default.fileExists(atPath: compressedFileURL.path) {
             print("Attempting decompression for \(compressedFileURL)")
             let data = try Data(contentsOf: compressedFileURL)
+            #if DEBUG
+            debugPrint(
+                "# YOMITANPROFILE",
+                "download.decompress.start",
+                "source=\(compressedFileURL.lastPathComponent)",
+                "bytes=\(data.count)"
+            )
+            #endif
             // TODO: When dropping iOS 15, switch to native Apple Brotli
             //            let decompressed = try data.decompressed(from: COMPRESSION_BROTLI)
             
@@ -393,14 +435,67 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
             
             let nsData = NSData(data: data)
             if #available(iOS 16.1, macOS 13.1, *) {
-                let decompressed = try data.decompressed(from: COMPRESSION_BROTLI)
-                try decompressed.write(to: localDestination, options: .atomic)
+                do {
+                    let decompressed = try data.decompressed(from: COMPRESSION_BROTLI)
+                    try decompressed.write(to: localDestination, options: .atomic)
+                    logLocalHeaderIfNeeded(label: "native")
+                    #if DEBUG
+                    debugPrint(
+                        "# YOMITANPROFILE",
+                        "download.decompress.native",
+                        "bytes=\(decompressed.count)"
+                    )
+                    #endif
+                } catch {
+                    #if DEBUG
+                    debugPrint(
+                        "# YOMITANPROFILE",
+                        "download.decompress.native.error",
+                        "error=\(error.localizedDescription)"
+                    )
+                    #endif
+                    guard let decompressed = nsData.brotliDecompressed() else {
+                        print("Error decompressing \(compressedFileURL.path)")
+                        #if DEBUG
+                        debugPrint(
+                            "# YOMITANPROFILE",
+                            "download.decompress.brotli.error",
+                            "reason=nil"
+                        )
+                        #endif
+                        return
+                    }
+                    try decompressed.write(to: localDestination, options: .atomic)
+                    logLocalHeaderIfNeeded(label: "brotli-fallback")
+                    #if DEBUG
+                    debugPrint(
+                        "# YOMITANPROFILE",
+                        "download.decompress.brotli",
+                        "bytes=\(decompressed.count)"
+                    )
+                    #endif
+                }
             } else {
                 guard let decompressed = nsData.brotliDecompressed() else {
                     print("Error decompressing \(compressedFileURL.path)")
+                    #if DEBUG
+                    debugPrint(
+                        "# YOMITANPROFILE",
+                        "download.decompress.brotli.error",
+                        "reason=nil"
+                    )
+                    #endif
                     return
                 }
                 try decompressed.write(to: localDestination, options: .atomic)
+                logLocalHeaderIfNeeded(label: "brotli")
+                #if DEBUG
+                debugPrint(
+                    "# YOMITANPROFILE",
+                    "download.decompress.brotli",
+                    "bytes=\(decompressed.count)"
+                )
+                #endif
             }
             
             print("Decompressed \(compressedFileURL)")
@@ -972,6 +1067,18 @@ extension DownloadController {
                     }
                 }()
             }
+            #if DEBUG
+            let compressedExists = FileManager.default.fileExists(atPath: download.compressedFileURL.path)
+            let destinationSize = (try? download.localDestination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            debugPrint(
+                "# YOMITANPROFILE",
+                "download.finish.preflight",
+                "url=\(download.url.absoluteString)",
+                "compressedExists=\(compressedExists)",
+                "destination=\(download.localDestination.lastPathComponent)",
+                "destinationBytes=\(destinationSize)"
+            )
+            #endif
             try await Task.detached(priority: .utility) {
                 try await download.decompressIfNeeded()
             }.value
