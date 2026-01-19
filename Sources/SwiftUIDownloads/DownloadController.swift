@@ -1073,7 +1073,7 @@ extension DownloadController {
             debugPrint(
                 "# YOMITANPROFILE",
                 "download.finish.preflight",
-                "url=\(download.url.absoluteString)",
+                "url=\(download.url.lastPathComponent)",
                 "compressedExists=\(compressedExists)",
                 "destination=\(download.localDestination.lastPathComponent)",
                 "destinationBytes=\(destinationSize)"
