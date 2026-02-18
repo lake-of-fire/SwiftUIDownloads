@@ -2,6 +2,7 @@ import SwiftUI
 
 public struct DownloadProgress: View {
     @ObservedObject var download: Downloadable
+    @ObservedObject private var downloadController = DownloadController.shared
     let retryAction: (() async throws -> Void)
     let redownloadAction: (() async throws -> Void)
     
@@ -10,6 +11,12 @@ public struct DownloadProgress: View {
     }
 
     private var statusText: String {
+        if isFailed {
+            if let message = download.failureMessage, !message.isEmpty {
+                return "Error: \(message)"
+            }
+            return "Failed"
+        }
         if download.isFinishedProcessing {
             return "Installed"
         }
@@ -44,6 +51,12 @@ public struct DownloadProgress: View {
     }
     
     private var isFailed: Bool {
+        if download.isFailed {
+            return true
+        }
+        if downloadController.failedDownloads.contains(where: { $0.url == download.url }) {
+            return true
+        }
         switch download.downloadProgress {
         case .completed(_, _, let urlError):
             return urlError != nil
@@ -107,16 +120,14 @@ public struct DownloadProgress: View {
     
     public var body: some View {
         HStack(alignment: .center, spacing: 12) {
-            if download.isFinishedProcessing {
+            if isFailed {
+                Image(systemName: "exclamationmark.circle")
+                    .foregroundColor(.red)
+                    .font(.title)
+            } else if download.isFinishedProcessing {
                 Image(systemName: "checkmark.circle")
                     .foregroundColor(.green)
                     .font(.title)
-            } else {
-                if isFailed {
-                    Image(systemName: "exclamationmark.circle")
-                        .foregroundColor(.red)
-                        .font(.title)
-                }
             }
             VStack(alignment: .leading, spacing: 2) {
                 Text(displayName)
