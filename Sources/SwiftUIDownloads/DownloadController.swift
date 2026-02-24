@@ -597,6 +597,23 @@ public class DownloadController: NSObject, ObservableObject {
     }
 }
 
+private extension FileManager {
+    func removeItemIfPresent(at url: URL) throws {
+        do {
+            try removeItem(at: url)
+        } catch let error as NSError {
+            let isMissingFile = error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError
+            let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError
+            let isMissingUnderlyingPOSIX = underlying?.domain == NSPOSIXErrorDomain
+                && underlying?.code == Int(ENOENT)
+            if isMissingFile || isMissingUnderlyingPOSIX {
+                return
+            }
+            throw error
+        }
+    }
+}
+
 public extension DownloadController {
     @MainActor
     var failureMessages: [String]? {
@@ -667,7 +684,7 @@ public extension DownloadController {
                     potentialOrphanDirs.insert(fileURL)
                 } else {
                     print("DownloadController: deleting orphan \(fileURL)")
-                    try FileManager.default.removeItem(at: fileURL)
+                    try FileManager.default.removeItemIfPresent(at: fileURL)
                 }
             }
         }
@@ -675,7 +692,7 @@ public extension DownloadController {
         for orphanDir in potentialOrphanDirs {
             if !seenSavedFiles.contains(where: { $0.path.hasPrefix(orphanDir.path) }) {
                 print("DownloadController: deleting orphan directory \(orphanDir)")
-                try FileManager.default.removeItem(at: orphanDir)
+                try FileManager.default.removeItemIfPresent(at: orphanDir)
             }
         }
     }
@@ -683,7 +700,7 @@ public extension DownloadController {
     @DownloadActor
     func delete(download: Downloadable) async throws -> Downloadable {
         await cancelInProgressDownloads(matchingDownloadURL: download.url)
-        try FileManager.default.removeItem(at: download.localDestination)
+        try FileManager.default.removeItemIfPresent(at: download.localDestination)
         try await { @MainActor in
             assuredDownloads = assuredDownloads.filter { $0.url != download.url }
             finishedDownloads = finishedDownloads.filter { $0.url != download.url }
@@ -859,7 +876,7 @@ extension DownloadController {
                     withIntermediateDirectories: true
                 )
                 if FileManager.default.fileExists(atPath: download.localDestination.path) {
-                    try FileManager.default.removeItem(at: download.localDestination)
+                    try FileManager.default.removeItemIfPresent(at: download.localDestination)
                 }
                 try FileManager.default.copyItem(at: download.url, to: download.localDestination)
                 await finishDownload(download, etag: etag)
@@ -928,12 +945,12 @@ extension DownloadController {
             return (task, download)
         }) {
             task.cancel()
-            if let destination = download?.localDestination {
-                do {
-                    try FileManager.default.removeItem(at: destination)
-                } catch {
-                    print("ERROR deleting \(destination.absoluteString): \(error)")
-                }
+                if let destination = download?.localDestination {
+                    do {
+                        try FileManager.default.removeItemIfPresent(at: destination)
+                    } catch {
+                        print("ERROR deleting \(destination.absoluteString): \(error)")
+                    }
             }
         }
     }
