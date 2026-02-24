@@ -561,6 +561,7 @@ public class DownloadController: NSObject, ObservableObject {
 
 #if DEBUG
     private var loggedEnsureDownloadedStates: [URL: String] = [:]
+    private var loggedFinishDownloadStates: [URL: String] = [:]
 #endif
     
     @MainActor
@@ -812,6 +813,12 @@ extension DownloadController {
             "etag=\(etag ?? "nil")"
         )
         #endif
+        await { @MainActor in
+            // Allow a fresh import attempt after a previous failure.
+            download.isFinishedProcessing = false
+            download.isFinishedDownloading = false
+            download.isFailed = false
+        }()
         if let importable = download as? ImportableDownloadable {
             await { @MainActor in
                 importable.lastImportError = nil
@@ -977,13 +984,25 @@ extension DownloadController {
     @DownloadActor
     public func finishDownload(_ download: Downloadable, etag: String? = nil) async {
         do {
+            #if DEBUG
+            @inline(__always)
+            func shouldLogFinishState(_ state: String) -> Bool {
+                if loggedFinishDownloadStates[download.url] == state {
+                    return false
+                }
+                loggedFinishDownloadStates[download.url] = state
+                return true
+            }
+            #endif
             let alreadyFinished = await MainActor.run { download.isFinishedProcessing }
             if alreadyFinished {
                 #if DEBUG
-                debugPrint(
-                    "# YOMITANIMPORT finishDownload skip (already finished)",
-                    "url=\(download.url.absoluteString)"
-                )
+                if shouldLogFinishState("skip.alreadyFinished") {
+                    debugPrint(
+                        "# YOMITANIMPORT finishDownload skip (already finished)",
+                        "url=\(download.url.absoluteString)"
+                    )
+                }
                 #endif
                 return
             }
@@ -1011,10 +1030,12 @@ extension DownloadController {
                 if let importable = download as? ImportableDownloadable,
                    await importable.isImported() {
                     #if DEBUG
-                    debugPrint(
-                        "# YOMITANIMPORT finishDownload skip (imported, no local file)",
-                        "url=\(download.url.absoluteString)"
-                    )
+                    if shouldLogFinishState("skip.importedNoLocalFile") {
+                        debugPrint(
+                            "# YOMITANIMPORT finishDownload skip (imported, no local file)",
+                            "url=\(download.url.absoluteString)"
+                        )
+                    }
                     #endif
                     await markDownloadAsProcessed(download)
                     return
@@ -1030,11 +1051,14 @@ extension DownloadController {
             
             if let importable = download as? ImportableDownloadable {
                 #if DEBUG
-                debugPrint(
-                    "# YOMITANIMPORT finishDownload",
-                    "url=\(download.url.absoluteString)",
-                    "destination=\(download.localDestination.lastPathComponent)"
-                )
+                let startState = "start.\(download.localDestination.lastPathComponent)"
+                if shouldLogFinishState(startState) {
+                    debugPrint(
+                        "# YOMITANIMPORT finishDownload",
+                        "url=\(download.url.absoluteString)",
+                        "destination=\(download.localDestination.lastPathComponent)"
+                    )
+                }
                 #endif
                 #if DEBUG
                 let importStart = Date()
@@ -1124,14 +1148,16 @@ extension DownloadController {
             #if DEBUG
             if let importable = download as? ImportableDownloadable {
                 await { @MainActor in
-                    debugPrint(
-                        "# YOMITANIMPORT finishDownload.success",
-                        "url=\(download.url.absoluteString)",
-                        "isFailed=\(download.isFailed)",
-                        "isFinishedProcessing=\(download.isFinishedProcessing)",
-                        "importStatus=\(importable.importStatusText ?? "nil")",
-                        "importError=\(String(describing: importable.lastImportError))"
-                    )
+                    if shouldLogFinishState("success") {
+                        debugPrint(
+                            "# YOMITANIMPORT finishDownload.success",
+                            "url=\(download.url.absoluteString)",
+                            "isFailed=\(download.isFailed)",
+                            "isFinishedProcessing=\(download.isFinishedProcessing)",
+                            "importStatus=\(importable.importStatusText ?? "nil")",
+                            "importError=\(String(describing: importable.lastImportError))"
+                        )
+                    }
                 }()
             }
             #endif
@@ -1140,15 +1166,19 @@ extension DownloadController {
             let shouldDeleteLocal = (download as? ImportableDownloadable)?.deleteAfterImport ?? true
             let localExists = FileManager.default.fileExists(atPath: download.localDestination.path)
             let compressedExists = FileManager.default.fileExists(atPath: download.compressedFileURL.path)
-            debugPrint(
-                "# YOMITANIMPORT finishDownload.error",
-                "url=\(download.url.absoluteString)",
-                "destination=\(download.localDestination.lastPathComponent)",
-                "deleteAfterImport=\(shouldDeleteLocal)",
-                "localExists=\(localExists)",
-                "compressedExists=\(compressedExists)",
-                "error=\(error)"
-            )
+            let errorState = "error.\(type(of: error))|\(error)"
+            if loggedFinishDownloadStates[download.url] != errorState {
+                loggedFinishDownloadStates[download.url] = errorState
+                debugPrint(
+                    "# YOMITANIMPORT finishDownload.error",
+                    "url=\(download.url.absoluteString)",
+                    "destination=\(download.localDestination.lastPathComponent)",
+                    "deleteAfterImport=\(shouldDeleteLocal)",
+                    "localExists=\(localExists)",
+                    "compressedExists=\(compressedExists)",
+                    "error=\(error)"
+                )
+            }
             #endif
             async let task = { @MainActor [weak self] in
                 if let importable = download as? ImportableDownloadable {
