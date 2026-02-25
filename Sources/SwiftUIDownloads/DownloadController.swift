@@ -1147,8 +1147,9 @@ extension DownloadController {
             try await task
             #if DEBUG
             if let importable = download as? ImportableDownloadable {
+                let shouldLogSuccess = shouldLogFinishState("success")
                 await { @MainActor in
-                    if shouldLogFinishState("success") {
+                    if shouldLogSuccess {
                         debugPrint(
                             "# YOMITANIMPORT finishDownload.success",
                             "url=\(download.url.absoluteString)",
