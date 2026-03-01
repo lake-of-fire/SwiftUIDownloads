@@ -23,8 +23,8 @@ let package = Package(
 //                .product(name: "Brotli", package: "Elva"), // Only needed for iOS 15 Brotli (somehow missing in simulator at least)
                 .product(name: "Brotli", package: "Brotli"), // Only needed for iOS 15 Brotli (somehow missing in simulator at least)
             ]),
-//        .testTarget(
-//            name: "SwiftUIDownloadsTests",
-//            dependencies: ["SwiftUIDownloads"]),
+        .testTarget(
+            name: "SwiftUIDownloadsTests",
+            dependencies: ["SwiftUIDownloads"]),
     ]
 )

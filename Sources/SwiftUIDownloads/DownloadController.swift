@@ -1,9 +1,8 @@
 import Foundation
 import SwiftUI
 import Combine
-import Compression
 import BackgroundAssets
-import Brotli
+import Compression
 
 // TODO: Extract download state transitions + import handling into a small processor/state machine once behavior stabilizes.
 
@@ -14,6 +13,9 @@ public actor DownloadActor {
 
 fileprivate func errorDescription(from error: Error) -> String {
     let nsError = error as NSError
+    if let httpError = error as? URLResourceDownloadHTTPError {
+        return httpError.localizedDescription
+    }
     if let urlError = error as? URLError {
         switch urlError.code {
         case .unknown:
@@ -381,11 +383,9 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
     func decompressIfNeeded() async throws {
         if FileManager.default.fileExists(atPath: compressedFileURL.path) {
             print("Attempting decompression for \(compressedFileURL)")
-            let data = try Data(contentsOf: compressedFileURL)
-            // TODO: When dropping iOS 15, switch to native Apple Brotli
-            //            let decompressed = try data.decompressed(from: COMPRESSION_BROTLI)
-            
-            if data.isEmpty {
+
+            let compressedFileSize = (try? compressedFileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            if compressedFileSize == 0 {
                 print("Data is empty for \(compressedFileURL)")
                 do {
                     try FileManager.default.removeItem(at: compressedFileURL)
@@ -394,25 +394,19 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
                 }
                 return
             }
-            
-            let nsData = NSData(data: data)
-            if #available(iOS 16.1, macOS 13.1, *) {
-                do {
-                    let decompressed = try data.decompressed(from: COMPRESSION_BROTLI)
-                    try decompressed.write(to: localDestination, options: .atomic)
-                } catch {
-                    guard let decompressed = nsData.brotliDecompressed() else {
-                        print("Error decompressing \(compressedFileURL.path)")
-                        return
-                    }
-                    try decompressed.write(to: localDestination, options: .atomic)
-                }
+
+            let temporaryOutputURL = localDestination.appendingPathExtension("decompressing")
+            try? FileManager.default.removeItem(at: temporaryOutputURL)
+            defer {
+                try? FileManager.default.removeItem(at: temporaryOutputURL)
+            }
+
+            try decompressBrotliFile(at: compressedFileURL, to: temporaryOutputURL)
+
+            if FileManager.default.fileExists(atPath: localDestination.path) {
+                _ = try FileManager.default.replaceItemAt(localDestination, withItemAt: temporaryOutputURL)
             } else {
-                guard let decompressed = nsData.brotliDecompressed() else {
-                    print("Error decompressing \(compressedFileURL.path)")
-                    return
-                }
-                try decompressed.write(to: localDestination, options: .atomic)
+                try FileManager.default.moveItem(at: temporaryOutputURL, to: localDestination)
             }
             
             print("Decompressed \(compressedFileURL)")
@@ -430,6 +424,10 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
 //            print("No file exists to decompress at \(compressedFileURL)")
         }
     }
+}
+
+private func decompressBrotliFile(at sourceURL: URL, to destinationURL: URL) throws {
+    try BrotliFileDecompressor.decompressFile(at: sourceURL, to: destinationURL)
 }
 
 public enum DownloadDirectory {
@@ -602,6 +600,103 @@ public class DownloadController: NSObject, ObservableObject {
     }
 }
 
+struct DownloadRetryPolicy {
+    let maxAttempts: Int
+    let initialDelaySeconds: Double
+    let maxDelaySeconds: Double
+    let jitterFraction: Double
+    let maxServerRetryAfterSeconds: Double
+
+    static var `default`: DownloadRetryPolicy {
+        let env = ProcessInfo.processInfo.environment
+        let attempts = max(1, Int(env["MANABI_DOWNLOAD_MAX_ATTEMPTS"] ?? "") ?? 3)
+        let initialDelay = max(0.05, Double(env["MANABI_DOWNLOAD_INITIAL_RETRY_DELAY_SECONDS"] ?? "") ?? 0.7)
+        let maxDelay = max(initialDelay, Double(env["MANABI_DOWNLOAD_MAX_RETRY_DELAY_SECONDS"] ?? "") ?? 6.0)
+        let jitter = min(max(Double(env["MANABI_DOWNLOAD_RETRY_JITTER_FRACTION"] ?? "") ?? 0.35, 0), 1)
+        let maxRetryAfter = max(
+            maxDelay,
+            Double(env["MANABI_DOWNLOAD_MAX_SERVER_RETRY_AFTER_SECONDS"] ?? "") ?? 120.0
+        )
+        return DownloadRetryPolicy(
+            maxAttempts: attempts,
+            initialDelaySeconds: initialDelay,
+            maxDelaySeconds: maxDelay,
+            jitterFraction: jitter,
+            maxServerRetryAfterSeconds: maxRetryAfter
+        )
+    }
+
+    func delayBeforeRetrySeconds(forAttempt attempt: Int) -> Double {
+        guard attempt > 1 else { return 0 }
+        let exponent = Double(max(0, attempt - 2))
+        let baseDelay = min(maxDelaySeconds, initialDelaySeconds * pow(2.0, exponent))
+        let jitterMagnitude = baseDelay * jitterFraction
+        let lower = max(0, baseDelay - jitterMagnitude)
+        let upper = baseDelay + jitterMagnitude
+        return Double.random(in: lower...upper)
+    }
+
+    func retryDelaySeconds(forAttempt attempt: Int, error: Error) -> Double {
+        let localDelay = delayBeforeRetrySeconds(forAttempt: attempt)
+        let serverDelay = serverSuggestedRetryDelaySeconds(from: error)
+            .map { min($0, maxServerRetryAfterSeconds) }
+        return max(localDelay, serverDelay ?? 0)
+    }
+}
+
+func serverSuggestedRetryDelaySeconds(from error: Error) -> Double? {
+    guard let httpError = error as? URLResourceDownloadHTTPError,
+          httpError.statusCode == 429 || httpError.statusCode == 503 else {
+        return nil
+    }
+    guard let retryAfterSeconds = httpError.retryAfterSeconds, retryAfterSeconds > 0 else {
+        return nil
+    }
+    return retryAfterSeconds
+}
+
+func isRetryableDownloadError(_ error: Error) -> Bool {
+    if let urlError = error as? URLError {
+        switch urlError.code {
+        case .timedOut,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .networkConnectionLost,
+             .dnsLookupFailed,
+             .resourceUnavailable,
+             .notConnectedToInternet,
+             .dataNotAllowed,
+             .internationalRoamingOff,
+             .callIsActive:
+            return true
+        default:
+            return false
+        }
+    }
+
+    if let posixError = error as? POSIXError {
+        switch posixError.code {
+        case .ENETDOWN,
+             .ENETUNREACH,
+             .ENETRESET,
+             .ECONNABORTED,
+             .ECONNRESET,
+             .ECONNREFUSED,
+             .ETIMEDOUT,
+             .EHOSTUNREACH:
+            return true
+        default:
+            return false
+        }
+    }
+
+    if let httpError = error as? URLResourceDownloadHTTPError {
+        return httpError.statusCode == 429 || (500...599).contains(httpError.statusCode)
+    }
+
+    return false
+}
+
 private extension FileManager {
     func removeItemIfPresent(at url: URL) throws {
         do {
@@ -742,6 +837,24 @@ public extension DownloadController {
 }
 
 extension DownloadController {
+    @DownloadActor
+    private func runSingleDownloadAttempt(_ download: Downloadable) async -> Error? {
+        let task = await download.download()
+        guard let completedState = try? await task.publisher.values.first(where: { progress in
+            if case .completed = progress {
+                return true
+            }
+            return false
+        }) else {
+            return URLError(.unknown)
+        }
+
+        if case .completed(_, _, let error) = completedState {
+            return error
+        }
+        return URLError(.unknown)
+    }
+
     @MainActor
     public func ensureDownloaded(download: Downloadable, deletingOrphansIn: [DownloadDirectory] = [], excludingFromDeletion: Set<Downloadable> = Set()) async {
         if assuredDownloads.contains(where: { $0.url == download.url }) && !failedDownloads.contains(where: { $0.url == download.url }) {
@@ -931,15 +1044,47 @@ extension DownloadController {
 //            }
             
             download.isFromBackgroundAssetsDownloader = false
-            // Wait for DL to finish or error.
-            let task = await download.download()
-            // TODO: Does this immediately deinit?
-            _ = try? await task.publisher.values.first(where: { progress in
-                switch progress {
-                case .completed(_, _, _): return true
-                default: return false
+            let retryPolicy = DownloadRetryPolicy.default
+            var attempt = 1
+            while true {
+                if Task.isCancelled {
+                    break
                 }
-            })
+
+                guard let error = await runSingleDownloadAttempt(download) else {
+                    break
+                }
+
+                let shouldRetry = attempt < retryPolicy.maxAttempts && isRetryableDownloadError(error)
+                #if DEBUG
+                debugPrint(
+                    "# DOWNLOADABLE retry",
+                    "url=\(download.url.absoluteString)",
+                    "attempt=\(attempt)",
+                    "maxAttempts=\(retryPolicy.maxAttempts)",
+                    "retryable=\(shouldRetry)",
+                    "error=\(error)"
+                )
+                #endif
+                guard shouldRetry else {
+                    break
+                }
+
+                let delaySeconds = retryPolicy.retryDelaySeconds(
+                    forAttempt: attempt + 1,
+                    error: error
+                )
+                let nanoseconds = UInt64(delaySeconds * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanoseconds)
+
+                await { @MainActor in
+                    download.isFailed = false
+                    download.isActive = false
+                    download.isFinishedDownloading = false
+                    download.downloadProgress = .uninitiated
+                }()
+                attempt += 1
+            }
         }()
     }
     
