@@ -142,6 +142,10 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
     
     @MainActor
     public var failureMessage: String? {
+        if let importable = self as? ImportableDownloadable,
+           let importError = importable.lastImportError {
+            return importError.localizedDescription
+        }
         switch downloadProgress {
         case .completed(_, _, let error):
             if let error = error {

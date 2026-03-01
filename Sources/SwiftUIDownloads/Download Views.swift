@@ -191,9 +191,11 @@ public struct ActiveDownloadsList: View {
     @ObservedObject private var downloadController = DownloadController.shared
     
     public var body: some View {
+        let downloads = downloadController.unfinishedDownloadsIncludingImports
         ScrollView {
             LazyVStack {
-                ForEach(downloadController.unfinishedDownloadsIncludingImports) { download in
+                ForEach(downloads.indices, id: \.self) { index in
+                    let download = downloads[index]
                     DownloadProgress(download: download, retryAction: {
                         Task { @MainActor in
                             await downloadController.ensureDownloaded([download])
@@ -204,8 +206,10 @@ public struct ActiveDownloadsList: View {
                         }
                     })
                     .padding(.horizontal, 12)
-                    Divider()
-                        .padding(.horizontal, 6)
+                    if index < downloads.count - 1 {
+                        Divider()
+                            .padding(.horizontal, 6)
+                    }
                 }
             }
         }
@@ -231,14 +235,11 @@ public struct ActiveDownloadsBox: View {
                 Spacer(minLength: 0)
             }
         } label: {
-            HStack(spacing: 10) {
-                ProgressView()
-                    .scaleEffect(0.75, anchor: .center)
-                Text(title)
-                    .font(.headline)
-                    .bold()
-                    .multilineTextAlignment(.leading)
-            }
+            Text(title)
+                .font(.headline)
+                .bold()
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
         }
         .padding(.horizontal, 10)
     }
