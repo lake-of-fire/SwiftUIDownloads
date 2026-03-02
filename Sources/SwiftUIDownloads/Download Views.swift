@@ -212,6 +212,7 @@ public struct ActiveDownloadsList: View {
                     }
                 }
             }
+            .padding(.bottom, 6)
         }
     }
     
@@ -241,6 +242,7 @@ public struct ActiveDownloadsBox: View {
                 .foregroundStyle(.primary)
                 .multilineTextAlignment(.leading)
         }
+        .tint(.primary)
         .padding(.horizontal, 10)
     }
     
@@ -399,7 +401,7 @@ struct InnerDownloadProgressView: View {
                 .foregroundColor(.accentColor)
                 .frame(width: size, height: size) // Use the size parameter
                 .rotationEffect(Angle(degrees: -90))
-                .animation(.linear)
+                .animation(.linear, value: fractionCompleted)
 
 //                Image(systemName: "stop.fill")
 //                    .resizable()
@@ -515,7 +517,7 @@ public struct DownloadControls: View {
         Button {
             Task { @MainActor in
                 downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString]))).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                try? await downloadController.delete(download: downloadable)
+                _ = try? await downloadController.delete(download: downloadable)
             }
         } label: {
             Image(systemName: "trash")

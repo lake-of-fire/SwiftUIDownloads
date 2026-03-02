@@ -1,7 +1,7 @@
 import Foundation
 import Combine
 
-public final class ImportableDownloadable: Downloadable {
+public final class ImportableDownloadable: Downloadable, @unchecked Sendable {
     public typealias ImportProgressHandler = @Sendable (_ progress: Double?, _ status: String?) -> Void
     public typealias ImportHandler = @Sendable (URL, @escaping ImportProgressHandler) async throws -> Void
     public typealias ImportedCheck = @Sendable () async -> Bool

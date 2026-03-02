@@ -2,13 +2,13 @@
 import Foundation
 import Combine
 
-private let retryAfterDateFormatter: DateFormatter = {
+private func makeRetryAfterDateFormatter() -> DateFormatter {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.timeZone = TimeZone(secondsFromGMT: 0)
     formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
     return formatter
-}()
+}
 
 func parseRetryAfterSeconds(_ value: String, now: Date = Date()) -> Double? {
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -17,7 +17,7 @@ func parseRetryAfterSeconds(_ value: String, now: Date = Date()) -> Double? {
     if let deltaSeconds = Double(trimmed) {
         return max(0, deltaSeconds)
     }
-    if let retryDate = retryAfterDateFormatter.date(from: trimmed) {
+    if let retryDate = makeRetryAfterDateFormatter().date(from: trimmed) {
         return max(0, retryDate.timeIntervalSince(now))
     }
     return nil
@@ -181,9 +181,7 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
             do {
                 try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
                 _ = try FileManager.default.replaceItemAt(destination, withItemAt: location)
-            } catch {
-                print("Error moving: \(error)")
-            }
+            } catch { }
             subject.send(.completed(destinationLocation: location, etag: (downloadTask.response as? HTTPURLResponse)?.allHeaderFields["Etag"] as? String, error: nil))
             subject.send(completion: .finished)
         }
@@ -206,7 +204,6 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
         subject.send(.downloading(progress: downloadTask.progress))
 #else
         let progress = Progress(totalUnitCount: max(0, downloadTask.countOfBytesExpectedToReceive))
-        progress.completedUnitCount = downloadTask.countOfBytesReceived
         progress.completedUnitCount = downloadTask.countOfBytesReceived
         subject.send(.downloading(progress: progress))
 #endif

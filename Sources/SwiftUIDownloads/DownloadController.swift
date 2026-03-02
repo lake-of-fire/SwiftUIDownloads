@@ -2,7 +2,6 @@ import Foundation
 import SwiftUI
 import Combine
 import BackgroundAssets
-import Compression
 
 // TODO: Extract download state transitions + import handling into a small processor/state machine once behavior stabilizes.
 
@@ -102,7 +101,7 @@ fileprivate extension Array where Element: Hashable {
     }
 }
 
-public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
+public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked Sendable {
     public static var groupIdentifier: String? = nil
     
     public let url: URL
@@ -151,7 +150,6 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
         switch downloadProgress {
         case .completed(_, _, let error):
             if let error = error {
-                print(error)
                 return errorDescription(from: error)
             }
         default: break
@@ -260,20 +258,22 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
             return isFinishedProcessing // Return `true` if finished, `false` if failed
         }
 
-        for await (isFailed, isFinishedProcessing) in $isFailed.combineLatest($isFinishedProcessing).values {
+        while true {
+            try Task.checkCancellation()
             if isFailed {
                 return false
             }
             if isFinishedProcessing {
                 return true
             }
+            try await Task.sleep(nanoseconds: 20_000_000)
         }
-        return false
     }
     
     @DownloadActor
     public func existsLocally() async -> Bool {
-        return await FileManager.default.fileExists(atPath: localDestination.path) || FileManager.default.fileExists(atPath: compressedFileURL.path)
+        FileManager.default.fileExists(atPath: localDestination.path)
+            || FileManager.default.fileExists(atPath: compressedFileURL.path)
     }
     
     @DownloadActor
@@ -283,26 +283,24 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
             request.httpMethod = "HEAD"
             do {
                 let fileSize = try await UInt64(URLSession.shared.data(for: request).1.expectedContentLength)
-                try await { @MainActor in
+                await MainActor.run {
                     self.fileSize = fileSize
-                }()
+                }
             } catch {
-                print("Failed to fetch remote file size for url \(url.absoluteString): \(error)")
                 throw(error)
             }
         }
     }
     
     @DownloadActor
-    func download() async -> URLResourceDownloadTask {
+    func download(session: URLSession) async -> URLResourceDownloadTask {
         let destination = url.pathExtension == "br" ? compressedFileURL : localDestination
-        let task = URLResourceDownloadTask(session: URLSession.shared, url: url, destination: destination)
+        let task = URLResourceDownloadTask(session: session, url: url, destination: destination)
         
         task.publisher.receive(on: DispatchQueue.main).sink(receiveCompletion: { [weak self] completion in
             Task { @MainActor [weak self] in
                 switch completion {
                 case .failure(let error):
-                    debugPrint("Download failed", error)
                     self?.isFailed = true
                     self?.isFinishedDownloading = false
                     self?.isActive = false
@@ -352,7 +350,6 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
             }
 //            }
         }).store(in: &cancellables)
-        print("Downloading \(url) to \(destination)")
         
         await { @MainActor in
             isFinishedDownloading = false
@@ -368,30 +365,19 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
     func sizeForLocalFile() -> UInt64 {
         do {
             let fileAttributes = try FileManager.default.attributesOfItem(atPath: localDestination.path)
-            if let fileSize = fileAttributes[FileAttributeKey.size]  {
-                return (fileSize as! NSNumber).uint64Value
-            } else {
-                print("Failed to get a size attribute from path: \(localDestination)")
+            if let fileSize = fileAttributes[FileAttributeKey.size] as? NSNumber {
+                return fileSize.uint64Value
             }
-        } catch {
-            print("Failed to get file attributes for local path: \(localDestination) with error: \(error)")
-        }
+        } catch { }
         return 0
     }
 
     @DownloadActor
     func decompressIfNeeded() async throws {
         if FileManager.default.fileExists(atPath: compressedFileURL.path) {
-            print("Attempting decompression for \(compressedFileURL)")
-
             let compressedFileSize = (try? compressedFileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             if compressedFileSize == 0 {
-                print("Data is empty for \(compressedFileURL)")
-                do {
-                    try FileManager.default.removeItem(at: compressedFileURL)
-                } catch {
-                    print("Error removing compressedFileURL \(compressedFileURL) \(error.localizedDescription)")
-                }
+                try? FileManager.default.removeItem(at: compressedFileURL)
                 return
             }
 
@@ -408,18 +394,13 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, Sendable {
             } else {
                 try FileManager.default.moveItem(at: temporaryOutputURL, to: localDestination)
             }
-            
-            print("Decompressed \(compressedFileURL)")
+
             let sizeToSet = sizeForLocalFile()
             await { @MainActor [weak self] in
                 self?.fileSize = sizeToSet
             }()
-            
-            do {
-                try FileManager.default.removeItem(at: compressedFileURL)
-            } catch {
-                print("Error removing compressedFileURL \(compressedFileURL) \(error.localizedDescription)")
-            }
+
+            try? FileManager.default.removeItem(at: compressedFileURL)
 //        } else {
 //            print("No file exists to decompress at \(compressedFileURL)")
         }
@@ -507,7 +488,7 @@ public extension Downloadable {
         )
     }
     
-    #warning("Deprecated; remove in favor of above w/ DownloadDirectory")
+    // Deprecated; remove in favor of above with DownloadDirectory.
     convenience init?(name: String, groupIdentifier: String? = nil, parentDirectoryName: String, filename: String? = nil, downloadMirrors: [URL]) {
         guard let url = downloadMirrors.first else {
             return nil
@@ -538,6 +519,8 @@ public extension Downloadable {
 }
 
 public class DownloadController: NSObject, ObservableObject {
+    typealias DownloadAttemptExecutor = @Sendable (_ download: Downloadable, _ session: URLSession) async throws -> Void
+
     public static var shared: DownloadController = {
         let controller = DownloadController()
 //        if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
@@ -561,11 +544,6 @@ public class DownloadController: NSObject, ObservableObject {
     @MainActor
     @Published public var failedDownloads = Set<Downloadable>()
 
-#if DEBUG
-    private var loggedEnsureDownloadedStates: [URL: String] = [:]
-    private var loggedFinishDownloadStates: [URL: String] = [:]
-#endif
-    
     @MainActor
     public var unfinishedDownloads: [Downloadable] {
         let downloads: [Downloadable] = Array(Set(activeDownloads).union(Set(failedDownloads)))
@@ -583,24 +561,56 @@ public class DownloadController: NSObject, ObservableObject {
     
     private var observation: NSKeyValueObservation?
     private var cancellables = Set<AnyCancellable>()
+    private var downloadStatusCancellables = [String: Set<AnyCancellable>]()
+    private let session: URLSession
+    private let attemptExecutor: DownloadAttemptExecutor?
+    private let retryPolicyProvider: @Sendable () -> DownloadRetryPolicy
     
     public override init() {
+        self.session = .shared
+        self.attemptExecutor = nil
+        self.retryPolicyProvider = { .default }
         super.init()
-        
+        configureStateObservers()
+    }
+
+    public init(session: URLSession) {
+        self.session = session
+        self.attemptExecutor = nil
+        self.retryPolicyProvider = { .default }
+        super.init()
+        configureStateObservers()
+    }
+
+    init(
+        session: URLSession,
+        attemptExecutor: DownloadAttemptExecutor?,
+        retryPolicyProvider: @escaping @Sendable () -> DownloadRetryPolicy = { .default }
+    ) {
+        self.session = session
+        self.attemptExecutor = attemptExecutor
+        self.retryPolicyProvider = retryPolicyProvider
+        super.init()
+        configureStateObservers()
+    }
+
+    private func configureStateObservers() {
         $activeDownloads
             .removeDuplicates()
 //            .print("#")
             .combineLatest($failedDownloads.removeDuplicates())
             .receive(on: DispatchQueue.main)
-            .sink { @MainActor [weak self] (active, failed) in
-//                debugPrint("# update isPending...", active.isEmpty, failed.isEmpty)
-                self?.isPending = !(active.isEmpty && failed.isEmpty)
+            .sink { [weak self] (active, failed) in
+                Task { @MainActor [weak self] in
+//                    debugPrint("# update isPending...", active.isEmpty, failed.isEmpty)
+                    self?.isPending = !(active.isEmpty && failed.isEmpty)
+                }
             }
             .store(in: &cancellables)
     }
 }
 
-struct DownloadRetryPolicy {
+struct DownloadRetryPolicy: Sendable {
     let maxAttempts: Int
     let initialDelaySeconds: Double
     let maxDelaySeconds: Double
@@ -783,7 +793,6 @@ public extension DownloadController {
                 if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory), isDirectory.boolValue {
                     potentialOrphanDirs.insert(fileURL)
                 } else {
-                    print("DownloadController: deleting orphan \(fileURL)")
                     try FileManager.default.removeItemIfPresent(at: fileURL)
                 }
             }
@@ -791,7 +800,6 @@ public extension DownloadController {
         
         for orphanDir in potentialOrphanDirs {
             if !seenSavedFiles.contains(where: { $0.path.hasPrefix(orphanDir.path) }) {
-                print("DownloadController: deleting orphan directory \(orphanDir)")
                 try FileManager.default.removeItemIfPresent(at: orphanDir)
             }
         }
@@ -800,8 +808,9 @@ public extension DownloadController {
     @DownloadActor
     func delete(download: Downloadable) async throws -> Downloadable {
         await cancelInProgressDownloads(matchingDownloadURL: download.url)
+        clearDownloadStatusObservers(forDownloadID: download.id)
         try FileManager.default.removeItemIfPresent(at: download.localDestination)
-        try await { @MainActor in
+        await MainActor.run {
             assuredDownloads = assuredDownloads.filter { $0.url != download.url }
             finishedDownloads = finishedDownloads.filter { $0.url != download.url }
             failedDownloads = failedDownloads.filter { $0.url != download.url }
@@ -811,7 +820,7 @@ public extension DownloadController {
             download.isFinishedDownloading = false
             download.isFailed = false
             download.downloadProgress = .uninitiated
-        }()
+        }
         return download
     }
     
@@ -837,22 +846,99 @@ public extension DownloadController {
 }
 
 extension DownloadController {
+    private enum DownloadAttemptExecutionError: LocalizedError {
+        case completedStateMissing(url: URL)
+
+        var errorDescription: String? {
+            switch self {
+            case .completedStateMissing(let url):
+                return "Download finished without a terminal state for \(url.absoluteString)"
+            }
+        }
+    }
+
     @DownloadActor
-    private func runSingleDownloadAttempt(_ download: Downloadable) async -> Error? {
-        let task = await download.download()
-        guard let completedState = try? await task.publisher.values.first(where: { progress in
+    private func clearDownloadStatusObservers(forDownloadID downloadID: String) {
+        guard let cancellables = downloadStatusCancellables.removeValue(forKey: downloadID) else {
+            return
+        }
+        cancellables.forEach { $0.cancel() }
+    }
+
+    @DownloadActor
+    private func resetDownloadStatusObservers(for download: Downloadable, etag: String?) {
+        clearDownloadStatusObservers(forDownloadID: download.id)
+
+        var perDownloadCancellables = Set<AnyCancellable>()
+        download.$isActive.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] isActive in
+            Task { @MainActor [weak self] in
+                if isActive {
+                    self?.activeDownloads.insert(download)
+                } else {
+                    self?.activeDownloads.remove(download)
+                }
+            }
+        }.store(in: &perDownloadCancellables)
+        download.$isFailed.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] isFailed in
+            Task { @MainActor [weak self] in
+                if isFailed {
+                    self?.finishedDownloads.remove(download)
+                    self?.failedDownloads.insert(download)
+                    self?.activeDownloads.remove(download)
+                } else {
+                    self?.failedDownloads.remove(download)
+                }
+            }
+        }.store(in: &perDownloadCancellables)
+        download.$isFinishedDownloading.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self, weak download] isFinishedDownloading in
+            Task { @MainActor [weak self, weak download] in
+                if isFinishedDownloading {
+                    if let download = download {
+                        self?.failedDownloads.remove(download)
+                        self?.finishedDownloads.insert(download)
+                        self?.activeDownloads.remove(download)
+                    }
+                    if !(download?.isFromBackgroundAssetsDownloader ?? true) {
+                        try? await self?.cancelInProgressDownloads(inDownloadExtension: true)
+                    }
+                    if let download = download {
+                        Task.detached(priority: .utility) { [weak self] in
+                            await self?.finishDownload(download, etag: etag)
+                        }
+                    }
+                } else if let download = download {
+                    self?.finishedDownloads.remove(download)
+                }
+            }
+        }.store(in: &perDownloadCancellables)
+
+        downloadStatusCancellables[download.id] = perDownloadCancellables
+    }
+
+    @DownloadActor
+    private func runSingleDownloadAttempt(_ download: Downloadable) async throws {
+        if let attemptExecutor {
+            try await attemptExecutor(download, session)
+            return
+        }
+
+        let task = await download.download(session: session)
+        guard let completedState = try await task.publisher.values.first(where: { progress in
             if case .completed = progress {
                 return true
             }
             return false
         }) else {
-            return URLError(.unknown)
+            throw DownloadAttemptExecutionError.completedStateMissing(url: download.url)
         }
-
-        if case .completed(_, _, let error) = completedState {
-            return error
+        switch completedState {
+        case .completed(_, _, let error):
+            if let error {
+                throw error
+            }
+        default:
+            throw DownloadAttemptExecutionError.completedStateMissing(url: download.url)
         }
-        return URLError(.unknown)
     }
 
     @MainActor
@@ -863,33 +949,10 @@ extension DownloadController {
         assuredDownloads.insert(download)
         do {
             try await deleteOrphanFiles(in: deletingOrphansIn, excluding: excludingFromDeletion)
-        } catch {
-            print("ERROR Failed to delete orphan files. \(error)")
-        }
+        } catch { }
         
         let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
         let localExists = await download.existsLocally()
-        #if DEBUG
-        let stateKey = [
-            "localExists=\(localExists)",
-            "isImported=\(isImported)",
-            "isFinishedProcessing=\(download.isFinishedProcessing)",
-            "isActive=\(download.isActive)",
-            "isFailed=\(download.isFailed)"
-        ].joined(separator: "|")
-        if loggedEnsureDownloadedStates[download.url] != stateKey {
-            loggedEnsureDownloadedStates[download.url] = stateKey
-            debugPrint(
-                "# YOMITANIMPORT ensureDownloaded.state",
-                "url=\(download.url.absoluteString)",
-                "localExists=\(localExists)",
-                "isImported=\(isImported)",
-                "isFinishedProcessing=\(download.isFinishedProcessing)",
-                "isActive=\(download.isActive)",
-                "isFailed=\(download.isFailed)"
-            )
-        }
-        #endif
         if localExists || isImported {
             if isImported {
                 await markDownloadAsProcessed(download)
@@ -900,36 +963,23 @@ extension DownloadController {
             if download.shouldCheckForUpdates,
                download.lastCheckedETagAt == nil
                 || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > updateCheckInterval {
-                await checkFileModifiedAt(download: download) { [weak self] modified, modifiedAt, etag in
-                    Task { @MainActor [weak self] in
-                        download.lastCheckedETagAt = Date()
-                        if let modifiedAt {
-                            download.lastModifiedAt = modifiedAt
-                        }
-                        if modified {
-                            await self?.download(download, etag: etag)
-                        }
-                    }
+                let (modified, modifiedAt, etag) = await checkFileModifiedAt(download: download)
+                download.lastCheckedETagAt = Date()
+                if let modifiedAt {
+                    download.lastModifiedAt = modifiedAt
+                }
+                if modified {
+                    await self.download(download, etag: etag)
                 }
             }
         } else {
-            async let task = { @DownloadActor [weak self] in
-                await self?.download(download)
-            }()
-            try? await task
+            await self.download(download)
         }
         //        }
     }
     
     @DownloadActor
     public func download(_ download: Downloadable, etag: String? = nil) async {
-        #if DEBUG
-        debugPrint(
-            "# YOMITANIMPORT download.begin",
-            "url=\(download.url.absoluteString)",
-            "etag=\(etag ?? "nil")"
-        )
-        #endif
         await { @MainActor in
             // Allow a fresh import attempt after a previous failure.
             download.isFinishedProcessing = false
@@ -942,43 +992,7 @@ extension DownloadController {
                 importable.importStatusText = nil
             }()
         }
-        download.$isActive.removeDuplicates().receive(on: DispatchQueue.main).sink { @MainActor [weak self] isActive in
-            if isActive {
-                self?.activeDownloads.insert(download)
-            } else {
-                self?.activeDownloads.remove(download)
-            }
-        }.store(in: &cancellables)
-        download.$isFailed.removeDuplicates().receive(on: DispatchQueue.main).sink { @MainActor [weak self] isFailed in
-            if isFailed {
-                self?.finishedDownloads.remove(download)
-                self?.failedDownloads.insert(download)
-                self?.activeDownloads.remove(download)
-            } else {
-                self?.failedDownloads.remove(download)
-            }
-        }.store(in: &cancellables)
-        download.$isFinishedDownloading.removeDuplicates().receive(on: DispatchQueue.main).sink { @MainActor [weak self, weak download] isFinishedDownloading in
-            if isFinishedDownloading {
-                if let download = download {
-                    self?.failedDownloads.remove(download)
-                    self?.finishedDownloads.insert(download)
-                    self?.activeDownloads.remove(download)
-                }
-                if !(download?.isFromBackgroundAssetsDownloader ?? true) {
-                    Task { @MainActor [weak self] in
-                        try? await self?.cancelInProgressDownloads(inDownloadExtension: true)
-                    }
-                }
-                if let download = download {
-                    Task.detached(priority: .utility) { [weak self] in
-                        await self?.finishDownload(download, etag: etag)
-                    }
-                }
-            } else if let download = download {
-                self?.finishedDownloads.remove(download)
-            }
-        }.store(in: &cancellables)
+        resetDownloadStatusObservers(for: download, etag: etag)
         
         if download.url.isFileURL {
             await { @MainActor in
@@ -1005,22 +1019,30 @@ extension DownloadController {
                 try FileManager.default.copyItem(at: download.url, to: download.localDestination)
                 await finishDownload(download, etag: etag)
             } catch {
-                await { @MainActor in
+                await MainActor.run { [weak self] in
+                    self?.finishedDownloads.remove(download)
+                    self?.failedDownloads.insert(download)
+                    self?.activeDownloads.remove(download)
                     download.isFailed = true
                     download.isActive = false
                     download.isFinishedDownloading = false
                     download.isFinishedProcessing = false
-                }()
+                    download.downloadProgress = .completed(
+                        destinationLocation: nil,
+                        etag: nil,
+                        error: error
+                    )
+                }
+                clearDownloadStatusObservers(forDownloadID: download.id)
             }
             return
         }
 
-        try await {
-            let allTasks = await URLSession.shared.allTasks
-            if allTasks.first(where: { $0.taskDescription == download.url.absoluteString }) != nil {
-                // Task exists.
-                return
-            }
+        let allTasks = await session.allTasks
+        if allTasks.first(where: { $0.taskDescription == download.url.absoluteString }) != nil {
+            // Task exists.
+            return
+        }
             
 //            if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
 //                if #available(macOS 13, iOS 16.1, *) {
@@ -1043,30 +1065,23 @@ extension DownloadController {
 //                } else { }
 //            }
             
-            download.isFromBackgroundAssetsDownloader = false
-            let retryPolicy = DownloadRetryPolicy.default
-            var attempt = 1
-            while true {
-                if Task.isCancelled {
-                    break
-                }
+        download.isFromBackgroundAssetsDownloader = false
+        let retryPolicy = retryPolicyProvider()
+        var attempt = 1
+        var terminalAttemptError: Error?
+        while true {
+            if Task.isCancelled {
+                terminalAttemptError = CancellationError()
+                break
+            }
 
-                guard let error = await runSingleDownloadAttempt(download) else {
-                    break
-                }
-
+            do {
+                try await runSingleDownloadAttempt(download)
+                break
+            } catch {
                 let shouldRetry = attempt < retryPolicy.maxAttempts && isRetryableDownloadError(error)
-                #if DEBUG
-                debugPrint(
-                    "# DOWNLOADABLE retry",
-                    "url=\(download.url.absoluteString)",
-                    "attempt=\(attempt)",
-                    "maxAttempts=\(retryPolicy.maxAttempts)",
-                    "retryable=\(shouldRetry)",
-                    "error=\(error)"
-                )
-                #endif
                 guard shouldRetry else {
+                    terminalAttemptError = error
                     break
                 }
 
@@ -1085,12 +1100,30 @@ extension DownloadController {
                 }()
                 attempt += 1
             }
-        }()
+        }
+
+        if let terminalAttemptError {
+            await MainActor.run { [weak self] in
+                self?.finishedDownloads.remove(download)
+                self?.failedDownloads.insert(download)
+                self?.activeDownloads.remove(download)
+                download.isFailed = true
+                download.isActive = false
+                download.isFinishedDownloading = false
+                download.isFinishedProcessing = false
+                download.downloadProgress = .completed(
+                    destinationLocation: nil,
+                    etag: nil,
+                    error: terminalAttemptError
+                )
+            }
+            clearDownloadStatusObservers(forDownloadID: download.id)
+        }
     }
     
     @MainActor
     public func cancelInProgressDownloads(matchingDownloadURL downloadURL: URL? = nil) async {
-        let allTasks = await URLSession.shared.allTasks
+        let allTasks = await session.allTasks
         for (task, download) in allTasks.map({ task in
             let download = assuredDownloads.first(where: {
                 if let downloadURL = downloadURL, $0.url != downloadURL {
@@ -1104,9 +1137,7 @@ extension DownloadController {
                 if let destination = download?.localDestination {
                     do {
                         try FileManager.default.removeItemIfPresent(at: destination)
-                    } catch {
-                        print("ERROR deleting \(destination.absoluteString): \(error)")
-                    }
+                    } catch { }
             }
         }
     }
@@ -1114,7 +1145,7 @@ extension DownloadController {
     @MainActor
     func cancelInProgressDownloads(inApp: Bool = false, inDownloadExtension: Bool = false) async throws {
         if inApp {
-            let allTasks = await URLSession.shared.allTasks
+            let allTasks = await session.allTasks
             for task in allTasks.filter({ task in assuredDownloads.contains(where: { $0.url.absoluteString == (task.taskDescription ?? "") }) }) {
                 task.cancel()
             }
@@ -1133,26 +1164,9 @@ extension DownloadController {
     @DownloadActor
     public func finishDownload(_ download: Downloadable, etag: String? = nil) async {
         do {
-            #if DEBUG
-            @inline(__always)
-            func shouldLogFinishState(_ state: String) -> Bool {
-                if loggedFinishDownloadStates[download.url] == state {
-                    return false
-                }
-                loggedFinishDownloadStates[download.url] = state
-                return true
-            }
-            #endif
             let alreadyFinished = await MainActor.run { download.isFinishedProcessing }
             if alreadyFinished {
-                #if DEBUG
-                if shouldLogFinishState("skip.alreadyFinished") {
-                    debugPrint(
-                        "# YOMITANIMPORT finishDownload skip (already finished)",
-                        "url=\(download.url.absoluteString)"
-                    )
-                }
-                #endif
+                clearDownloadStatusObservers(forDownloadID: download.id)
                 return
             }
             if let importable = download as? ImportableDownloadable,
@@ -1165,10 +1179,6 @@ extension DownloadController {
                     }
                 }()
             }
-            #if DEBUG
-            let compressedExists = FileManager.default.fileExists(atPath: download.compressedFileURL.path)
-            let destinationSize = (try? download.localDestination.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                        #endif
             try await Task.detached(priority: .utility) {
                 try await download.decompressIfNeeded()
             }.value
@@ -1178,47 +1188,20 @@ extension DownloadController {
                   let fileSize = resourceValues.fileSize, fileSize > 0 else {
                 if let importable = download as? ImportableDownloadable,
                    await importable.isImported() {
-                    #if DEBUG
-                    if shouldLogFinishState("skip.importedNoLocalFile") {
-                        debugPrint(
-                            "# YOMITANIMPORT finishDownload skip (imported, no local file)",
-                            "url=\(download.url.absoluteString)"
-                        )
-                    }
-                    #endif
                     await markDownloadAsProcessed(download)
+                    clearDownloadStatusObservers(forDownloadID: download.id)
                     return
                 }
-                async let task = { @MainActor [weak self] in
+                await MainActor.run { [weak self] in
                     self?.activeDownloads.remove(download)
                     self?.finishedDownloads.remove(download)
                     self?.failedDownloads.insert(download)
-                }()
-                try await task
+                }
+                clearDownloadStatusObservers(forDownloadID: download.id)
                 return
             }
             
             if let importable = download as? ImportableDownloadable {
-                #if DEBUG
-                let startState = "start.\(download.localDestination.lastPathComponent)"
-                if shouldLogFinishState(startState) {
-                    debugPrint(
-                        "# YOMITANIMPORT finishDownload",
-                        "url=\(download.url.absoluteString)",
-                        "destination=\(download.localDestination.lastPathComponent)"
-                    )
-                }
-                #endif
-                #if DEBUG
-                let importStart = Date()
-                debugPrint(
-                    "# DOWNLOADABLEIMPORT start",
-                    "url=\(download.url.absoluteString)",
-                    "name=\(download.name)"
-                )
-                var lastLoggedProgress: Double?
-                var lastLoggedStatus: String?
-                #endif
                 await { @MainActor in
                     importable.lastImportError = nil
                     importable.importProgress = 0
@@ -1233,57 +1216,20 @@ extension DownloadController {
                         if let status {
                             importable.importStatusText = status
                         }
-                        #if DEBUG
-                        let clampedProgress = importable.importProgress
-                        let currentStatus = importable.importStatusText
-                        let progressDelta: Double
-                        if let clampedProgress, let lastLoggedProgress {
-                            progressDelta = abs(clampedProgress - lastLoggedProgress)
-                        } else {
-                            progressDelta = 1
-                        }
-                        let statusChanged = currentStatus != lastLoggedStatus
-                        if statusChanged || progressDelta >= 0.05 {
-                            lastLoggedProgress = clampedProgress
-                            lastLoggedStatus = currentStatus
-                            debugPrint(
-                                "# DOWNLOADABLEIMPORT progress",
-                                "url=\(download.url.absoluteString)",
-                                "name=\(download.name)",
-                                "progress=\(clampedProgress.map { String(format: "%.2f", $0) } ?? "nil")",
-                                "status=\(currentStatus ?? "nil")"
-                            )
-                        }
-                        #endif
                     }
                 }
                 try await importable.importHandler(download.localDestination, progressHandler)
-                #if DEBUG
-                let importElapsed = Date().timeIntervalSince(importStart)
-                await MainActor.run {
-                    debugPrint(
-                        "# DOWNLOADABLEIMPORT finish",
-                        "url=\(download.url.absoluteString)",
-                        "name=\(download.name)",
-                        "elapsed=\(String(format: "%.2fs", importElapsed))",
-                        "error=\(String(describing: importable.lastImportError))"
-                    )
-                }
-                #endif
                 if importable.deleteAfterImport {
                     try? FileManager.default.removeItem(at: download.localDestination)
                 }
             }
 //              print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
             
-            async let task = { @MainActor [weak self] in
+            await MainActor.run { [weak self] in
                 download.lastDownloadedETag = etag ?? download.lastDownloadedETag
                 self?.failedDownloads.remove(download)
                 self?.activeDownloads.remove(download)
                 self?.finishedDownloads.insert(download)
-                if !download.isFinishedDownloading {
-                    print("Download \(download.url) finished downloading to \(download.localDestination)")
-                }
                 download.isFailed = false
                 download.isActive = false
                 download.isFinishedDownloading = true
@@ -1292,45 +1238,10 @@ extension DownloadController {
                     importable.importProgress = nil
                     importable.importStatusText = nil
                 }
-            }()
-            try await task
-            #if DEBUG
-            if let importable = download as? ImportableDownloadable {
-                let shouldLogSuccess = shouldLogFinishState("success")
-                await { @MainActor in
-                    if shouldLogSuccess {
-                        debugPrint(
-                            "# YOMITANIMPORT finishDownload.success",
-                            "url=\(download.url.absoluteString)",
-                            "isFailed=\(download.isFailed)",
-                            "isFinishedProcessing=\(download.isFinishedProcessing)",
-                            "importStatus=\(importable.importStatusText ?? "nil")",
-                            "importError=\(String(describing: importable.lastImportError))"
-                        )
-                    }
-                }()
             }
-            #endif
+            clearDownloadStatusObservers(forDownloadID: download.id)
         } catch {
-            #if DEBUG
-            let shouldDeleteLocal = (download as? ImportableDownloadable)?.deleteAfterImport ?? true
-            let localExists = FileManager.default.fileExists(atPath: download.localDestination.path)
-            let compressedExists = FileManager.default.fileExists(atPath: download.compressedFileURL.path)
-            let errorState = "error.\(type(of: error))|\(error)"
-            if loggedFinishDownloadStates[download.url] != errorState {
-                loggedFinishDownloadStates[download.url] = errorState
-                debugPrint(
-                    "# YOMITANIMPORT finishDownload.error",
-                    "url=\(download.url.absoluteString)",
-                    "destination=\(download.localDestination.lastPathComponent)",
-                    "deleteAfterImport=\(shouldDeleteLocal)",
-                    "localExists=\(localExists)",
-                    "compressedExists=\(compressedExists)",
-                    "error=\(error)"
-                )
-            }
-            #endif
-            async let task = { @MainActor [weak self] in
+            await MainActor.run { [weak self] in
                 if let importable = download as? ImportableDownloadable {
                     importable.lastImportError = error
                     importable.importStatusText = "Import failed"
@@ -1346,8 +1257,8 @@ extension DownloadController {
                 if shouldDeleteLocal {
                     try? FileManager.default.removeItem(at: download.localDestination)
                 }
-            }()
-            try await task
+            }
+            clearDownloadStatusObservers(forDownloadID: download.id)
         }
     }
 
@@ -1367,42 +1278,44 @@ extension DownloadController {
     /// Checks if file at given URL is modified.
     /// Using "Last-Modified" header value to compare it with given date.
     @DownloadActor
-    public func checkFileModifiedAt(download: Downloadable, completion: @escaping (Bool, Date?, String?) -> Void) {
+    public func checkFileModifiedAt(download: Downloadable) async -> (Bool, Date?, String?) {
         var request = URLRequest(url: download.url)
         request.httpMethod = "HEAD"
-        URLSession.shared.dataTask(with: request, completionHandler: { (_, response, error) in
+        do {
+            let (_, response) = try await session.data(for: request)
             guard let httpURLResponse = response as? HTTPURLResponse,
-                  httpURLResponse.statusCode == 200,
-                  error == nil else {
-                completion(false, nil, nil)
-                return
+                  httpURLResponse.statusCode == 200 else {
+                return (false, nil, nil)
             }
-            
+
+            let etag = httpURLResponse.allHeaderFields["Etag"] as? String
+            let baseline = await MainActor.run {
+                download.lastModifiedAt ?? download.lastDownloaded ?? Date(timeIntervalSince1970: 0)
+            }
+            let lastDownloadedETag = await MainActor.run {
+                download.lastDownloadedETag
+            }
+
             if let modifiedDateString = httpURLResponse.allHeaderFields["Last-Modified"] as? String {
                 let dateFormatter = DateFormatter()
                 dateFormatter.locale = Locale(identifier: "en_US_POSIX")
                 dateFormatter.dateStyle = .medium
                 dateFormatter.timeStyle = .long
                 dateFormatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-                guard let modifiedDate = dateFormatter.date(from: modifiedDateString) else {
-                    completion(false, nil, httpURLResponse.allHeaderFields["Etag"] as? String)
-                    return
-                }
-                
-                let baseline = download.lastModifiedAt ?? download.lastDownloaded ?? Date(timeIntervalSince1970: 0)
-                if modifiedDate > baseline {
-                    completion(true, modifiedDate, httpURLResponse.allHeaderFields["Etag"] as? String)
-                    return
+                if let modifiedDate = dateFormatter.date(from: modifiedDateString),
+                   modifiedDate > baseline {
+                    return (true, modifiedDate, etag)
                 }
             }
-            
-            if let etag = httpURLResponse.allHeaderFields["Etag"] as? String, etag != download.lastDownloadedETag {
-                completion(true, nil, httpURLResponse.allHeaderFields["Etag"] as? String)
-                return
+
+            if let etag, etag != lastDownloadedETag {
+                return (true, nil, etag)
             }
-            
-            completion(false, nil, httpURLResponse.allHeaderFields["Etag"] as? String)
-        }).resume()
+
+            return (false, nil, etag)
+        } catch {
+            return (false, nil, nil)
+        }
     }
 }
 
