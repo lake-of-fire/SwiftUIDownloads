@@ -7,7 +7,7 @@ import Brotli
 
 @globalActor
 public actor DownloadActor {
-    public static var shared = DownloadActor()
+    public static let shared = DownloadActor()
 }
 
 fileprivate func errorDescription(from error: Error) -> String {
