@@ -2,10 +2,21 @@ import SwiftUI
 
 public struct DownloadProgress: View {
     @ObservedObject var download: Downloadable
+    @ObservedObject private var downloadController = DownloadController.shared
     let retryAction: (() async throws -> Void)
     let redownloadAction: (() async throws -> Void)
     
+    private var displayName: String {
+        return download.name
+    }
+
     private var statusText: String {
+        if isFailed {
+            if let message = download.failureMessage, !message.isEmpty {
+                return "Error: \(message)"
+            }
+            return "Failed"
+        }
         if download.isFinishedProcessing {
             return "Installed"
         }
@@ -26,6 +37,10 @@ public struct DownloadProgress: View {
                 if download.isFinishedProcessing {
                     return "Installed"
                 } else {
+                    if let importable = download as? ImportableDownloadable,
+                       let status = importable.importStatusText {
+                        return status
+                    }
                     return "Installing…"
                 }
             }
@@ -36,12 +51,50 @@ public struct DownloadProgress: View {
     }
     
     private var isFailed: Bool {
+        if download.isFailed {
+            return true
+        }
+        if downloadController.failedDownloads.contains(where: { $0.url == download.url }) {
+            return true
+        }
         switch download.downloadProgress {
         case .completed(_, _, let urlError):
             return urlError != nil
         default:
             return false
         }
+    }
+    
+    private enum ProgressStyle {
+        case none
+        case indeterminate
+        case determinate(Double)
+    }
+    
+    private var progressStyle: ProgressStyle {
+        if download.isFinishedProcessing {
+            return .none
+        }
+        switch download.downloadProgress {
+        case .downloading(let progress):
+            return .determinate(progress.fractionCompleted)
+        case .completed(let destinationLocation, _, let error):
+            guard destinationLocation != nil, error == nil else { return .none }
+            if let importable = download as? ImportableDownloadable,
+               let importProgress = importable.importProgress {
+                return .determinate(importProgress)
+            }
+            return .indeterminate
+        default:
+            return .indeterminate
+        }
+    }
+    
+    private var shouldShowProgress: Bool {
+        if download.isFinishedProcessing {
+            return false
+        }
+        return !isFailed
     }
     
     private var fractionCompleted: Double {
@@ -52,7 +105,14 @@ public struct DownloadProgress: View {
         case .downloading(let progress):
             return progress.fractionCompleted
         case .completed(let destinationLocation, _, let error):
-            return destinationLocation != nil && error == nil ? 1.0 : 0
+            if destinationLocation != nil && error == nil {
+                if let importable = download as? ImportableDownloadable,
+                   let importProgress = importable.importProgress {
+                    return importProgress
+                }
+                return 1.0
+            }
+            return 0
         default:
             return 0
         }
@@ -60,36 +120,37 @@ public struct DownloadProgress: View {
     
     public var body: some View {
         HStack(alignment: .center, spacing: 12) {
-            if download.isFinishedProcessing {
+            if isFailed {
+                Image(systemName: "exclamationmark.circle")
+                    .foregroundColor(.red)
+                    .font(.title)
+            } else if download.isFinishedProcessing {
                 Image(systemName: "checkmark.circle")
                     .foregroundColor(.green)
                     .font(.title)
-            } else {
-                if isFailed {
-                    Image(systemName: "exclamationmark.circle")
-                        .foregroundColor(.red)
-                        .font(.title)
-                } else {
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .scaleEffect(0.75, anchor: .center)
-                }
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(download.isActive ? "Downloading " : "")\(download.name)")
-                    .font(.callout)
-                if fractionCompleted < 1 {
-                    ProgressView(value: fractionCompleted)
-                        .progressViewStyle(.linear)
-                        .frame(height: 5)
-                        .clipShape(Capsule())
+                Text(displayName)
+                    .font(.caption)
+                if shouldShowProgress {
+                    switch progressStyle {
+                    case .determinate(let progress):
+                        ProgressView(value: min(max(progress, 0), 1))
+                            .progressViewStyle(.linear)
+                            .frame(height: 5)
+                            .clipShape(Capsule())
+                    default:
+                        ProgressView()
+                            .progressViewStyle(.linear)
+                            .frame(height: 5)
+                            .clipShape(Capsule())
+                    }
                 }
                 Text(statusText)
                     .font(.caption)
                     .monospacedDigit()
                     .foregroundColor(isFailed ? .red : .secondary)
             }
-            .font(.callout)
             .frame(maxWidth: .infinity, alignment: .leading)
             if isFailed {
                 Button("Retry") {
@@ -130,9 +191,11 @@ public struct ActiveDownloadsList: View {
     @ObservedObject private var downloadController = DownloadController.shared
     
     public var body: some View {
+        let downloads = downloadController.unfinishedDownloadsIncludingImports
         ScrollView {
             LazyVStack {
-                ForEach(downloadController.unfinishedDownloads) { download in
+                ForEach(downloads.indices, id: \.self) { index in
+                    let download = downloads[index]
                     DownloadProgress(download: download, retryAction: {
                         Task { @MainActor in
                             await downloadController.ensureDownloaded([download])
@@ -143,10 +206,13 @@ public struct ActiveDownloadsList: View {
                         }
                     })
                     .padding(.horizontal, 12)
-                    Divider()
-                        .padding(.horizontal, 6)
+                    if index < downloads.count - 1 {
+                        Divider()
+                            .padding(.horizontal, 6)
+                    }
                 }
             }
+            .padding(.bottom, 6)
         }
     }
     
@@ -170,15 +236,13 @@ public struct ActiveDownloadsBox: View {
                 Spacer(minLength: 0)
             }
         } label: {
-            HStack(spacing: 10) {
-                ProgressView()
-                    .scaleEffect(0.75, anchor: .center)
-                Text(title)
-                    .font(.headline)
-                    .bold()
-                    .multilineTextAlignment(.leading)
-            }
+            Text(title)
+                .font(.headline)
+                .bold()
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
         }
+        .tint(.primary)
         .padding(.horizontal, 10)
     }
     
@@ -337,7 +401,7 @@ struct InnerDownloadProgressView: View {
                 .foregroundColor(.accentColor)
                 .frame(width: size, height: size) // Use the size parameter
                 .rotationEffect(Angle(degrees: -90))
-                .animation(.linear)
+                .animation(.linear, value: fractionCompleted)
 
 //                Image(systemName: "stop.fill")
 //                    .resizable()
@@ -453,7 +517,7 @@ public struct DownloadControls: View {
         Button {
             Task { @MainActor in
                 downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString]))).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                try? await downloadController.delete(download: downloadable)
+                _ = try? await downloadController.delete(download: downloadable)
             }
         } label: {
             Image(systemName: "trash")

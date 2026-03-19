@@ -2,6 +2,60 @@
 import Foundation
 import Combine
 
+private func makeRetryAfterDateFormatter() -> DateFormatter {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+    return formatter
+}
+
+func parseRetryAfterSeconds(_ value: String, now: Date = Date()) -> Double? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    if let deltaSeconds = Double(trimmed) {
+        return max(0, deltaSeconds)
+    }
+    if let retryDate = makeRetryAfterDateFormatter().date(from: trimmed) {
+        return max(0, retryDate.timeIntervalSince(now))
+    }
+    return nil
+}
+
+func retryAfterSeconds(from response: HTTPURLResponse, now: Date = Date()) -> Double? {
+    if let headerValue = response.value(forHTTPHeaderField: "Retry-After") {
+        return parseRetryAfterSeconds(headerValue, now: now)
+    }
+    return nil
+}
+
+public struct URLResourceDownloadHTTPError: LocalizedError, Sendable {
+    public let statusCode: Int
+    public let url: URL?
+    public let retryAfterSeconds: Double?
+
+    public init(statusCode: Int, url: URL?, retryAfterSeconds: Double? = nil) {
+        self.statusCode = statusCode
+        self.url = url
+        self.retryAfterSeconds = retryAfterSeconds
+    }
+
+    public var errorDescription: String? {
+        let status = HTTPURLResponse.localizedString(forStatusCode: statusCode)
+        if let url {
+            if let retryAfterSeconds {
+                return "HTTP \(statusCode) (\(status)) for \(url.absoluteString), Retry-After \(Int(retryAfterSeconds))s"
+            }
+            return "HTTP \(statusCode) (\(status)) for \(url.absoluteString)"
+        }
+        if let retryAfterSeconds {
+            return "HTTP \(statusCode) (\(status)), Retry-After \(Int(retryAfterSeconds))s"
+        }
+        return "HTTP \(statusCode) (\(status))"
+    }
+}
+
 public enum URLResourceDownloadTaskProgress { //}: Equatable, CustomStringConvertible {
 //    public static func == (lhs: URLResourceDownloadTaskProgress, rhs: URLResourceDownloadTaskProgress) -> Bool {
 //        return lhs.description == rhs.de
@@ -102,6 +156,13 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol 
 }
 
 extension URLResourceDownloadTask: URLSessionDownloadDelegate {
+    private func makeHTTPError(from response: HTTPURLResponse) -> URLResourceDownloadHTTPError {
+        URLResourceDownloadHTTPError(
+            statusCode: response.statusCode,
+            url: self.url,
+            retryAfterSeconds: retryAfterSeconds(from: response)
+        )
+    }
 
     /// Tells the delegate that a download task has finished downloading.
     public func urlSession(_ session: URLSession,
@@ -113,16 +174,14 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
         }
 
         if let httpResponse = downloadTask.response as? HTTPURLResponse, httpResponse.statusCode < 200 || httpResponse.statusCode > 299 {
-            let error = URLError(.fileDoesNotExist)
+            let error = makeHTTPError(from: httpResponse)
             subject.send(.completed(destinationLocation: location, etag: nil, error: error))
             subject.send(completion: .failure(error))
         } else {
             do {
                 try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
                 _ = try FileManager.default.replaceItemAt(destination, withItemAt: location)
-            } catch {
-                print("Error moving: \(error)")
-            }
+            } catch { }
             subject.send(.completed(destinationLocation: location, etag: (downloadTask.response as? HTTPURLResponse)?.allHeaderFields["Etag"] as? String, error: nil))
             subject.send(completion: .finished)
         }
@@ -146,7 +205,6 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
 #else
         let progress = Progress(totalUnitCount: max(0, downloadTask.countOfBytesExpectedToReceive))
         progress.completedUnitCount = downloadTask.countOfBytesReceived
-        progress.completedUnitCount = downloadTask.countOfBytesReceived
         subject.send(.downloading(progress: progress))
 #endif
     }
@@ -166,7 +224,11 @@ extension URLResourceDownloadTask: URLSessionTaskDelegate {
             subject.send(.completed(destinationLocation: nil, etag: nil, error: posixError))
             subject.send(completion: .failure(posixError))
         } else if let httpResponse = task.response as? HTTPURLResponse, httpResponse.statusCode < 200 || httpResponse.statusCode > 299 {
-            let error = URLError(.fileDoesNotExist)
+            let error = URLResourceDownloadHTTPError(
+                statusCode: httpResponse.statusCode,
+                url: self.url,
+                retryAfterSeconds: retryAfterSeconds(from: httpResponse)
+            )
             subject.send(.completed(destinationLocation: nil, etag: nil, error: error))
             subject.send(completion: .failure(error))
         }
