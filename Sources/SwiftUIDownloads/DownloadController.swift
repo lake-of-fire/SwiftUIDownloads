@@ -7,7 +7,7 @@ import BackgroundAssets
 
 @globalActor
 public actor DownloadActor {
-    public static var shared = DownloadActor()
+    public static let shared = DownloadActor()
 }
 
 fileprivate func errorDescription(from error: Error) -> String {
@@ -518,10 +518,10 @@ public extension Downloadable {
     }
 }
 
-public class DownloadController: NSObject, ObservableObject {
+public class DownloadController: NSObject, ObservableObject, @unchecked Sendable {
     typealias DownloadAttemptExecutor = @Sendable (_ download: Downloadable, _ session: URLSession) async throws -> Void
 
-    public static var shared: DownloadController = {
+    public static let shared: DownloadController = {
         let controller = DownloadController()
 //        if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
 //            Task.detached(priority: .utility) { [weak controller] in
