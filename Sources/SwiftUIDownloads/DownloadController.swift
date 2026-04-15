@@ -3,6 +3,11 @@ import SwiftUI
 import Combine
 import BackgroundAssets
 
+fileprivate func logPrefix(_ stage: String, _ parts: String...) {
+    let suffix = parts.isEmpty ? "" : " " + parts.joined(separator: " ")
+    debugPrint("# PREFIX stage=\(stage)\(suffix)")
+}
+
 // TODO: Extract download state transitions + import handling into a small processor/state machine once behavior stabilizes.
 
 @globalActor
@@ -793,6 +798,13 @@ public extension DownloadController {
                 if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory), isDirectory.boolValue {
                     potentialOrphanDirs.insert(fileURL)
                 } else {
+                    if fileURL.pathExtension == "marisa" {
+                        logPrefix(
+                            "orphanCleanup.deleteFile",
+                            "path=\(fileURL.path)",
+                            "root=\(dir.path)"
+                        )
+                    }
                     try FileManager.default.removeItemIfPresent(at: fileURL)
                 }
             }
@@ -800,6 +812,12 @@ public extension DownloadController {
         
         for orphanDir in potentialOrphanDirs {
             if !seenSavedFiles.contains(where: { $0.path.hasPrefix(orphanDir.path) }) {
+                if orphanDir.lastPathComponent == "lookup-prefix-tries" {
+                    logPrefix(
+                        "orphanCleanup.deleteDirectory",
+                        "path=\(orphanDir.path)"
+                    )
+                }
                 try FileManager.default.removeItemIfPresent(at: orphanDir)
             }
         }
