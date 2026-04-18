@@ -2,10 +2,32 @@ import Foundation
 import SwiftUI
 import Combine
 import BackgroundAssets
+import CryptoKit
 
 fileprivate func logPrefix(_ stage: String, _ parts: String...) {
     let suffix = parts.isEmpty ? "" : " " + parts.joined(separator: " ")
-    debugPrint("# PREFIX stage=\(stage)\(suffix)")
+    debugPrint("# READERLOAD stage=\(stage)\(suffix)")
+}
+
+private struct ChecksumVerificationMarker: Codable {
+    let expectedChecksum: String
+    let fileSize: UInt64
+    let modificationTimeIntervalSince1970: TimeInterval
+}
+
+private func sha1Checksum(for fileURL: URL) throws -> String {
+    let fileHandle = try FileHandle(forReadingFrom: fileURL)
+    defer { try? fileHandle.close() }
+
+    var hasher = Insecure.SHA1()
+    while autoreleasepool(invoking: {
+        let data = fileHandle.readData(ofLength: 64 * 1024)
+        guard !data.isEmpty else { return false }
+        hasher.update(data: data)
+        return true
+    }) {}
+
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
 }
 
 // TODO: Extract download state transitions + import handling into a small processor/state machine once behavior stabilizes.
@@ -242,9 +264,81 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     public var compressedFileURL: URL {
         return localDestination.appendingPathExtension("br")
     }
+
+    public var checksumVerificationMarkerURL: URL {
+        return localDestination.appendingPathExtension("sha1verified.json")
+    }
     
     public var stringContent: String? {
         return try? String(contentsOf: localDestination)
+    }
+
+    public func hasVerifiedLocalDestinationChecksumMarker() -> Bool {
+        guard let expectedChecksum = localDestinationChecksum?.lowercased() else {
+            return FileManager.default.fileExists(atPath: localDestination.path)
+        }
+        guard let fileAttributes = try? FileManager.default.attributesOfItem(atPath: localDestination.path) else {
+            return false
+        }
+        let fileSize = (fileAttributes[.size] as? NSNumber)?.uint64Value ?? 0
+        guard fileSize > 0 else { return false }
+        let modificationDate = (fileAttributes[.modificationDate] as? Date) ?? Date(timeIntervalSince1970: 0)
+        guard let verification = try? loadChecksumVerificationMarker() else { return false }
+        return verification.expectedChecksum == expectedChecksum
+            && verification.fileSize == fileSize
+            && verification.modificationTimeIntervalSince1970 == modificationDate.timeIntervalSince1970
+    }
+
+    public func isReadyForImmediateLocalRead() -> Bool {
+        if localDestinationChecksum == nil {
+            return FileManager.default.fileExists(atPath: localDestination.path)
+        }
+        return hasVerifiedLocalDestinationChecksumMarker()
+    }
+
+    public func ensureVerifiedLocalDestinationChecksum() throws {
+        guard let expectedChecksum = localDestinationChecksum?.lowercased() else { return }
+        let fileAttributes = try FileManager.default.attributesOfItem(atPath: localDestination.path)
+        let fileSize = (fileAttributes[.size] as? NSNumber)?.uint64Value ?? 0
+        guard fileSize > 0 else {
+            throw NSError(
+                domain: "Downloadable",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Cannot verify empty file at \(localDestination.path)"]
+            )
+        }
+        let modificationDate = (fileAttributes[.modificationDate] as? Date) ?? Date(timeIntervalSince1970: 0)
+
+        if let verification = try loadChecksumVerificationMarker(),
+           verification.expectedChecksum == expectedChecksum,
+           verification.fileSize == fileSize,
+           verification.modificationTimeIntervalSince1970 == modificationDate.timeIntervalSince1970 {
+            return
+        }
+
+        let actualChecksum = try sha1Checksum(for: localDestination)
+        guard actualChecksum == expectedChecksum else {
+            try? FileManager.default.removeItem(at: checksumVerificationMarkerURL)
+            throw NSError(
+                domain: "Downloadable",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "SHA-1 mismatch. Expected \(expectedChecksum), got \(actualChecksum)"]
+            )
+        }
+
+        let marker = ChecksumVerificationMarker(
+            expectedChecksum: expectedChecksum,
+            fileSize: fileSize,
+            modificationTimeIntervalSince1970: modificationDate.timeIntervalSince1970
+        )
+        let data = try JSONEncoder().encode(marker)
+        try data.write(to: checksumVerificationMarkerURL, options: .atomic)
+    }
+
+    private func loadChecksumVerificationMarker() throws -> ChecksumVerificationMarker? {
+        guard FileManager.default.fileExists(atPath: checksumVerificationMarkerURL.path) else { return nil }
+        let data = try Data(contentsOf: checksumVerificationMarkerURL)
+        return try JSONDecoder().decode(ChecksumVerificationMarker.self, from: data)
     }
     
     @MainActor
@@ -1218,6 +1312,8 @@ extension DownloadController {
                 clearDownloadStatusObservers(forDownloadID: download.id)
                 return
             }
+
+            try download.ensureVerifiedLocalDestinationChecksum()
             
             if let importable = download as? ImportableDownloadable {
                 await { @MainActor in
