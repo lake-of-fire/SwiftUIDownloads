@@ -158,6 +158,34 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     public var id: String {
         return url.absoluteString
     }
+
+    private var shouldLogReaderOptimizationDiagnostics: Bool {
+        let loweredName = name.lowercased()
+        let loweredFilename = localDestination.lastPathComponent.lowercased()
+        let loweredPath = localDestination.path.lowercased()
+        return loweredName.contains("dictionary_index")
+            || loweredName.contains("dictionary index")
+            || loweredFilename.contains("lookup-cache")
+            || loweredPath.contains("lookup-cache")
+    }
+
+    private func logReaderOptimizationDiagnostic(
+        _ stage: String,
+        _ details: [String: String] = [:]
+    ) {
+        guard shouldLogReaderOptimizationDiagnostics else { return }
+        var segments: [String] = [
+            "# READERLOAD stage=\(stage)",
+            "downloadName=\(name)",
+            "filename=\(localDestination.lastPathComponent)"
+        ]
+        for key in details.keys.sorted() {
+            if let value = details[key] {
+                segments.append("\(key)=\(value)")
+            }
+        }
+        debugPrint(segments.joined(separator: " "))
+    }
     
     public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
@@ -293,6 +321,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
 
     public func ensureVerifiedLocalDestinationChecksum() throws {
         guard let expectedChecksum = localDestinationChecksum?.lowercased() else { return }
+        let startedAt = Date()
         let fileAttributes = try FileManager.default.attributesOfItem(atPath: localDestination.path)
         let fileSize = (fileAttributes[.size] as? NSNumber)?.uint64Value ?? 0
         guard fileSize > 0 else {
@@ -308,10 +337,33 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
            verification.expectedChecksum == expectedChecksum,
            verification.fileSize == fileSize,
            verification.modificationTimeIntervalSince1970 == modificationDate.timeIntervalSince1970 {
+            logReaderOptimizationDiagnostic(
+                "download.checksum.markerHit",
+                [
+                    "elapsed": String(format: "%.3fs", Date().timeIntervalSince(startedAt)),
+                    "fileSize": String(fileSize)
+                ]
+            )
             return
         }
 
+        logReaderOptimizationDiagnostic(
+            "download.checksum.markerMiss",
+            [
+                "expectedChecksumPrefix": String(expectedChecksum.prefix(8)),
+                "fileSize": String(fileSize),
+                "markerExists": String(FileManager.default.fileExists(atPath: checksumVerificationMarkerURL.path))
+            ]
+        )
+        let hashStartedAt = Date()
         let actualChecksum = try sha1Checksum(for: localDestination)
+        logReaderOptimizationDiagnostic(
+            "download.checksum.sha1Complete",
+            [
+                "elapsed": String(format: "%.3fs", Date().timeIntervalSince(hashStartedAt)),
+                "matched": String(actualChecksum == expectedChecksum)
+            ]
+        )
         guard actualChecksum == expectedChecksum else {
             try? FileManager.default.removeItem(at: checksumVerificationMarkerURL)
             throw NSError(
@@ -328,6 +380,13 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         )
         let data = try JSONEncoder().encode(marker)
         try data.write(to: checksumVerificationMarkerURL, options: .atomic)
+        logReaderOptimizationDiagnostic(
+            "download.checksum.markerWrite",
+            [
+                "elapsed": String(format: "%.3fs", Date().timeIntervalSince(startedAt)),
+                "markerFilename": checksumVerificationMarkerURL.lastPathComponent
+            ]
+        )
     }
 
     private func loadChecksumVerificationMarker() throws -> ChecksumVerificationMarker? {
@@ -1257,6 +1316,7 @@ extension DownloadController {
     
     @DownloadActor
     public func finishDownload(_ download: Downloadable, etag: String? = nil) async {
+        let finishStartedAt = Date()
         do {
             let alreadyFinished = await MainActor.run { download.isFinishedProcessing }
             if alreadyFinished {
@@ -1273,9 +1333,11 @@ extension DownloadController {
                     }
                 }()
             }
+            let decompressStartedAt = Date()
             try await Task.detached(priority: .utility) {
                 try await download.decompressIfNeeded()
             }.value
+            let decompressElapsed = Date().timeIntervalSince(decompressStartedAt)
          
             // Confirm non-empty
             guard let resourceValues = try? download.localDestination.resourceValues(forKeys: [.fileSizeKey]),
@@ -1295,7 +1357,10 @@ extension DownloadController {
                 return
             }
 
+            let verifyStartedAt = Date()
             try download.ensureVerifiedLocalDestinationChecksum()
+            let verifyElapsed = Date().timeIntervalSince(verifyStartedAt)
+            var importElapsed: TimeInterval = 0
             
             if let importable = download as? ImportableDownloadable {
                 await { @MainActor in
@@ -1303,6 +1368,7 @@ extension DownloadController {
                     importable.importProgress = 0
                     importable.importStatusText = "Importing…"
                 }()
+                let importStartedAt = Date()
                 let progressHandler: ImportableDownloadable.ImportProgressHandler = { [weak importable] progress, status in
                     Task { @MainActor in
                         guard let importable else { return }
@@ -1315,6 +1381,7 @@ extension DownloadController {
                     }
                 }
                 try await importable.importHandler(download.localDestination, progressHandler)
+                importElapsed = Date().timeIntervalSince(importStartedAt)
                 if importable.deleteAfterImport {
                     try? FileManager.default.removeItem(at: download.localDestination)
                 }
@@ -1334,6 +1401,18 @@ extension DownloadController {
                     importable.importProgress = nil
                     importable.importStatusText = nil
                 }
+            }
+            if download.localDestinationChecksum != nil {
+                debugPrint(
+                    "# READERLOAD stage=download.finish.phaseSummary",
+                    "downloadName=\(download.name)",
+                    "filename=\(download.localDestination.lastPathComponent)",
+                    "decompressElapsed=\(String(format: "%.3fs", decompressElapsed))",
+                    "verifyElapsed=\(String(format: "%.3fs", verifyElapsed))",
+                    "importElapsed=\(String(format: "%.3fs", importElapsed))",
+                    "totalElapsed=\(String(format: "%.3fs", Date().timeIntervalSince(finishStartedAt)))",
+                    "fileSize=\(fileSize)"
+                )
             }
             clearDownloadStatusObservers(forDownloadID: download.id)
         } catch {
