@@ -9,6 +9,20 @@ fileprivate func logPrefix(_ stage: String, _ parts: String...) {
     debugPrint("# READERLOAD stage=\(stage)\(suffix)")
 }
 
+fileprivate func shouldLogLookupCacheDownload(_ download: Downloadable) -> Bool {
+    download.localDestination.lastPathComponent.contains("jmdict-lookup-cache")
+}
+
+fileprivate func logLookupCacheDownload(_ stage: String, download: Downloadable, _ parts: String...) {
+    guard shouldLogLookupCacheDownload(download) else { return }
+    let values = [
+        "downloadName=\(download.name.replacingOccurrences(of: " ", with: "_"))",
+        "filename=\(download.localDestination.lastPathComponent)"
+    ] + parts
+    let suffix = values.isEmpty ? "" : " " + values.joined(separator: " ")
+    debugPrint("# READERLOAD stage=\(stage)\(suffix)")
+}
+
 private struct ChecksumVerificationMarker: Codable {
     let expectedChecksum: String
     let fileSize: UInt64
@@ -289,6 +303,14 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             && verification.modificationTimeIntervalSince1970 == modificationDate.timeIntervalSince1970
     }
 
+    public func hasReadableLocalDestination() -> Bool {
+        guard let fileAttributes = try? FileManager.default.attributesOfItem(atPath: localDestination.path) else {
+            return false
+        }
+        let fileSize = (fileAttributes[.size] as? NSNumber)?.uint64Value ?? 0
+        return fileSize > 0
+    }
+
     public func isReadyForImmediateLocalRead() -> Bool {
         if localDestinationChecksum == nil {
             return FileManager.default.fileExists(atPath: localDestination.path)
@@ -335,6 +357,34 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         try data.write(to: checksumVerificationMarkerURL, options: .atomic)
     }
 
+    public func repairVerifiedLocalDestinationChecksumMarkerIfNeeded() {
+        guard localDestinationChecksum != nil else { return }
+        guard hasReadableLocalDestination() else { return }
+        guard !hasVerifiedLocalDestinationChecksumMarker() else { return }
+        Task.detached(priority: .utility) { [download = self] in
+            let startedAt = Date()
+            logLookupCacheDownload(
+                "download.checksumRepair.begin",
+                download: download
+            )
+            do {
+                try download.ensureVerifiedLocalDestinationChecksum()
+                logLookupCacheDownload(
+                    "download.checksumRepair.complete",
+                    download: download,
+                    "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))"
+                )
+            } catch {
+                logLookupCacheDownload(
+                    "download.checksumRepair.error",
+                    download: download,
+                    "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))",
+                    "error=\(String(describing: error))"
+                )
+            }
+        }
+    }
+
     private func loadChecksumVerificationMarker() throws -> ChecksumVerificationMarker? {
         guard FileManager.default.fileExists(atPath: checksumVerificationMarkerURL.path) else { return nil }
         let data = try Data(contentsOf: checksumVerificationMarkerURL)
@@ -357,12 +407,34 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             return isFinishedProcessing // Return `true` if finished, `false` if failed
         }
 
+        let startedAt = Date()
+        logLookupCacheDownload(
+            "download.awaitCompletion.begin",
+            download: self,
+            "isFinishedDownloading=\(isFinishedDownloading)",
+            "isFinishedProcessing=\(isFinishedProcessing)",
+            "isFailed=\(isFailed)"
+        )
+
         while true {
             try Task.checkCancellation()
             if isFailed {
+                logLookupCacheDownload(
+                    "download.awaitCompletion.end",
+                    download: self,
+                    "result=failed",
+                    "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))"
+                )
                 return false
             }
             if isFinishedProcessing {
+                logLookupCacheDownload(
+                    "download.awaitCompletion.end",
+                    download: self,
+                    "result=finished",
+                    "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))",
+                    "isFinishedDownloading=\(isFinishedDownloading)"
+                )
                 return true
             }
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -1056,8 +1128,11 @@ extension DownloadController {
     @MainActor
     public func ensureDownloaded(download: Downloadable, deletingOrphansIn: [DownloadDirectory] = [], excludingFromDeletion: Set<Downloadable> = Set()) async {
         if assuredDownloads.contains(where: { $0.url == download.url }) && !failedDownloads.contains(where: { $0.url == download.url }) {
+            logLookupCacheDownload("download.ensureDownloaded.skip", download: download, "reason=alreadyAssured")
             return
         }
+        let ensureStartedAt = Date()
+        logLookupCacheDownload("download.ensureDownloaded.begin", download: download)
         assuredDownloads.insert(download)
         do {
             try await deleteOrphanFiles(in: deletingOrphansIn, excluding: excludingFromDeletion)
@@ -1066,6 +1141,12 @@ extension DownloadController {
         let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
         let localExists = await download.existsLocally()
         if localExists || isImported {
+            logLookupCacheDownload(
+                "download.ensureDownloaded.localState",
+                download: download,
+                "localExists=\(localExists)",
+                "isImported=\(isImported)"
+            )
             if isImported {
                 await markDownloadAsProcessed(download)
             } else {
@@ -1075,18 +1156,34 @@ extension DownloadController {
             if download.shouldCheckForUpdates,
                download.lastCheckedETagAt == nil
                 || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > updateCheckInterval {
+                logLookupCacheDownload("download.ensureDownloaded.updateCheck.begin", download: download)
                 let (modified, modifiedAt, etag) = await checkFileModifiedAt(download: download)
                 download.lastCheckedETagAt = Date()
+                logLookupCacheDownload(
+                    "download.ensureDownloaded.updateCheck.end",
+                    download: download,
+                    "modified=\(modified)",
+                    "modifiedAt=\(modifiedAt?.timeIntervalSince1970.description ?? "nil")",
+                    "etagPresent=\(etag != nil)"
+                )
                 if let modifiedAt {
                     download.lastModifiedAt = modifiedAt
                 }
                 if modified {
+                    logLookupCacheDownload("download.ensureDownloaded.updateCheck.redownload", download: download)
                     await self.download(download, etag: etag)
                 }
             }
         } else {
+            logLookupCacheDownload("download.ensureDownloaded.localState", download: download, "localExists=false", "isImported=false")
+            logLookupCacheDownload("download.ensureDownloaded.download.begin", download: download)
             await self.download(download)
         }
+        logLookupCacheDownload(
+            "download.ensureDownloaded.end",
+            download: download,
+            "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(ensureStartedAt)))"
+        )
         //        }
     }
     
@@ -1276,11 +1373,23 @@ extension DownloadController {
     @DownloadActor
     public func finishDownload(_ download: Downloadable, etag: String? = nil) async {
         do {
+            let finishStartedAt = Date()
             let alreadyFinished = await MainActor.run { download.isFinishedProcessing }
             if alreadyFinished {
+                logLookupCacheDownload(
+                    "download.finish.skipped",
+                    download: download,
+                    "reason=alreadyFinished",
+                    "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(finishStartedAt)))"
+                )
                 clearDownloadStatusObservers(forDownloadID: download.id)
                 return
             }
+            logLookupCacheDownload(
+                "download.finish.begin",
+                download: download,
+                "etagPresent=\(etag != nil)"
+            )
             if let importable = download as? ImportableDownloadable,
                FileManager.default.fileExists(atPath: download.compressedFileURL.path) {
                 await { @MainActor in
@@ -1291,9 +1400,15 @@ extension DownloadController {
                     }
                 }()
             }
+            let decompressStartedAt = Date()
             try await Task.detached(priority: .utility) {
                 try await download.decompressIfNeeded()
             }.value
+            logLookupCacheDownload(
+                "download.finish.decompress",
+                download: download,
+                "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(decompressStartedAt)))"
+            )
          
             // Confirm non-empty
             guard let resourceValues = try? download.localDestination.resourceValues(forKeys: [.fileSizeKey]),
@@ -1313,7 +1428,14 @@ extension DownloadController {
                 return
             }
 
+            let checksumStartedAt = Date()
             try download.ensureVerifiedLocalDestinationChecksum()
+            logLookupCacheDownload(
+                "download.finish.checksum",
+                download: download,
+                "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(checksumStartedAt)))",
+                "fileSize=\(fileSize)"
+            )
             
             if let importable = download as? ImportableDownloadable {
                 await { @MainActor in
@@ -1353,8 +1475,18 @@ extension DownloadController {
                     importable.importStatusText = nil
                 }
             }
+            logLookupCacheDownload(
+                "download.finish.complete",
+                download: download,
+                "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(finishStartedAt)))"
+            )
             clearDownloadStatusObservers(forDownloadID: download.id)
         } catch {
+            logLookupCacheDownload(
+                "download.finish.error",
+                download: download,
+                "error=\(String(describing: error))"
+            )
             await MainActor.run { [weak self] in
                 if let importable = download as? ImportableDownloadable {
                     importable.lastImportError = error
@@ -1378,6 +1510,7 @@ extension DownloadController {
 
     @DownloadActor
     private func markDownloadAsProcessed(_ download: Downloadable) async {
+        logLookupCacheDownload("download.markProcessed", download: download)
         await { @MainActor [weak self] in
             download.isFailed = false
             download.isActive = false
@@ -1393,12 +1526,21 @@ extension DownloadController {
     /// Using "Last-Modified" header value to compare it with given date.
     @DownloadActor
     public func checkFileModifiedAt(download: Downloadable) async -> (Bool, Date?, String?) {
+        let startedAt = Date()
+        logLookupCacheDownload("download.checkFileModifiedAt.begin", download: download)
         var request = URLRequest(url: download.url)
         request.httpMethod = "HEAD"
         do {
             let (_, response) = try await session.data(for: request)
             guard let httpURLResponse = response as? HTTPURLResponse,
                   httpURLResponse.statusCode == 200 else {
+                logLookupCacheDownload(
+                    "download.checkFileModifiedAt.end",
+                    download: download,
+                    "result=non200",
+                    "statusCode=\((response as? HTTPURLResponse)?.statusCode ?? -1)",
+                    "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))"
+                )
                 return (false, nil, nil)
             }
 
@@ -1418,16 +1560,41 @@ extension DownloadController {
                 dateFormatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
                 if let modifiedDate = dateFormatter.date(from: modifiedDateString),
                    modifiedDate > baseline {
+                    logLookupCacheDownload(
+                        "download.checkFileModifiedAt.end",
+                        download: download,
+                        "result=modifiedDateChanged",
+                        "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))"
+                    )
                     return (true, modifiedDate, etag)
                 }
             }
 
             if let etag, etag != lastDownloadedETag {
+                logLookupCacheDownload(
+                    "download.checkFileModifiedAt.end",
+                    download: download,
+                    "result=etagChanged",
+                    "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))"
+                )
                 return (true, nil, etag)
             }
 
+            logLookupCacheDownload(
+                "download.checkFileModifiedAt.end",
+                download: download,
+                "result=unchanged",
+                "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))"
+            )
             return (false, nil, etag)
         } catch {
+            logLookupCacheDownload(
+                "download.checkFileModifiedAt.end",
+                download: download,
+                "result=error",
+                "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))",
+                "error=\(String(describing: error))"
+            )
             return (false, nil, nil)
         }
     }
