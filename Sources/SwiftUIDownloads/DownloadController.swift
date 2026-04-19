@@ -173,6 +173,9 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     public var finishedLoadingDuringCurrentLaunchAt: Date?
     
     private var cancellables = Set<AnyCancellable>()
+    private let checksumRepairTaskLock = NSLock()
+    private var checksumRepairTask: Task<Void, Never>?
+    private var checksumRepairTaskID: UUID?
     
     public var id: String {
         return url.absoluteString
@@ -361,7 +364,14 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         guard localDestinationChecksum != nil else { return }
         guard hasReadableLocalDestination() else { return }
         guard !hasVerifiedLocalDestinationChecksumMarker() else { return }
-        Task.detached(priority: .utility) { [download = self] in
+        let taskID = UUID()
+        checksumRepairTaskLock.lock()
+        if let checksumRepairTask, !checksumRepairTask.isCancelled {
+            checksumRepairTaskLock.unlock()
+            return
+        }
+        checksumRepairTaskID = taskID
+        let task = Task.detached(priority: .utility) { [download = self] in
             let startedAt = Date()
             logLookupCacheDownload(
                 "download.checksumRepair.begin",
@@ -382,7 +392,18 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
                     "error=\(String(describing: error))"
                 )
             }
+            download.finishChecksumRepairTask(taskID: taskID)
         }
+        checksumRepairTask = task
+        checksumRepairTaskLock.unlock()
+    }
+
+    private func finishChecksumRepairTask(taskID: UUID) {
+        checksumRepairTaskLock.lock()
+        defer { checksumRepairTaskLock.unlock() }
+        guard checksumRepairTaskID == taskID else { return }
+        checksumRepairTask = nil
+        checksumRepairTaskID = nil
     }
 
     private func loadChecksumVerificationMarker() throws -> ChecksumVerificationMarker? {
