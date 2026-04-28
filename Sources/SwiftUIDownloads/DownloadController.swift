@@ -23,6 +23,51 @@ fileprivate func logLookupCacheDownload(_ stage: String, download: Downloadable,
     debugPrint("# READERLOAD stage=\(stage)\(suffix)")
 }
 
+fileprivate func downloadFileStateParts(_ download: Downloadable) -> [String] {
+    let fileManager = FileManager.default
+
+    func fileSize(for url: URL) -> Int? {
+        try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+    }
+
+    func modificationDate(for url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+
+    let localExists = fileManager.fileExists(atPath: download.localDestination.path)
+    let compressedExists = fileManager.fileExists(atPath: download.compressedFileURL.path)
+    let markerExists = fileManager.fileExists(atPath: download.checksumVerificationMarkerURL.path)
+    let markerVerified = download.hasVerifiedLocalDestinationChecksumMarker()
+    let readableLocal = download.hasReadableLocalDestination()
+    let localSize = localExists ? fileSize(for: download.localDestination) : nil
+    let localModifiedAt = localExists ? modificationDate(for: download.localDestination) : nil
+    let compressedSize = compressedExists ? fileSize(for: download.compressedFileURL) : nil
+    let compressedModifiedAt = compressedExists ? modificationDate(for: download.compressedFileURL) : nil
+
+    var parts = [
+        "localExists=\(localExists)",
+        "readableLocal=\(readableLocal)",
+        "markerExists=\(markerExists)",
+        "markerVerified=\(markerVerified)",
+        "compressedExists=\(compressedExists)"
+    ]
+
+    if let localSize {
+        parts.append("localSize=\(localSize)")
+    }
+    if let localModifiedAt {
+        parts.append("localModifiedAt=\(String(format: "%.3f", localModifiedAt.timeIntervalSince1970))")
+    }
+    if let compressedSize {
+        parts.append("compressedSize=\(compressedSize)")
+    }
+    if let compressedModifiedAt {
+        parts.append("compressedModifiedAt=\(String(format: "%.3f", compressedModifiedAt.timeIntervalSince1970))")
+    }
+
+    return parts
+}
+
 private struct ChecksumVerificationMarker: Codable {
     let expectedChecksum: String
     let fileSize: UInt64
@@ -126,6 +171,11 @@ fileprivate func errorDescription(from error: Error) -> String {
     } else {
         return "Unknown Error"
     }
+}
+
+fileprivate func isChecksumMismatchError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    return nsError.domain == "Downloadable" && nsError.code == 2
 }
 
 fileprivate extension Array where Element: Hashable {
@@ -375,19 +425,22 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             let startedAt = Date()
             logLookupCacheDownload(
                 "download.checksumRepair.begin",
-                download: download
+                download: download,
+                "downloadState=\(downloadFileStateParts(download).joined(separator: " "))"
             )
             do {
                 try download.ensureVerifiedLocalDestinationChecksum()
                 logLookupCacheDownload(
                     "download.checksumRepair.complete",
                     download: download,
+                    "downloadState=\(downloadFileStateParts(download).joined(separator: " "))",
                     "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))"
                 )
             } catch {
                 logLookupCacheDownload(
                     "download.checksumRepair.error",
                     download: download,
+                    "downloadState=\(downloadFileStateParts(download).joined(separator: " "))",
                     "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))",
                     "error=\(String(describing: error))"
                 )
@@ -1166,7 +1219,8 @@ extension DownloadController {
                 "download.ensureDownloaded.localState",
                 download: download,
                 "localExists=\(localExists)",
-                "isImported=\(isImported)"
+                "isImported=\(isImported)",
+                "downloadState=\(downloadFileStateParts(download).joined(separator: " "))"
             )
             if isImported {
                 await markDownloadAsProcessed(download)
@@ -1196,7 +1250,13 @@ extension DownloadController {
                 }
             }
         } else {
-            logLookupCacheDownload("download.ensureDownloaded.localState", download: download, "localExists=false", "isImported=false")
+            logLookupCacheDownload(
+                "download.ensureDownloaded.localState",
+                download: download,
+                "localExists=false",
+                "isImported=false",
+                "downloadState=\(downloadFileStateParts(download).joined(separator: " "))"
+            )
             logLookupCacheDownload("download.ensureDownloaded.download.begin", download: download)
             await self.download(download)
         }
@@ -1393,6 +1453,7 @@ extension DownloadController {
     
     @DownloadActor
     public func finishDownload(_ download: Downloadable, etag: String? = nil) async {
+        var finishStartedWithCompressedFile = false
         do {
             let finishStartedAt = Date()
             let alreadyFinished = await MainActor.run { download.isFinishedProcessing }
@@ -1406,10 +1467,12 @@ extension DownloadController {
                 clearDownloadStatusObservers(forDownloadID: download.id)
                 return
             }
+            finishStartedWithCompressedFile = FileManager.default.fileExists(atPath: download.compressedFileURL.path)
             logLookupCacheDownload(
                 "download.finish.begin",
                 download: download,
-                "etagPresent=\(etag != nil)"
+                "etagPresent=\(etag != nil)",
+                "downloadState=\(downloadFileStateParts(download).joined(separator: " "))"
             )
             if let importable = download as? ImportableDownloadable,
                FileManager.default.fileExists(atPath: download.compressedFileURL.path) {
@@ -1428,6 +1491,7 @@ extension DownloadController {
             logLookupCacheDownload(
                 "download.finish.decompress",
                 download: download,
+                "downloadState=\(downloadFileStateParts(download).joined(separator: " "))",
                 "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(decompressStartedAt)))"
             )
          
@@ -1450,10 +1514,17 @@ extension DownloadController {
             }
 
             let checksumStartedAt = Date()
+            logLookupCacheDownload(
+                "download.finish.checksum.begin",
+                download: download,
+                "downloadState=\(downloadFileStateParts(download).joined(separator: " "))",
+                "fileSize=\(fileSize)"
+            )
             try download.ensureVerifiedLocalDestinationChecksum()
             logLookupCacheDownload(
                 "download.finish.checksum",
                 download: download,
+                "downloadState=\(downloadFileStateParts(download).joined(separator: " "))",
                 "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(checksumStartedAt)))",
                 "fileSize=\(fileSize)"
             )
@@ -1503,9 +1574,37 @@ extension DownloadController {
             )
             clearDownloadStatusObservers(forDownloadID: download.id)
         } catch {
+            if isChecksumMismatchError(error) && download.localDestinationChecksum != nil && !finishStartedWithCompressedFile {
+                logLookupCacheDownload(
+                    "download.finish.retryAfterChecksumMismatch",
+                    download: download,
+                    "downloadState=\(downloadFileStateParts(download).joined(separator: " "))",
+                    "error=\(String(describing: error))"
+                )
+                await MainActor.run { [weak self] in
+                    if let importable = download as? ImportableDownloadable {
+                        importable.lastImportError = nil
+                        importable.importStatusText = "Retrying download…"
+                    }
+                    self?.failedDownloads.remove(download)
+                    self?.activeDownloads.remove(download)
+                    self?.finishedDownloads.remove(download)
+                    download.isFailed = false
+                    download.isActive = false
+                    download.isFinishedDownloading = false
+                    download.isFinishedProcessing = false
+                }
+                try? FileManager.default.removeItemIfPresent(at: download.localDestination)
+                try? FileManager.default.removeItemIfPresent(at: download.compressedFileURL)
+                try? FileManager.default.removeItemIfPresent(at: download.checksumVerificationMarkerURL)
+                clearDownloadStatusObservers(forDownloadID: download.id)
+                await self.download(download, etag: etag)
+                return
+            }
             logLookupCacheDownload(
                 "download.finish.error",
                 download: download,
+                "downloadState=\(downloadFileStateParts(download).joined(separator: " "))",
                 "error=\(String(describing: error))"
             )
             await MainActor.run { [weak self] in
