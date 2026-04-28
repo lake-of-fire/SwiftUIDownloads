@@ -228,22 +228,44 @@ public struct ActiveDownloadsBox: View {
     @AppStorage("ActiveDownloadsBox.isExpanded") private var isExpanded = true
     
     public var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            HStack(spacing: 0) {
-                Spacer(minLength: 0)
-                ActiveDownloadsList()
-                    .frame(maxHeight: listHeight)
-                Spacer(minLength: 0)
+        downloadsBox
+            .background(.regularMaterial)
+    }
+
+    private var downloadsBox: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                isExpanded.toggle()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .frame(width: 12)
+                    Text(title)
+                        .font(.headline)
+                        .bold()
+                        .foregroundStyle(.primary)
+                        .multilineTextAlignment(.leading)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
             }
-        } label: {
-            Text(title)
-                .font(.headline)
-                .bold()
-                .foregroundStyle(.primary)
-                .multilineTextAlignment(.leading)
+            .buttonStyle(.plain)
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
+            .padding(.bottom, isExpanded ? 6 : 8)
+
+            if isExpanded {
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    ActiveDownloadsList()
+                        .frame(maxHeight: listHeight)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
+            }
         }
-        .tint(.primary)
-        .padding(.horizontal, 10)
     }
     
     public init(title: String) {
