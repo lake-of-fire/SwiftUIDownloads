@@ -1006,6 +1006,7 @@ public extension DownloadController {
         
         let saveFiles = await Set<URL>(assuredDownloads.union(excluding).map { $0.localDestination })
             .union(Set(assuredDownloads.union(excluding).map { $0.compressedFileURL }))
+            .union(Set(assuredDownloads.union(excluding).map { $0.checksumVerificationMarkerURL }))
         
         var potentialOrphanDirs = Set<URL>()
         var seenSavedFiles = Set<URL>()
