@@ -5,8 +5,10 @@ import BackgroundAssets
 import CryptoKit
 
 fileprivate func logPrefix(_ stage: String, _ parts: String...) {
+#if DEBUG
     let suffix = parts.isEmpty ? "" : " " + parts.joined(separator: " ")
     debugPrint("# READERLOAD stage=\(stage)\(suffix)")
+#endif
 }
 
 fileprivate func shouldLogLookupCacheDownload(_ download: Downloadable) -> Bool {
@@ -14,6 +16,7 @@ fileprivate func shouldLogLookupCacheDownload(_ download: Downloadable) -> Bool 
 }
 
 fileprivate func logLookupCacheDownload(_ stage: String, download: Downloadable, _ parts: String...) {
+#if DEBUG
     guard shouldLogLookupCacheDownload(download) else { return }
     let values = [
         "downloadName=\(download.name.replacingOccurrences(of: " ", with: "_"))",
@@ -21,6 +24,7 @@ fileprivate func logLookupCacheDownload(_ stage: String, download: Downloadable,
     ] + parts
     let suffix = values.isEmpty ? "" : " " + values.joined(separator: " ")
     debugPrint("# READERLOAD stage=\(stage)\(suffix)")
+#endif
 }
 
 fileprivate func downloadFileStateParts(_ download: Downloadable) -> [String] {
