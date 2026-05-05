@@ -27,6 +27,18 @@ fileprivate func logLookupCacheDownload(_ stage: String, download: Downloadable,
 #endif
 }
 
+fileprivate func logDownloadDiagnostics(_ stage: String, download: Downloadable, _ parts: String...) {
+#if DEBUG
+    guard shouldLogLookupCacheDownload(download) else { return }
+    let values = [
+        "downloadName=\(download.name.replacingOccurrences(of: " ", with: "_"))",
+        "filename=\(download.localDestination.lastPathComponent)"
+    ] + parts
+    let suffix = values.isEmpty ? "" : " " + values.joined(separator: " ")
+    debugPrint("# download stage=\(stage)\(suffix)")
+#endif
+}
+
 fileprivate func downloadFileStateParts(_ download: Downloadable) -> [String] {
     let fileManager = FileManager.default
 
@@ -623,10 +635,27 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
 
     @DownloadActor
     func decompressIfNeeded() async throws {
+        logDownloadDiagnostics(
+            "decompressIfNeeded.begin",
+            download: self,
+            "state=\(downloadFileStateParts(self).joined(separator: " "))",
+            "compressedPath=\(compressedFileURL.path)",
+            "localPath=\(localDestination.path)"
+        )
         if FileManager.default.fileExists(atPath: compressedFileURL.path) {
             let compressedFileSize = (try? compressedFileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            logDownloadDiagnostics(
+                "decompressIfNeeded.compressedPresent",
+                download: self,
+                "compressedFileSize=\(compressedFileSize)"
+            )
             if compressedFileSize == 0 {
                 try? FileManager.default.removeItem(at: compressedFileURL)
+                logDownloadDiagnostics(
+                    "decompressIfNeeded.removeEmptyCompressed",
+                    download: self,
+                    "state=\(downloadFileStateParts(self).joined(separator: " "))"
+                )
                 return
             }
 
@@ -637,11 +666,28 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             }
 
             try decompressBrotliFile(at: compressedFileURL, to: temporaryOutputURL)
+            logDownloadDiagnostics(
+                "decompressIfNeeded.decompressed",
+                download: self,
+                "temporaryPath=\(temporaryOutputURL.path)",
+                "temporaryExists=\(FileManager.default.fileExists(atPath: temporaryOutputURL.path))",
+                "temporarySize=\((try? temporaryOutputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? -1)"
+            )
 
             if FileManager.default.fileExists(atPath: localDestination.path) {
                 _ = try FileManager.default.replaceItemAt(localDestination, withItemAt: temporaryOutputURL)
+                logDownloadDiagnostics(
+                    "decompressIfNeeded.replaceLocal",
+                    download: self,
+                    "state=\(downloadFileStateParts(self).joined(separator: " "))"
+                )
             } else {
                 try FileManager.default.moveItem(at: temporaryOutputURL, to: localDestination)
+                logDownloadDiagnostics(
+                    "decompressIfNeeded.moveLocal",
+                    download: self,
+                    "state=\(downloadFileStateParts(self).joined(separator: " "))"
+                )
             }
 
             let sizeToSet = sizeForLocalFile()
@@ -649,9 +695,27 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
                 self?.fileSize = sizeToSet
             }()
 
-            try? FileManager.default.removeItem(at: compressedFileURL)
-//        } else {
-//            print("No file exists to decompress at \(compressedFileURL)")
+            do {
+                try FileManager.default.removeItem(at: compressedFileURL)
+                logDownloadDiagnostics(
+                    "decompressIfNeeded.removeCompressed.success",
+                    download: self,
+                    "state=\(downloadFileStateParts(self).joined(separator: " "))"
+                )
+            } catch {
+                logDownloadDiagnostics(
+                    "decompressIfNeeded.removeCompressed.error",
+                    download: self,
+                    "error=\(String(describing: error))",
+                    "state=\(downloadFileStateParts(self).joined(separator: " "))"
+                )
+            }
+        } else {
+            logDownloadDiagnostics(
+                "decompressIfNeeded.noCompressed",
+                download: self,
+                "state=\(downloadFileStateParts(self).joined(separator: " "))"
+            )
         }
     }
 }
