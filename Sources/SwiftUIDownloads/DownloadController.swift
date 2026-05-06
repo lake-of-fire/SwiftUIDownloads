@@ -674,7 +674,7 @@ public extension Downloadable {
 public class DownloadController: NSObject, ObservableObject, @unchecked Sendable {
     typealias DownloadAttemptExecutor = @Sendable (_ download: Downloadable, _ session: URLSession) async throws -> Void
 
-    public static let shared: DownloadController = {
+    nonisolated(unsafe) public static var shared: DownloadController = {
         let controller = DownloadController()
 //        if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
 //            Task.detached(priority: .utility) { [weak controller] in
