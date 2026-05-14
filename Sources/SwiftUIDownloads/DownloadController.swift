@@ -12,7 +12,9 @@ fileprivate func logPrefix(_ stage: String, _ parts: String...) {
 }
 
 fileprivate func shouldLogLookupCacheDownload(_ download: Downloadable) -> Bool {
-    download.localDestination.lastPathComponent.contains("jmdict-lookup-cache")
+    let path = download.localDestination.path
+    return path.contains("jmdict-lookup-cache")
+        || path.contains("manabi-fonts")
 }
 
 fileprivate func logLookupCacheDownload(_ stage: String, download: Downloadable, _ parts: String...) {
@@ -20,7 +22,9 @@ fileprivate func logLookupCacheDownload(_ stage: String, download: Downloadable,
     guard shouldLogLookupCacheDownload(download) else { return }
     let values = [
         "downloadName=\(download.name.replacingOccurrences(of: " ", with: "_"))",
-        "filename=\(download.localDestination.lastPathComponent)"
+        "filename=\(download.localDestination.lastPathComponent)",
+        "localPath=\(download.localDestination.path)",
+        "compressedPath=\(download.compressedFileURL.path)"
     ] + parts
     let suffix = values.isEmpty ? "" : " " + values.joined(separator: " ")
     debugPrint("# READERLOAD stage=\(stage)\(suffix)")
@@ -32,11 +36,49 @@ fileprivate func logDownloadDiagnostics(_ stage: String, download: Downloadable,
     guard shouldLogLookupCacheDownload(download) else { return }
     let values = [
         "downloadName=\(download.name.replacingOccurrences(of: " ", with: "_"))",
-        "filename=\(download.localDestination.lastPathComponent)"
+        "filename=\(download.localDestination.lastPathComponent)",
+        "localPath=\(download.localDestination.path)",
+        "compressedPath=\(download.compressedFileURL.path)"
     ] + parts
     let suffix = values.isEmpty ? "" : " " + values.joined(separator: " ")
     debugPrint("# download stage=\(stage)\(suffix)")
 #endif
+}
+
+fileprivate func shouldLogDownloadDirectory(_ url: URL) -> Bool {
+    let path = url.path
+    return path.contains("jmdict-lookup-cache")
+        || path.contains("manabi-fonts")
+}
+
+@MainActor
+fileprivate func downloadDebugSummary(_ downloads: Set<Downloadable>) -> String {
+    downloads
+        .sorted(by: { $0.name < $1.name })
+        .map { download in
+            let progressDescription: String
+            switch download.downloadProgress {
+            case .uninitiated:
+                progressDescription = "uninitiated"
+            case .waitingForResponse:
+                progressDescription = "waiting"
+            case .downloading(let progress):
+                progressDescription = "downloading:\(progress.completedUnitCount)/\(progress.totalUnitCount)"
+            case .completed(let destination, _, let error):
+                progressDescription = error == nil
+                    ? "completed:\(destination?.lastPathComponent ?? "nil")"
+                    : "completedError:\(error?.localizedDescription ?? "unknown")"
+            }
+            return [
+                download.name.replacingOccurrences(of: " ", with: "_"),
+                "active=\(download.isActive)",
+                "failed=\(download.isFailed)",
+                "finishedDownloading=\(download.isFinishedDownloading)",
+                "finishedProcessing=\(download.isFinishedProcessing)",
+                "progress=\(progressDescription)"
+            ].joined(separator: "|")
+        }
+        .joined(separator: ",")
 }
 
 fileprivate func downloadFileStateParts(_ download: Downloadable) -> [String] {
@@ -790,12 +832,26 @@ public extension Downloadable {
     ) {
 //        let filename = filename ?? url.lastPathComponent.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? url.lastPathComponent
         let filename = filename ?? url.lastPathComponent
+        let localDestination = destination.directoryURL.appendingPathComponent(filename)
+        if localDestination.path.contains("jmdict-lookup-cache")
+            || localDestination.path.contains("manabi-fonts") {
+            logPrefix(
+                "download.path.init",
+                "downloadName=\(name.replacingOccurrences(of: " ", with: "_"))",
+                "url=\(url.absoluteString)",
+                "filename=\(filename)",
+                "localPath=\(localDestination.path)",
+                "compressedPath=\(localDestination.appendingPathExtension("br").path)",
+                "localExists=\(FileManager.default.fileExists(atPath: localDestination.path))",
+                "compressedExists=\(FileManager.default.fileExists(atPath: localDestination.appendingPathExtension("br").path))"
+            )
+        }
         // TODO: macos 13+:   Downloadable(url: URL(string: "https://manabi.io/static/dictionaries/furigana.realm.br")!, mirrorURL: nil, name: "Furigana Data", localDestination: folderURL.appending(component: "furigana.realm")),
         self.init(
             url: url,
             mirrorURL: url,
             name: name,
-            localDestination: destination.directoryURL.appendingPathComponent(filename),
+            localDestination: localDestination,
             localDestinationChecksum: localDestinationChecksum,
             metadataStore: metadataStore
         )
@@ -869,7 +925,18 @@ public class DownloadController: NSObject, ObservableObject {
         let downloads = Set(activeDownloads)
             .union(Set(failedDownloads))
             .union(Set(importing))
-        return Array(downloads).sorted(by: { $0.name > $1.name })
+        let sortedDownloads = Array(downloads).sorted(by: { $0.name > $1.name })
+        if !sortedDownloads.isEmpty {
+            logPrefix(
+                "download.ui.unfinishedIncludingImports",
+                "activeCount=\(activeDownloads.count)",
+                "failedCount=\(failedDownloads.count)",
+                "finishedCount=\(finishedDownloads.count)",
+                "importingCount=\(importing.count)",
+                "downloads=\(downloadDebugSummary(Set(sortedDownloads)))"
+            )
+        }
+        return sortedDownloads
     }
     
     private var observation: NSKeyValueObservation?
@@ -916,7 +983,18 @@ public class DownloadController: NSObject, ObservableObject {
             .sink { [weak self] (active, failed) in
                 Task { @MainActor [weak self] in
 //                    debugPrint("# update isPending...", active.isEmpty, failed.isEmpty)
-                    self?.isPending = !(active.isEmpty && failed.isEmpty)
+                    let pending = !(active.isEmpty && failed.isEmpty)
+                    if self?.isPending != pending {
+                        logPrefix(
+                            "download.ui.isPending",
+                            "value=\(pending)",
+                            "activeCount=\(active.count)",
+                            "failedCount=\(failed.count)",
+                            "active=\(downloadDebugSummary(active))",
+                            "failed=\(downloadDebugSummary(failed))"
+                        )
+                    }
+                    self?.isPending = pending
                 }
             }
             .store(in: &cancellables)
@@ -1082,6 +1160,13 @@ public extension DownloadController {
         for location in locations {
             let dir = location.directoryURL
             let path = dir.path
+            if shouldLogDownloadDirectory(dir) {
+                logPrefix(
+                    "orphanCleanup.scan.begin",
+                    "root=\(dir.path)",
+                    "saveFiles=\(saveFiles.map { $0.lastPathComponent }.sorted().joined(separator: ","))"
+                )
+            }
             let enumerator = FileManager.default.enumerator(atPath: path)
             
             while let filename = enumerator?.nextObject() as? String {
@@ -1100,6 +1185,13 @@ public extension DownloadController {
                 
                 if saveFiles.contains(fileURL) || fileURL.lastPathComponent.hasSuffix(".realm.lock") || fileURL.lastPathComponent.hasSuffix(".realm.management") || fileURL.lastPathComponent.hasSuffix(".realm.note") {
                     seenSavedFiles.insert(fileURL)
+                    if shouldLogDownloadDirectory(fileURL) {
+                        logPrefix(
+                            "orphanCleanup.keepFile",
+                            "path=\(fileURL.path)",
+                            "root=\(dir.path)"
+                        )
+                    }
                     continue
                 }
                 
@@ -1107,7 +1199,7 @@ public extension DownloadController {
                 if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory), isDirectory.boolValue {
                     potentialOrphanDirs.insert(fileURL)
                 } else {
-                    if fileURL.pathExtension == "marisa" {
+                    if fileURL.pathExtension == "marisa" || shouldLogDownloadDirectory(fileURL) {
                         logPrefix(
                             "orphanCleanup.deleteFile",
                             "path=\(fileURL.path)",
@@ -1121,7 +1213,7 @@ public extension DownloadController {
         
         for orphanDir in potentialOrphanDirs {
             if !seenSavedFiles.contains(where: { $0.path.hasPrefix(orphanDir.path) }) {
-                if orphanDir.lastPathComponent == "lookup-prefix-tries" {
+                if orphanDir.lastPathComponent == "lookup-prefix-tries" || shouldLogDownloadDirectory(orphanDir) {
                     logPrefix(
                         "orphanCleanup.deleteDirectory",
                         "path=\(orphanDir.path)"
@@ -1199,6 +1291,13 @@ extension DownloadController {
         var perDownloadCancellables = Set<AnyCancellable>()
         download.$isActive.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] isActive in
             Task { @MainActor [weak self] in
+                logPrefix(
+                    "download.state.isActive",
+                    "downloadName=\(download.name.replacingOccurrences(of: " ", with: "_"))",
+                    "value=\(isActive)",
+                    "localPath=\(download.localDestination.path)",
+                    "progress=\(downloadDebugSummary([download]))"
+                )
                 if isActive {
                     self?.activeDownloads.insert(download)
                 } else {
@@ -1208,6 +1307,13 @@ extension DownloadController {
         }.store(in: &perDownloadCancellables)
         download.$isFailed.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] isFailed in
             Task { @MainActor [weak self] in
+                logPrefix(
+                    "download.state.isFailed",
+                    "downloadName=\(download.name.replacingOccurrences(of: " ", with: "_"))",
+                    "value=\(isFailed)",
+                    "localPath=\(download.localDestination.path)",
+                    "progress=\(downloadDebugSummary([download]))"
+                )
                 if isFailed {
                     self?.finishedDownloads.remove(download)
                     self?.failedDownloads.insert(download)
@@ -1219,6 +1325,15 @@ extension DownloadController {
         }.store(in: &perDownloadCancellables)
         download.$isFinishedDownloading.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self, weak download] isFinishedDownloading in
             Task { @MainActor [weak self, weak download] in
+                if let download {
+                    logPrefix(
+                        "download.state.isFinishedDownloading",
+                        "downloadName=\(download.name.replacingOccurrences(of: " ", with: "_"))",
+                        "value=\(isFinishedDownloading)",
+                        "localPath=\(download.localDestination.path)",
+                        "progress=\(downloadDebugSummary([download]))"
+                    )
+                }
                 if isFinishedDownloading {
                     if let download = download {
                         self?.failedDownloads.remove(download)
