@@ -1121,6 +1121,9 @@ extension DownloadController {
                 if let modifiedAt {
                     download.lastModifiedAt = modifiedAt
                 }
+                if !modified, let etag {
+                    download.lastDownloadedETag = etag
+                }
                 if modified {
                     await self.download(download, etag: etag)
                 }
@@ -1464,9 +1467,13 @@ extension DownloadController {
             }
 
             let etag = httpURLResponse.allHeaderFields["Etag"] as? String
-            let baseline = await MainActor.run {
-                download.lastModifiedAt ?? download.lastDownloaded ?? Date(timeIntervalSince1970: 0)
+            let localModificationDate = (try? download.localDestination.resourceValues(
+                forKeys: [.contentModificationDateKey]
+            ).contentModificationDate) ?? nil
+            let metadataBaseline = await MainActor.run {
+                download.lastModifiedAt ?? download.lastDownloaded
             }
+            let baseline = metadataBaseline ?? localModificationDate ?? Date(timeIntervalSince1970: 0)
             let lastDownloadedETag = await MainActor.run {
                 download.lastDownloadedETag
             }
@@ -1483,7 +1490,7 @@ extension DownloadController {
                 }
             }
 
-            if let etag, etag != lastDownloadedETag {
+            if let etag, let lastDownloadedETag, etag != lastDownloadedETag {
                 return (true, nil, etag)
             }
 
