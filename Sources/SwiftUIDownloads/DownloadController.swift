@@ -109,6 +109,11 @@ fileprivate func errorDescription(from error: Error) -> String {
     }
 }
 
+fileprivate func isChecksumMismatchError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    return nsError.domain == "Downloadable" && nsError.code == 2
+}
+
 fileprivate extension Array where Element: Hashable {
     func removingDuplicates() -> [Element] {
         var addedDict = [Element: Bool]()
@@ -154,6 +159,9 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     public var finishedLoadingDuringCurrentLaunchAt: Date?
     
     private var cancellables = Set<AnyCancellable>()
+    private let checksumRepairTaskLock = NSLock()
+    private var checksumRepairTask: Task<Void, Never>?
+    private var checksumRepairTaskID: UUID?
     
     public var id: String {
         return url.absoluteString
@@ -312,6 +320,14 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             && verification.modificationTimeIntervalSince1970 == modificationDate.timeIntervalSince1970
     }
 
+    public func hasReadableLocalDestination() -> Bool {
+        guard let fileAttributes = try? FileManager.default.attributesOfItem(atPath: localDestination.path) else {
+            return false
+        }
+        let fileSize = (fileAttributes[.size] as? NSNumber)?.uint64Value ?? 0
+        return fileSize > 0
+    }
+
     public func isReadyForImmediateLocalRead() -> Bool {
         if localDestinationChecksum == nil {
             return FileManager.default.fileExists(atPath: localDestination.path)
@@ -387,6 +403,34 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
                 "markerFilename": checksumVerificationMarkerURL.lastPathComponent
             ]
         )
+    }
+
+    public func repairVerifiedLocalDestinationChecksumMarkerIfNeeded() {
+        guard localDestinationChecksum != nil else { return }
+        guard hasReadableLocalDestination() else { return }
+        guard !hasVerifiedLocalDestinationChecksumMarker() else { return }
+
+        let taskID = UUID()
+        checksumRepairTaskLock.lock()
+        if let checksumRepairTask, !checksumRepairTask.isCancelled {
+            checksumRepairTaskLock.unlock()
+            return
+        }
+        checksumRepairTaskID = taskID
+        let task = Task.detached(priority: .utility) { [download = self] in
+            try? download.ensureVerifiedLocalDestinationChecksum()
+            download.finishChecksumRepairTask(taskID: taskID)
+        }
+        checksumRepairTask = task
+        checksumRepairTaskLock.unlock()
+    }
+
+    private func finishChecksumRepairTask(taskID: UUID) {
+        checksumRepairTaskLock.lock()
+        defer { checksumRepairTaskLock.unlock() }
+        guard checksumRepairTaskID == taskID else { return }
+        checksumRepairTask = nil
+        checksumRepairTaskID = nil
     }
 
     private func loadChecksumVerificationMarker() throws -> ChecksumVerificationMarker? {
@@ -914,6 +958,7 @@ public extension DownloadController {
         
         let saveFiles = await Set<URL>(assuredDownloads.union(excluding).map { $0.localDestination })
             .union(Set(assuredDownloads.union(excluding).map { $0.compressedFileURL }))
+            .union(Set(assuredDownloads.union(excluding).map { $0.checksumVerificationMarkerURL }))
         
         var potentialOrphanDirs = Set<URL>()
         var seenSavedFiles = Set<URL>()
@@ -1320,12 +1365,14 @@ extension DownloadController {
     @DownloadActor
     public func finishDownload(_ download: Downloadable, etag: String? = nil) async {
         let finishStartedAt = Date()
+        var finishStartedWithCompressedFile = false
         do {
             let alreadyFinished = await MainActor.run { download.isFinishedProcessing }
             if alreadyFinished {
                 clearDownloadStatusObservers(forDownloadID: download.id)
                 return
             }
+            finishStartedWithCompressedFile = FileManager.default.fileExists(atPath: download.compressedFileURL.path)
             if let importable = download as? ImportableDownloadable,
                FileManager.default.fileExists(atPath: download.compressedFileURL.path) {
                 await { @MainActor in
@@ -1419,6 +1466,27 @@ extension DownloadController {
             }
             clearDownloadStatusObservers(forDownloadID: download.id)
         } catch {
+            if isChecksumMismatchError(error) && download.localDestinationChecksum != nil && !finishStartedWithCompressedFile {
+                await MainActor.run { [weak self] in
+                    if let importable = download as? ImportableDownloadable {
+                        importable.lastImportError = nil
+                        importable.importStatusText = "Retrying download…"
+                    }
+                    self?.failedDownloads.remove(download)
+                    self?.activeDownloads.remove(download)
+                    self?.finishedDownloads.remove(download)
+                    download.isFailed = false
+                    download.isActive = false
+                    download.isFinishedDownloading = false
+                    download.isFinishedProcessing = false
+                }
+                try? FileManager.default.removeItemIfPresent(at: download.localDestination)
+                try? FileManager.default.removeItemIfPresent(at: download.compressedFileURL)
+                try? FileManager.default.removeItemIfPresent(at: download.checksumVerificationMarkerURL)
+                clearDownloadStatusObservers(forDownloadID: download.id)
+                await self.download(download, etag: etag)
+                return
+            }
             await MainActor.run { [weak self] in
                 if let importable = download as? ImportableDownloadable {
                     importable.lastImportError = error
