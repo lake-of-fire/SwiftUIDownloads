@@ -1413,6 +1413,9 @@ extension DownloadController {
                 if let modifiedAt {
                     download.lastModifiedAt = modifiedAt
                 }
+                if !modified, let etag {
+                    download.lastDownloadedETag = etag
+                }
                 if modified {
                     logLookupCacheDownload("download.ensureDownloaded.updateCheck.redownload", download: download)
                     await self.download(download, etag: etag)
@@ -1834,9 +1837,18 @@ extension DownloadController {
             }
 
             let etag = httpURLResponse.allHeaderFields["Etag"] as? String
-            let baseline = await MainActor.run {
-                download.lastModifiedAt ?? download.lastDownloaded ?? Date(timeIntervalSince1970: 0)
+            let localModificationDate = (try? download.localDestination.resourceValues(
+                forKeys: [.contentModificationDateKey]
+            ).contentModificationDate) ?? nil
+            let metadataBaseline = await MainActor.run {
+                download.lastModifiedAt ?? download.lastDownloaded
             }
+            let baseline = metadataBaseline ?? localModificationDate ?? Date(timeIntervalSince1970: 0)
+            let baselineSource: String = {
+                if metadataBaseline != nil { return "metadata" }
+                if localModificationDate != nil { return "localModificationDate" }
+                return "epoch"
+            }()
             let lastDownloadedETag = await MainActor.run {
                 download.lastDownloadedETag
             }
@@ -1853,13 +1865,14 @@ extension DownloadController {
                         "download.checkFileModifiedAt.end",
                         download: download,
                         "result=modifiedDateChanged",
+                        "baselineSource=\(baselineSource)",
                         "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))"
                     )
                     return (true, modifiedDate, etag)
                 }
             }
 
-            if let etag, etag != lastDownloadedETag {
+            if let etag, let lastDownloadedETag, etag != lastDownloadedETag {
                 logLookupCacheDownload(
                     "download.checkFileModifiedAt.end",
                     download: download,
@@ -1873,6 +1886,8 @@ extension DownloadController {
                 "download.checkFileModifiedAt.end",
                 download: download,
                 "result=unchanged",
+                "baselineSource=\(baselineSource)",
+                "etagWasRecorded=\(lastDownloadedETag != nil)",
                 "elapsed=\(String(format: "%.3fs", Date().timeIntervalSince(startedAt)))"
             )
             return (false, nil, etag)
