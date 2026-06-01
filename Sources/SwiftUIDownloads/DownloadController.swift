@@ -10,6 +10,10 @@ private struct ChecksumVerificationMarker: Codable {
     let modificationTimeIntervalSince1970: TimeInterval
 }
 
+private func checksumMarkerModificationTimesMatch(_ lhs: TimeInterval, _ rhs: TimeInterval) -> Bool {
+    abs(lhs - rhs) < 1
+}
+
 private func sha1Checksum(for fileURL: URL) throws -> String {
     let fileHandle = try FileHandle(forReadingFrom: fileURL)
     defer { try? fileHandle.close() }
@@ -317,7 +321,10 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         guard let verification = try? loadChecksumVerificationMarker() else { return false }
         return verification.expectedChecksum == expectedChecksum
             && verification.fileSize == fileSize
-            && verification.modificationTimeIntervalSince1970 == modificationDate.timeIntervalSince1970
+            && checksumMarkerModificationTimesMatch(
+                verification.modificationTimeIntervalSince1970,
+                modificationDate.timeIntervalSince1970
+            )
     }
 
     public func hasReadableLocalDestination() -> Bool {
@@ -352,7 +359,10 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         if let verification = try loadChecksumVerificationMarker(),
            verification.expectedChecksum == expectedChecksum,
            verification.fileSize == fileSize,
-           verification.modificationTimeIntervalSince1970 == modificationDate.timeIntervalSince1970 {
+           checksumMarkerModificationTimesMatch(
+               verification.modificationTimeIntervalSince1970,
+               modificationDate.timeIntervalSince1970
+           ) {
             logReaderOptimizationDiagnostic(
                 "download.checksum.markerHit",
                 [
@@ -634,6 +644,11 @@ public enum DownloadDirectory {
             if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
                 containerURL = sharedContainerURL
             }
+#if DEBUG
+            if let testAppGroupURL = Self.testAppGroupURL(groupIdentifier: groupIdentifier) {
+                containerURL = testAppGroupURL
+            }
+#endif
             var url = containerURL.appendingPathComponent("swiftui-downloads", isDirectory: true)
             
             if let parentDirectoryName {
@@ -651,6 +666,11 @@ public enum DownloadDirectory {
             if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
                 containerURL = sharedContainerURL
             }
+#if DEBUG
+            if let testAppGroupURL = Self.testAppGroupURL(groupIdentifier: groupIdentifier) {
+                containerURL = testAppGroupURL
+            }
+#endif
             var url = containerURL
             if let parentDirectoryName {
                 url = url.appendingPathComponent(parentDirectoryName, isDirectory: true)
@@ -661,6 +681,21 @@ public enum DownloadDirectory {
             return url
         }
     }
+
+#if DEBUG
+    private static func testAppGroupURL(groupIdentifier: String?) -> URL? {
+        guard groupIdentifier != nil else { return nil }
+        if let testAppGroupPath = ProcessInfo.processInfo.environment["MANABI_TEST_APP_GROUP_DIR"],
+           !testAppGroupPath.isEmpty {
+            return URL(fileURLWithPath: testAppGroupPath, isDirectory: true)
+        }
+        let isRunningTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+            || NSClassFromString("XCTest.XCTestCase") != nil
+        guard isRunningTests else { return nil }
+        return URL(fileURLWithPath: "/tmp/manabi-reader-test-app-group", isDirectory: true)
+    }
+#endif
 }
 
 public extension Downloadable {
