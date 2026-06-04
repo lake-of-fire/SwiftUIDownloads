@@ -43,4 +43,31 @@ final class BrotliFileDecompressorTests: XCTestCase {
             try BrotliFileDecompressor.decompressFile(at: compressedURL, to: decompressedURL)
         )
     }
+
+    func testDecompressFile_cancelledTaskThrowsBeforeWritingOutput() async throws {
+        let sourcePayload = Data(repeating: 0xCD, count: 128 * 1024)
+        guard let compressedPayload = (sourcePayload as NSData).brotliCompressed() else {
+            XCTFail("Expected test payload to be compressible")
+            return
+        }
+
+        let compressedURL = temporaryDirectoryURL.appendingPathComponent("cancelled.br")
+        let decompressedURL = temporaryDirectoryURL.appendingPathComponent("cancelled.bin")
+        try compressedPayload.write(to: compressedURL, options: .atomic)
+
+        let task = Task {
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            try BrotliFileDecompressor.decompressFile(at: compressedURL, to: decompressedURL)
+        }
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("Expected decompression to throw CancellationError")
+        } catch is CancellationError {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: decompressedURL.path))
+        }
+    }
 }

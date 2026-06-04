@@ -3,6 +3,9 @@ import SwiftUI
 import Combine
 import BackgroundAssets
 import CryptoKit
+#if canImport(UIKit)
+import UIKit
+#endif
 
 private struct ChecksumVerificationMarker: Codable {
     let expectedChecksum: String
@@ -752,6 +755,10 @@ public extension Downloadable {
 
 public class DownloadController: NSObject, ObservableObject, @unchecked Sendable {
     typealias DownloadAttemptExecutor = @Sendable (_ download: Downloadable, _ session: URLSession) async throws -> Void
+    private struct ProcessingTaskRecord {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
 
     nonisolated(unsafe) public static var shared: DownloadController = {
         let controller = DownloadController()
@@ -794,6 +801,7 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     private var observation: NSKeyValueObservation?
     private var cancellables = Set<AnyCancellable>()
     private var downloadStatusCancellables = [String: Set<AnyCancellable>]()
+    private var processingTasks = [String: ProcessingTaskRecord]()
     private let session: URLSession
     private let attemptExecutor: DownloadAttemptExecutor?
     private let retryPolicyProvider: @Sendable () -> DownloadRetryPolicy
@@ -804,6 +812,7 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
         self.retryPolicyProvider = { .default }
         super.init()
         configureStateObservers()
+        configureAppLifecycleObservers()
     }
 
     public init(session: URLSession) {
@@ -812,6 +821,7 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
         self.retryPolicyProvider = { .default }
         super.init()
         configureStateObservers()
+        configureAppLifecycleObservers()
     }
 
     init(
@@ -824,6 +834,7 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
         self.retryPolicyProvider = retryPolicyProvider
         super.init()
         configureStateObservers()
+        configureAppLifecycleObservers()
     }
 
     private func configureStateObservers() {
@@ -839,6 +850,31 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
                 }
             }
             .store(in: &cancellables)
+    }
+
+    private func configureAppLifecycleObservers() {
+#if canImport(UIKit)
+        NotificationCenter.default
+            .publisher(for: UIApplication.didEnterBackgroundNotification)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                Task { @DownloadActor [weak self] in
+                    await self?.cancelLongRunningWorkForBackgrounding()
+                }
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default
+            .publisher(for: UIApplication.willEnterForegroundNotification)
+            .merge(with: NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification))
+            .sink { [weak self] _ in
+                guard let self else { return }
+                Task { @DownloadActor [weak self] in
+                    await self?.resumeRecoverableDownloadsAfterForegrounding()
+                }
+            }
+            .store(in: &cancellables)
+#endif
     }
 }
 
@@ -1396,12 +1432,82 @@ extension DownloadController {
             }
         }
     }
+
+    @DownloadActor
+    func cancelLongRunningWorkForBackgrounding() async {
+        let tasks = self.processingTasks.values.map(\.task)
+        tasks.forEach { $0.cancel() }
+        try? await cancelInProgressDownloads(inApp: true)
+    }
+
+    @DownloadActor
+    func resumeRecoverableDownloadsAfterForegrounding() async {
+        let downloads = await MainActor.run { Array(assuredDownloads) }
+        for download in downloads {
+            let state = await MainActor.run {
+                (
+                    isFailed: download.isFailed,
+                    isActive: download.isActive,
+                    isFinishedDownloading: download.isFinishedDownloading,
+                    isFinishedProcessing: download.isFinishedProcessing
+                )
+            }
+            guard !state.isFinishedProcessing else { continue }
+
+            let hasRecoverableFile = FileManager.default.fileExists(atPath: download.compressedFileURL.path)
+                || FileManager.default.fileExists(atPath: download.localDestination.path)
+            guard hasRecoverableFile || state.isFailed || state.isActive || state.isFinishedDownloading else {
+                continue
+            }
+
+            if hasRecoverableFile {
+                await finishDownload(download)
+            } else {
+                await self.download(download)
+            }
+        }
+    }
+
+    @DownloadActor
+    private func clearProcessingTask(forDownloadID downloadID: String, processingTaskID: UUID) {
+        guard processingTasks[downloadID]?.id == processingTaskID else { return }
+        processingTasks[downloadID] = nil
+    }
     
     @DownloadActor
     public func finishDownload(_ download: Downloadable, etag: String? = nil) async {
+        if let existingTask = processingTasks[download.id]?.task {
+            await existingTask.value
+            return
+        }
+
+        let processingTaskID = UUID()
+        let task = Task { @DownloadActor [weak self] in
+            guard let self else { return }
+            await self.finishDownloadBody(
+                download,
+                etag: etag,
+                processingTaskID: processingTaskID
+            )
+        }
+        processingTasks[download.id] = ProcessingTaskRecord(id: processingTaskID, task: task)
+        await task.value
+    }
+
+    @DownloadActor
+    private func finishDownloadBody(
+        _ download: Downloadable,
+        etag: String? = nil,
+        processingTaskID: UUID
+    ) async {
+        defer {
+            clearProcessingTask(forDownloadID: download.id, processingTaskID: processingTaskID)
+        }
+
         let finishStartedAt = Date()
         var finishStartedWithCompressedFile = false
         do {
+            try Task.checkCancellation()
             let alreadyFinished = await MainActor.run { download.isFinishedProcessing }
             if alreadyFinished {
                 clearDownloadStatusObservers(forDownloadID: download.id)
@@ -1419,9 +1525,15 @@ extension DownloadController {
                 }()
             }
             let decompressStartedAt = Date()
-            try await Task.detached(priority: .utility) {
+            let decompressTask = Task.detached(priority: .utility) {
                 try await download.decompressIfNeeded()
-            }.value
+            }
+            try await withTaskCancellationHandler(operation: {
+                try await decompressTask.value
+            }, onCancel: {
+                decompressTask.cancel()
+            })
+            try Task.checkCancellation()
             let decompressElapsed = Date().timeIntervalSince(decompressStartedAt)
          
             // Confirm non-empty
@@ -1443,11 +1555,14 @@ extension DownloadController {
             }
 
             let verifyStartedAt = Date()
+            try Task.checkCancellation()
             try download.ensureVerifiedLocalDestinationChecksum()
+            try Task.checkCancellation()
             let verifyElapsed = Date().timeIntervalSince(verifyStartedAt)
             var importElapsed: TimeInterval = 0
             
             if let importable = download as? ImportableDownloadable {
+                try Task.checkCancellation()
                 await { @MainActor in
                     importable.lastImportError = nil
                     importable.importProgress = 0
@@ -1466,6 +1581,7 @@ extension DownloadController {
                     }
                 }
                 try await importable.importHandler(download.localDestination, progressHandler)
+                try Task.checkCancellation()
                 importElapsed = Date().timeIntervalSince(importStartedAt)
                 if importable.deleteAfterImport {
                     try? FileManager.default.removeItem(at: download.localDestination)
@@ -1520,6 +1636,29 @@ extension DownloadController {
                 try? FileManager.default.removeItemIfPresent(at: download.checksumVerificationMarkerURL)
                 clearDownloadStatusObservers(forDownloadID: download.id)
                 await self.download(download, etag: etag)
+                return
+            }
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                await MainActor.run { [weak self] in
+                    if let importable = download as? ImportableDownloadable {
+                        importable.lastImportError = nil
+                        importable.importProgress = nil
+                        importable.importStatusText = nil
+                    }
+                    self?.failedDownloads.insert(download)
+                    self?.activeDownloads.remove(download)
+                    self?.finishedDownloads.remove(download)
+                    download.isFailed = true
+                    download.isActive = false
+                    download.isFinishedDownloading = false
+                    download.isFinishedProcessing = false
+                    download.downloadProgress = .completed(
+                        destinationLocation: nil,
+                        etag: nil,
+                        error: error
+                    )
+                }
+                clearDownloadStatusObservers(forDownloadID: download.id)
                 return
             }
             await MainActor.run { [weak self] in

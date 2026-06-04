@@ -1,5 +1,6 @@
 import CryptoKit
 import XCTest
+import Brotli
 @testable import SwiftUIDownloads
 
 private func sha1Hex(_ data: Data) -> String {
@@ -142,5 +143,44 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
         let attemptCount = await attemptExecutor.recordedAttemptCount()
         XCTAssertEqual(attemptCount, 1)
+    }
+
+    func testForegroundRecoveryProcessesPreservedCompressedFile() async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swiftui-downloads-foreground-recovery-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let payload = Data("recoverable-compressed-payload".utf8)
+        guard let compressedPayload = (payload as NSData).brotliCompressed() else {
+            XCTFail("Expected test payload to be compressible")
+            return
+        }
+
+        let destinationURL = tempDirectory.appendingPathComponent("payload.bin")
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads-checksum.test/recoverable-payload.bin.br")!,
+            name: "Foreground Recovery",
+            localDestination: destinationURL,
+            localDestinationChecksum: sha1Hex(payload)
+        )
+        try compressedPayload.write(to: download.compressedFileURL, options: .atomic)
+
+        let controller = DownloadController()
+        await MainActor.run {
+            controller.assuredDownloads.insert(download)
+            controller.failedDownloads.insert(download)
+            download.isFailed = true
+            download.isFinishedDownloading = false
+            download.isFinishedProcessing = false
+        }
+
+        await controller.resumeRecoverableDownloadsAfterForegrounding()
+
+        XCTAssertEqual(try Data(contentsOf: destinationURL), payload)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: download.compressedFileURL.path))
+        let isComplete = await MainActor.run { download.isFinishedProcessing && !download.isFailed }
+        XCTAssertTrue(isComplete)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
     }
 }

@@ -21,6 +21,8 @@ enum BrotliFileDecompressor {
     private static let outputChunkSize = 64 * 1024
 
     static func decompressFile(at sourceURL: URL, to destinationURL: URL) throws {
+        try Task.checkCancellation()
+
         if #available(iOS 16.1, macOS 13.1, *) {
             try decompressWithCompressionFramework(sourceURL: sourceURL, destinationURL: destinationURL)
             return
@@ -32,6 +34,7 @@ enum BrotliFileDecompressor {
 
     @available(iOS 16.1, macOS 13.1, *)
     private static func decompressWithCompressionFramework(sourceURL: URL, destinationURL: URL) throws {
+        try Task.checkCancellation()
         try createDestinationDirectory(for: destinationURL)
         guard FileManager.default.createFile(atPath: destinationURL.path, contents: nil) else {
             throw BrotliFileDecompressionError.failedToCreateOutputFile(destinationURL)
@@ -48,6 +51,11 @@ enum BrotliFileDecompressor {
         let algorithm = Algorithm(rawValue: COMPRESSION_BROTLI)!
         let filter = try InputFilter<Data>(.decompress, using: algorithm) { requestedLength in
             if reachedEOF {
+                return nil
+            }
+            if Task.isCancelled {
+                readError = CancellationError()
+                reachedEOF = true
                 return nil
             }
 
@@ -67,6 +75,7 @@ enum BrotliFileDecompressor {
 
         do {
             while let decompressedChunk = try filter.readData(ofLength: outputChunkSize) {
+                try Task.checkCancellation()
                 if !decompressedChunk.isEmpty {
                     try outputHandle.write(contentsOf: decompressedChunk)
                 }
@@ -80,6 +89,7 @@ enum BrotliFileDecompressor {
     }
 
     private static func decompressWithLegacyNSData(sourceURL: URL, destinationURL: URL) throws {
+        try Task.checkCancellation()
         try createDestinationDirectory(for: destinationURL)
         guard FileManager.default.createFile(atPath: destinationURL.path, contents: nil) else {
             throw BrotliFileDecompressionError.failedToCreateOutputFile(destinationURL)
@@ -90,14 +100,17 @@ enum BrotliFileDecompressor {
 
         let compressedData = NSMutableData()
         while true {
+            try Task.checkCancellation()
             let chunk = try inputHandle.read(upToCount: inputChunkSize)
             guard let chunk, !chunk.isEmpty else { break }
             compressedData.append(chunk)
         }
 
+        try Task.checkCancellation()
         guard let decompressedData = (compressedData as NSData).brotliDecompressed() else {
             throw BrotliFileDecompressionError.invalidBrotliData
         }
+        try Task.checkCancellation()
         try decompressedData.write(to: destinationURL, options: .atomic)
     }
 
