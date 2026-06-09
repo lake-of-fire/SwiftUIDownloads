@@ -190,7 +190,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     ) {
         guard shouldLogReaderOptimizationDiagnostics else { return }
         var segments: [String] = [
-            "# READERLOAD stage=\(stage)",
+            "stage=\(stage)",
             "downloadName=\(name)",
             "filename=\(localDestination.lastPathComponent)"
         ]
@@ -1602,18 +1602,6 @@ extension DownloadController {
                     importable.importProgress = nil
                     importable.importStatusText = nil
                 }
-            }
-            if download.localDestinationChecksum != nil {
-                debugPrint(
-                    "# READERLOAD stage=download.finish.phaseSummary",
-                    "downloadName=\(download.name)",
-                    "filename=\(download.localDestination.lastPathComponent)",
-                    "decompressElapsed=\(String(format: "%.3fs", decompressElapsed))",
-                    "verifyElapsed=\(String(format: "%.3fs", verifyElapsed))",
-                    "importElapsed=\(String(format: "%.3fs", importElapsed))",
-                    "totalElapsed=\(String(format: "%.3fs", Date().timeIntervalSince(finishStartedAt)))",
-                    "fileSize=\(fileSize)"
-                )
             }
             clearDownloadStatusObservers(forDownloadID: download.id)
         } catch {
