@@ -137,6 +137,7 @@ fileprivate extension Array where Element: Hashable {
 
 public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked Sendable {
     public static var groupIdentifier: String? = nil
+    public let objectWillChange = ObservableObjectPublisher()
     
     public let url: URL
     let mirrorURL: URL?
@@ -754,6 +755,8 @@ public extension Downloadable {
 }
 
 public class DownloadController: NSObject, ObservableObject, @unchecked Sendable {
+    public let objectWillChange = ObservableObjectPublisher()
+    
     typealias DownloadAttemptExecutor = @Sendable (_ download: Downloadable, _ session: URLSession) async throws -> Void
     private struct ProcessingTaskRecord {
         let id: UUID
