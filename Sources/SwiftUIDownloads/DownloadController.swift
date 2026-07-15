@@ -1216,7 +1216,11 @@ extension DownloadController {
     @MainActor
     public func ensureDownloaded(download: Downloadable, deletingOrphansIn: [DownloadDirectory] = [], excludingFromDeletion: Set<Downloadable> = Set()) async {
         if assuredDownloads.contains(where: { $0.url == download.url }) && !failedDownloads.contains(where: { $0.url == download.url }) {
-            return
+            let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
+            let localExists = await download.existsLocally()
+            if localExists || isImported {
+                return
+            }
         }
         assuredDownloads.insert(download)
         do {
@@ -1455,10 +1459,18 @@ extension DownloadController {
                     isFinishedProcessing: download.isFinishedProcessing
                 )
             }
-            guard !state.isFinishedProcessing else { continue }
-
             let hasRecoverableFile = FileManager.default.fileExists(atPath: download.compressedFileURL.path)
                 || FileManager.default.fileExists(atPath: download.localDestination.path)
+            let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
+
+            if state.isFinishedProcessing {
+                if hasRecoverableFile || isImported {
+                    continue
+                }
+                await self.download(download)
+                continue
+            }
+
             guard hasRecoverableFile || state.isFailed || state.isActive || state.isFinishedDownloading else {
                 continue
             }

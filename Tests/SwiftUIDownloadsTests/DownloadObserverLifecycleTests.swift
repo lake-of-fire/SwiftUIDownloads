@@ -17,12 +17,14 @@ private actor ImportInvocationCounter {
 
 private actor SuccessfulAttemptExecutorStub {
     private let payload: Data
+    private var invocationCount = 0
 
     init(payload: Data) {
         self.payload = payload
     }
 
     func execute(download: Downloadable, session _: URLSession) async throws {
+        invocationCount += 1
         try FileManager.default.createDirectory(
             at: download.localDestination.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -38,6 +40,10 @@ private actor SuccessfulAttemptExecutorStub {
             download.isFailed = false
             download.isFinishedDownloading = true
         }
+    }
+
+    func count() -> Int {
+        invocationCount
     }
 }
 
@@ -160,5 +166,73 @@ final class DownloadObserverLifecycleTests: XCTestCase {
             }
             XCTAssertTrue(failedContainsDownload)
         }
+    }
+
+    func testForegroundRecoveryRedownloadsFinishedFileDeletedByAnotherProcess() async throws {
+        let downloadURL = URL(string: "https://swiftui-downloads-foreground.test/\(UUID().uuidString).txt")!
+        let payload = Data("foreground-recovery".utf8)
+        let attemptExecutor = SuccessfulAttemptExecutorStub(payload: payload)
+        let retryPolicy = DownloadRetryPolicy(
+            maxAttempts: 1,
+            initialDelaySeconds: 0.05,
+            maxDelaySeconds: 0.05,
+            jitterFraction: 0,
+            maxServerRetryAfterSeconds: 1.0
+        )
+
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swiftui-downloads-foreground-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let destinationURL = tempDirectory.appendingPathComponent("downloaded.txt")
+        let metadataSuiteName = "swiftui-downloads-foreground-\(UUID().uuidString)"
+        guard let metadataDefaults = UserDefaults(suiteName: metadataSuiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite for metadata store.")
+            return
+        }
+        defer { metadataDefaults.removePersistentDomain(forName: metadataSuiteName) }
+
+        let download = Downloadable(
+            url: downloadURL,
+            name: "Foreground Recovery",
+            localDestination: destinationURL,
+            metadataStore: UserDefaultsDownloadableMetadataStore(userDefaults: metadataDefaults)
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(download: download, session: session)
+            },
+            retryPolicyProvider: { retryPolicy }
+        )
+
+        await controller.ensureDownloaded(download: download)
+        let initiallyCompleted = try await download.awaitCompletionOrFailure()
+        let initialInvocationCount = await attemptExecutor.count()
+        XCTAssertTrue(initiallyCompleted)
+        XCTAssertEqual(initialInvocationCount, 1)
+
+        try FileManager.default.removeItem(at: destinationURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destinationURL.path))
+
+        await controller.resumeRecoverableDownloadsAfterForegrounding()
+
+        let recovered = try await download.awaitCompletionOrFailure()
+        let recoveredInvocationCount = await attemptExecutor.count()
+        XCTAssertTrue(recovered)
+        XCTAssertEqual(try Data(contentsOf: destinationURL), payload)
+        XCTAssertEqual(recoveredInvocationCount, 2)
+
+        try FileManager.default.removeItem(at: destinationURL)
+        await controller.ensureDownloaded(download: download)
+
+        let explicitlyRecovered = try await download.awaitCompletionOrFailure()
+        let explicitRecoveryInvocationCount = await attemptExecutor.count()
+        XCTAssertTrue(explicitlyRecovered)
+        XCTAssertEqual(try Data(contentsOf: destinationURL), payload)
+        XCTAssertEqual(explicitRecoveryInvocationCount, 3)
     }
 }
