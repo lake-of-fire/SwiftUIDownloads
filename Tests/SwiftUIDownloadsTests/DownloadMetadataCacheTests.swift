@@ -272,4 +272,25 @@ final class DownloadMetadataCacheTests: XCTestCase {
         XCTAssertNil(store.storedMetadata.lastDownloadedETag)
         XCTAssertEqual(store.saveCount, 1)
     }
+
+    @MainActor
+    func testAssignmentAfterFailedLoadCanClearUnknownStoredValue() async throws {
+        let store = RecordingDownloadMetadataStore(
+            metadata: DownloadMetadata(lastDownloadedETag: "stored"),
+            failsBulkLoad: true
+        )
+        let download = Downloadable(
+            url: URL(string: "https://example.com/clear-after-failed-load.zip")!,
+            name: "Clear after failed load",
+            localDestination: URL(fileURLWithPath: "/tmp/clear-after-failed-load.zip"),
+            metadataStore: store
+        )
+        await download.waitForDownloadMetadata()
+
+        download.lastDownloadedETag = nil
+        try await download.waitForDownloadMetadataPersistence()
+
+        XCTAssertNil(store.storedMetadata.lastDownloadedETag)
+        XCTAssertEqual(store.saveCount, 1)
+    }
 }

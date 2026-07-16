@@ -63,6 +63,7 @@ final class DownloadMetadataCache: @unchecked Sendable {
     private var fieldsChangedBeforeInitialLoad: DownloadMetadataFields = []
     private var dirtyFields: DownloadMetadataFields = []
     private var hasCompletedInitialLoad = false
+    private var knownStoredFields: DownloadMetadataFields = []
     private var hasStartedInitialLoad = false
     private var initialLoadTask: Task<Void, Never>?
     private var observationRelays: [DownloadMetadataObservationRelay] = []
@@ -152,32 +153,32 @@ final class DownloadMetadataCache: @unchecked Sendable {
     }
 
     func setLastDownloadedETag(_ value: String?) {
-        update(.lastDownloadedETag) { metadata, hasLoaded in
-            guard !hasLoaded || metadata.lastDownloadedETag != value else { return false }
+        update(.lastDownloadedETag) { metadata, isStoredFieldKnown in
+            guard !isStoredFieldKnown || metadata.lastDownloadedETag != value else { return false }
             metadata.lastDownloadedETag = value
             return true
         }
     }
 
     func setLastCheckedETagAt(_ value: Date?) {
-        update(.lastCheckedETagAt) { metadata, hasLoaded in
-            guard !hasLoaded || metadata.lastCheckedETagAt != value else { return false }
+        update(.lastCheckedETagAt) { metadata, isStoredFieldKnown in
+            guard !isStoredFieldKnown || metadata.lastCheckedETagAt != value else { return false }
             metadata.lastCheckedETagAt = value
             return true
         }
     }
 
     func setLastDownloadedAt(_ value: Date?) {
-        update(.lastDownloadedAt) { metadata, hasLoaded in
-            guard !hasLoaded || metadata.lastDownloadedAt != value else { return false }
+        update(.lastDownloadedAt) { metadata, isStoredFieldKnown in
+            guard !isStoredFieldKnown || metadata.lastDownloadedAt != value else { return false }
             metadata.lastDownloadedAt = value
             return true
         }
     }
 
     func setLastModifiedAt(_ value: Date?) {
-        update(.lastModifiedAt) { metadata, hasLoaded in
-            guard !hasLoaded || metadata.lastModifiedAt != value else { return false }
+        update(.lastModifiedAt) { metadata, isStoredFieldKnown in
+            guard !isStoredFieldKnown || metadata.lastModifiedAt != value else { return false }
             metadata.lastModifiedAt = value
             return true
         }
@@ -185,10 +186,10 @@ final class DownloadMetadataCache: @unchecked Sendable {
 
     private func update(
         _ field: DownloadMetadataFields,
-        mutation: (inout DownloadMetadata, _ hasCompletedInitialLoad: Bool) -> Bool
+        mutation: (inout DownloadMetadata, _ isStoredFieldKnown: Bool) -> Bool
     ) {
         let shouldStartSaveTask: Bool? = withLock {
-            guard mutation(&metadata, hasCompletedInitialLoad) else { return nil }
+            guard mutation(&metadata, knownStoredFields.contains(field)) else { return nil }
             mutationRevision &+= 1
             dirtyFields.insert(field)
             latestSaveError = nil
@@ -229,6 +230,7 @@ final class DownloadMetadataCache: @unchecked Sendable {
                 metadata.lastModifiedAt = storedMetadata.lastModifiedAt
             }
             fieldsChangedBeforeInitialLoad = []
+            knownStoredFields = .all
             hasCompletedInitialLoad = true
         }
     }
@@ -251,6 +253,9 @@ final class DownloadMetadataCache: @unchecked Sendable {
             }
             do {
                 try store.saveMetadata(pending.0, fields: pending.1, for: url)
+                withLock {
+                    knownStoredFields.formUnion(pending.1)
+                }
             } catch {
                 let persistenceError = DownloadMetadataPersistenceError(error)
                 withLock {
