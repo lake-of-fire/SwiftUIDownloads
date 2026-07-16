@@ -152,27 +152,43 @@ final class DownloadMetadataCache: @unchecked Sendable {
     }
 
     func setLastDownloadedETag(_ value: String?) {
-        update(.lastDownloadedETag) { $0.lastDownloadedETag = value }
+        update(.lastDownloadedETag) { metadata, hasLoaded in
+            guard !hasLoaded || metadata.lastDownloadedETag != value else { return false }
+            metadata.lastDownloadedETag = value
+            return true
+        }
     }
 
     func setLastCheckedETagAt(_ value: Date?) {
-        update(.lastCheckedETagAt) { $0.lastCheckedETagAt = value }
+        update(.lastCheckedETagAt) { metadata, hasLoaded in
+            guard !hasLoaded || metadata.lastCheckedETagAt != value else { return false }
+            metadata.lastCheckedETagAt = value
+            return true
+        }
     }
 
     func setLastDownloadedAt(_ value: Date?) {
-        update(.lastDownloadedAt) { $0.lastDownloadedAt = value }
+        update(.lastDownloadedAt) { metadata, hasLoaded in
+            guard !hasLoaded || metadata.lastDownloadedAt != value else { return false }
+            metadata.lastDownloadedAt = value
+            return true
+        }
     }
 
     func setLastModifiedAt(_ value: Date?) {
-        update(.lastModifiedAt) { $0.lastModifiedAt = value }
+        update(.lastModifiedAt) { metadata, hasLoaded in
+            guard !hasLoaded || metadata.lastModifiedAt != value else { return false }
+            metadata.lastModifiedAt = value
+            return true
+        }
     }
 
     private func update(
         _ field: DownloadMetadataFields,
-        mutation: (inout DownloadMetadata) -> Void
+        mutation: (inout DownloadMetadata, _ hasCompletedInitialLoad: Bool) -> Bool
     ) {
-        let shouldStartSaveTask = withLock {
-            mutation(&metadata)
+        let shouldStartSaveTask: Bool? = withLock {
+            guard mutation(&metadata, hasCompletedInitialLoad) else { return nil }
             mutationRevision &+= 1
             dirtyFields.insert(field)
             latestSaveError = nil
@@ -183,6 +199,7 @@ final class DownloadMetadataCache: @unchecked Sendable {
             isSaveScheduled = true
             return true
         }
+        guard let shouldStartSaveTask else { return }
         notifyObservers()
         guard shouldStartSaveTask else { return }
 
