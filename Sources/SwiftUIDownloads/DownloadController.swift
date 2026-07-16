@@ -146,6 +146,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     public let localDestinationChecksum: String?
     var isFromBackgroundAssetsDownloader: Bool? = nil
     public let metadataStore: any DownloadableMetadataStore
+    private let downloadMetadataCache: DownloadMetadataCache
     @MainActor public var shouldCheckForUpdates: Bool = true
     
     @MainActor
@@ -229,46 +230,46 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     
     @MainActor
     public var lastDownloadedETag: String? {
-        get { metadataStore.lastDownloadedETag(for: url) }
+        get { downloadMetadataCache.currentMetadata().lastDownloadedETag }
         set {
-            let value = newValue
-            Task { @DownloadActor in
-                metadataStore.setLastDownloadedETag(value, for: url)
-            }
+            downloadMetadataCache.setLastDownloadedETag(newValue)
         }
     }
     
     @MainActor
     public var lastCheckedETagAt: Date? {
-        get { metadataStore.lastCheckedETagAt(for: url) }
+        get { downloadMetadataCache.currentMetadata().lastCheckedETagAt }
         set {
-            let value = newValue
-            Task { @DownloadActor in
-                metadataStore.setLastCheckedETagAt(value, for: url)
-            }
+            downloadMetadataCache.setLastCheckedETagAt(newValue)
         }
     }
     
     @MainActor
     public var lastDownloaded: Date? {
-        get { metadataStore.lastDownloaded(for: url) }
+        get { downloadMetadataCache.currentMetadata().lastDownloadedAt }
         set {
-            let value = newValue
-            Task { @DownloadActor in
-                metadataStore.setLastDownloaded(value, for: url)
-            }
+            downloadMetadataCache.setLastDownloadedAt(newValue)
         }
     }
 
     @MainActor
     public var lastModifiedAt: Date? {
-        get { metadataStore.lastModifiedAt(for: url) }
+        get { downloadMetadataCache.currentMetadata().lastModifiedAt }
         set {
-            let value = newValue
-            Task { @DownloadActor in
-                metadataStore.setLastModifiedAt(value, for: url)
-            }
+            downloadMetadataCache.setLastModifiedAt(newValue)
         }
+    }
+
+    public func waitForDownloadMetadata() async {
+        await downloadMetadataCache.waitForInitialLoad()
+    }
+
+    public var cachedDownloadMetadata: DownloadMetadata {
+        downloadMetadataCache.currentMetadata()
+    }
+
+    public func waitForDownloadMetadataPersistence() async throws {
+        try await downloadMetadataCache.waitForPendingSaves()
     }
     
     /// localDestinationChecksum is currently NOT checked.
@@ -288,7 +289,12 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         self.localDestination = localDestination
         self.localDestinationChecksum = localDestinationChecksum
         self.isFromBackgroundAssetsDownloader = isFromBackgroundAssetsDownloader
-        self.metadataStore = metadataStore ?? UserDefaultsDownloadableMetadataStore()
+        let resolvedMetadataStore = metadataStore ?? UserDefaultsDownloadableMetadataStore()
+        self.metadataStore = resolvedMetadataStore
+        self.downloadMetadataCache = DownloadMetadataCache.shared(store: resolvedMetadataStore, url: url)
+        let metadataObservationRelay = DownloadMetadataObservationRelay()
+        metadataObservationRelay.owner = self
+        self.downloadMetadataCache.startLoading(observationRelay: metadataObservationRelay)
     }
     
     public static func == (lhs: Downloadable, rhs: Downloadable) -> Bool {
@@ -1212,6 +1218,7 @@ extension DownloadController {
 
     @MainActor
     public func ensureDownloaded(download: Downloadable, deletingOrphansIn: [DownloadDirectory] = [], excludingFromDeletion: Set<Downloadable> = Set()) async {
+        await download.waitForDownloadMetadata()
         if assuredDownloads.contains(where: { $0.url == download.url }) && !failedDownloads.contains(where: { $0.url == download.url }) {
             let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
             let localExists = await download.existsLocally()
@@ -1512,6 +1519,7 @@ extension DownloadController {
         etag: String? = nil,
         processingTaskID: UUID
     ) async {
+        await download.waitForDownloadMetadata()
         defer {
             clearProcessingTask(forDownloadID: download.id, processingTaskID: processingTaskID)
         }
@@ -1711,6 +1719,7 @@ extension DownloadController {
     /// Using "Last-Modified" header value to compare it with given date.
     @DownloadActor
     public func checkFileModifiedAt(download: Downloadable) async -> (Bool, Date?, String?) {
+        await download.waitForDownloadMetadata()
         var request = URLRequest(url: download.url)
         request.httpMethod = "HEAD"
         do {
