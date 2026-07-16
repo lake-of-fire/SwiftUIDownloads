@@ -11,21 +11,31 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
     let metadataCacheNamespace = "RecordingDownloadMetadataStore:\(UUID().uuidString)"
     private var metadata: DownloadMetadata
     private let failsBulkLoad: Bool
+    private let bulkLoadStarted = DispatchSemaphore(value: 0)
+    private let bulkLoadMayFinish = DispatchSemaphore(value: 0)
+    private let pausesBulkLoad: Bool
     private var remainingSaveFailures: Int
     private(set) var bulkLoadCount = 0
     private(set) var scalarReadCount = 0
+    private(set) var saveCount = 0
 
     init(
         metadata: DownloadMetadata,
         failsBulkLoad: Bool = false,
+        pausesBulkLoad: Bool = false,
         saveFailureCount: Int = 0
     ) {
         self.metadata = metadata
         self.failsBulkLoad = failsBulkLoad
+        self.pausesBulkLoad = pausesBulkLoad
         self.remainingSaveFailures = saveFailureCount
     }
 
     func loadMetadata(for _: URL) throws -> DownloadMetadata {
+        if pausesBulkLoad {
+            bulkLoadStarted.signal()
+            bulkLoadMayFinish.wait()
+        }
         if failsBulkLoad {
             throw StoreError.requested
         }
@@ -41,6 +51,7 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
         for _: URL
     ) throws {
         try withLock {
+            saveCount += 1
             if remainingSaveFailures > 0 {
                 remainingSaveFailures -= 1
                 throw StoreError.requested
@@ -71,6 +82,14 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
 
     var storedMetadata: DownloadMetadata {
         withLock { metadata }
+    }
+
+    func waitUntilBulkLoadStarts() {
+        bulkLoadStarted.wait()
+    }
+
+    func resumeBulkLoad() {
+        bulkLoadMayFinish.signal()
     }
 
     private func scalarRead<Value>(_ value: () -> Value) -> Value {
@@ -202,5 +221,55 @@ final class DownloadMetadataCacheTests: XCTestCase {
 
         XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "etag")
         XCTAssertEqual(store.storedMetadata.lastModifiedAt, modifiedAt)
+    }
+
+    @MainActor
+    func testAssigningLoadedValuesDoesNotSchedulePersistence() async throws {
+        let checkedAt = Date(timeIntervalSince1970: 100)
+        let store = RecordingDownloadMetadataStore(
+            metadata: DownloadMetadata(
+                lastDownloadedETag: "etag",
+                lastCheckedETagAt: checkedAt
+            )
+        )
+        let download = Downloadable(
+            url: URL(string: "https://example.com/unchanged.zip")!,
+            name: "Unchanged",
+            localDestination: URL(fileURLWithPath: "/tmp/unchanged.zip"),
+            metadataStore: store
+        )
+        await download.waitForDownloadMetadata()
+
+        download.lastDownloadedETag = "etag"
+        download.lastCheckedETagAt = checkedAt
+        try await download.waitForDownloadMetadataPersistence()
+
+        XCTAssertEqual(store.saveCount, 0)
+    }
+
+    @MainActor
+    func testAssignmentBeforeInitialLoadCanClearStoredValue() async throws {
+        let store = RecordingDownloadMetadataStore(
+            metadata: DownloadMetadata(lastDownloadedETag: "stored"),
+            pausesBulkLoad: true
+        )
+        let download = Downloadable(
+            url: URL(string: "https://example.com/clear-before-load.zip")!,
+            name: "Clear before load",
+            localDestination: URL(fileURLWithPath: "/tmp/clear-before-load.zip"),
+            metadataStore: store
+        )
+        await Task.detached {
+            store.waitUntilBulkLoadStarts()
+        }.value
+
+        download.lastDownloadedETag = nil
+        store.resumeBulkLoad()
+        await download.waitForDownloadMetadata()
+        try await download.waitForDownloadMetadataPersistence()
+
+        XCTAssertNil(download.lastDownloadedETag)
+        XCTAssertNil(store.storedMetadata.lastDownloadedETag)
+        XCTAssertEqual(store.saveCount, 1)
     }
 }
