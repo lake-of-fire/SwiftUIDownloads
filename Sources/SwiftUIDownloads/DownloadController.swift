@@ -644,6 +644,21 @@ public enum DownloadDirectory {
     )
     
     public var directoryURL: URL {
+        if let configuredRoot = ProcessInfo.processInfo.environment["JVIDS_MANABI_DATA_ROOT"],
+           !configuredRoot.isEmpty {
+            var url = URL(fileURLWithPath: configuredRoot, isDirectory: true)
+            switch self {
+            case .documents(let parentDirectoryName, let subdirectoryName, _),
+                 .appSupport(let parentDirectoryName, let subdirectoryName, _):
+                if let parentDirectoryName {
+                    url.appendPathComponent(parentDirectoryName, isDirectory: true)
+                }
+                if let subdirectoryName {
+                    url.appendPathComponent(subdirectoryName, isDirectory: true)
+                }
+            }
+            return url
+        }
         switch self {
         case .documents(
             let parentDirectoryName,
