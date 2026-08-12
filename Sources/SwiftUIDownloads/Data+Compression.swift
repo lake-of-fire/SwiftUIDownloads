@@ -14,11 +14,18 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 import Foundation
 import Compression
 
+private enum DataCompressionError: Error {
+    case unsupportedAlgorithm(compression_algorithm)
+}
+
 public extension Data {
     /// Compresses the data using the specified compression algorithm.
     func compressed(using algo: compression_algorithm = COMPRESSION_LZMA, pageSize: Int = 128) throws -> Data {
         var outputData = Data()
-        let filter = try OutputFilter(.compress, using: Algorithm(rawValue: algo)!, bufferCapacity: pageSize, writingTo: { $0.flatMap({ outputData.append($0) }) })
+        guard let algorithm = Algorithm(rawValue: algo) else {
+            throw DataCompressionError.unsupportedAlgorithm(algo)
+        }
+        let filter = try OutputFilter(.compress, using: algorithm, bufferCapacity: pageSize, writingTo: { $0.flatMap({ outputData.append($0) }) })
 
         var index = 0
         let bufferSize = count
@@ -43,7 +50,10 @@ public extension Data {
         let bufferSize = count
         var decompressionIndex = 0
 
-        let filter = try InputFilter(.decompress, using: Algorithm(rawValue: algo)!) { (length: Int) -> Data? in
+        guard let algorithm = Algorithm(rawValue: algo) else {
+            throw DataCompressionError.unsupportedAlgorithm(algo)
+        }
+        let filter = try InputFilter(.decompress, using: algorithm) { (length: Int) -> Data? in
             let rangeLength = Swift.min(length, bufferSize - decompressionIndex)
             let subdata = self.subdata(in: decompressionIndex ..< decompressionIndex + rangeLength)
             decompressionIndex += rangeLength
