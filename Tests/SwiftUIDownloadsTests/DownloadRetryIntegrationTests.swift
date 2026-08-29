@@ -160,8 +160,18 @@ final class DownloadRetryIntegrationTests: XCTestCase {
         await controller.download(download)
         let isComplete = try await download.awaitCompletionOrFailure()
         XCTAssertFalse(isComplete)
-        let isFailed = await MainActor.run { download.isFailed }
-        XCTAssertTrue(isFailed)
+        let terminalState = await MainActor.run {
+            (
+                download.isFailed,
+                download.isFinishedDownloading,
+                controller.failedDownloads.contains(download),
+                controller.finishedDownloads.contains(download)
+            )
+        }
+        XCTAssertTrue(terminalState.0)
+        XCTAssertFalse(terminalState.1)
+        XCTAssertTrue(terminalState.2)
+        XCTAssertFalse(terminalState.3)
 
         let requestDates = await attemptExecutor.recordedAttemptDates()
         XCTAssertEqual(requestDates.count, 2)

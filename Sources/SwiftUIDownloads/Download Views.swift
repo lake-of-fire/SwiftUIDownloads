@@ -493,8 +493,12 @@ public struct HidingDownloadButton: View {
     
     @MainActor
     private func refreshDownloadable() async {
-        downloadExistedOnDisk = await downloadable.existsLocally()
-        downloadable.isFinishedDownloading = downloadExistedOnDisk
+        let existsOnDisk = await downloadable.existsLocally()
+        // A retained payload can be useful for diagnosis/retry after a
+        // processing failure, but it is not a successful downloaded state.
+        let isUsableDownload = existsOnDisk && !downloadable.isFailed
+        downloadExistedOnDisk = isUsableDownload
+        downloadable.isFinishedDownloading = isUsableDownload
     }
 }
 

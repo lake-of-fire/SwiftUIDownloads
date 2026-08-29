@@ -115,6 +115,20 @@ public protocol URLResourceDownloadTaskProtocol {
     func resume()
 }
 
+public enum URLResourceDownloadInstallError: LocalizedError {
+    case destinationInstallFailed(destination: URL, underlyingError: Error)
+    case completedWithoutDownloadedFile(URL)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .destinationInstallFailed(destination, underlyingError):
+            return "Unable to install download at \(destination.path): \(underlyingError.localizedDescription)"
+        case let .completedWithoutDownloadedFile(url):
+            return "Download completed without producing a file for \(url.absoluteString)"
+        }
+    }
+}
+
 public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol {
 
     private let session: URLSession
@@ -126,6 +140,8 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol 
     public typealias PublisherType = AnyPublisher<URLResourceDownloadTaskProgress, Error>
 
     fileprivate let subject: PassthroughSubject<PublisherType.Output, PublisherType.Failure>
+    private let terminalLock = NSLock()
+    private var didPublishTerminalResult = false
 
     public var taskIdentifier: Int {
         self.downloadTask.taskIdentifier
@@ -150,8 +166,33 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol 
 
     public func resume() {
         self.downloadTask.delegate = self
-        self.downloadTask.resume()
         self.subject.send(.waitingForResponse)
+        self.downloadTask.resume()
+    }
+
+    private func publishTerminalResult(
+        destinationLocation: URL?,
+        etag: String?,
+        error: Error?
+    ) {
+        terminalLock.lock()
+        guard !didPublishTerminalResult else {
+            terminalLock.unlock()
+            return
+        }
+        didPublishTerminalResult = true
+        terminalLock.unlock()
+
+        subject.send(.completed(
+            destinationLocation: destinationLocation,
+            etag: etag,
+            error: error
+        ))
+        if let error {
+            subject.send(completion: .failure(error))
+        } else {
+            subject.send(completion: .finished)
+        }
     }
 }
 
@@ -175,15 +216,35 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
 
         if let httpResponse = downloadTask.response as? HTTPURLResponse, httpResponse.statusCode < 200 || httpResponse.statusCode > 299 {
             let error = makeHTTPError(from: httpResponse)
-            subject.send(.completed(destinationLocation: location, etag: nil, error: error))
-            subject.send(completion: .failure(error))
+            publishTerminalResult(destinationLocation: nil, etag: nil, error: error)
         } else {
             do {
                 try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                _ = try FileManager.default.replaceItemAt(destination, withItemAt: location)
-            } catch { }
-            subject.send(.completed(destinationLocation: location, etag: (downloadTask.response as? HTTPURLResponse)?.allHeaderFields["Etag"] as? String, error: nil))
-            subject.send(completion: .finished)
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    _ = try FileManager.default.replaceItemAt(
+                        destination,
+                        withItemAt: location
+                    )
+                } else {
+                    try FileManager.default.moveItem(at: location, to: destination)
+                }
+                publishTerminalResult(
+                    destinationLocation: destination,
+                    etag: (downloadTask.response as? HTTPURLResponse)?
+                        .value(forHTTPHeaderField: "ETag"),
+                    error: nil
+                )
+            } catch {
+                publishTerminalResult(
+                    destinationLocation: nil,
+                    etag: nil,
+                    error: URLResourceDownloadInstallError
+                        .destinationInstallFailed(
+                            destination: destination,
+                            underlyingError: error
+                        )
+                )
+            }
         }
     }
 
@@ -217,20 +278,26 @@ extension URLResourceDownloadTask: URLSessionTaskDelegate {
             return
         }
 
-        if let urlError = error as? URLError {
-            subject.send(.completed(destinationLocation: nil, etag: nil, error: urlError))
-            subject.send(completion: .failure(urlError))
-        } else if let posixError = error as? POSIXError {
-            subject.send(.completed(destinationLocation: nil, etag: nil, error: posixError))
-            subject.send(completion: .failure(posixError))
+        if let error {
+            publishTerminalResult(
+                destinationLocation: nil,
+                etag: nil,
+                error: error
+            )
         } else if let httpResponse = task.response as? HTTPURLResponse, httpResponse.statusCode < 200 || httpResponse.statusCode > 299 {
             let error = URLResourceDownloadHTTPError(
                 statusCode: httpResponse.statusCode,
                 url: self.url,
                 retryAfterSeconds: retryAfterSeconds(from: httpResponse)
             )
-            subject.send(.completed(destinationLocation: nil, etag: nil, error: error))
-            subject.send(completion: .failure(error))
+            publishTerminalResult(destinationLocation: nil, etag: nil, error: error)
+        } else {
+            publishTerminalResult(
+                destinationLocation: nil,
+                etag: nil,
+                error: URLResourceDownloadInstallError
+                    .completedWithoutDownloadedFile(url)
+            )
         }
     }
 }

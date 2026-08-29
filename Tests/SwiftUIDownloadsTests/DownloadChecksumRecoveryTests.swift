@@ -42,7 +42,68 @@ private actor ChecksumRecoveryAttemptExecutor {
 }
 
 final class DownloadChecksumRecoveryTests: XCTestCase {
-    func testRepairVerifiedLocalDestinationChecksumMarkerWritesMarkerForReadableFile() async throws {
+    func testDeleteRemovesPayloadAndAllProcessingArtifacts() async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-delete-artifacts-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let destination = tempDirectory.appendingPathComponent("payload.bin")
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads-delete.test/payload.bin.br")!,
+            name: "Delete Artifacts",
+            localDestination: destination,
+            localDestinationChecksum: sha1Hex(Data("payload".utf8))
+        )
+        let staging = destination.appendingPathExtension(
+            "decompressing.\(UUID().uuidString)"
+        )
+        for url in [
+            destination,
+            download.compressedFileURL,
+            download.checksumVerificationMarkerURL,
+            staging,
+        ] {
+            try Data("artifact".utf8).write(to: url)
+        }
+
+        let controller = DownloadController()
+        await MainActor.run {
+            controller.assuredDownloads.insert(download)
+            controller.finishedDownloads.insert(download)
+        }
+
+        _ = try await controller.delete(download: download)
+
+        for url in [
+            destination,
+            download.compressedFileURL,
+            download.checksumVerificationMarkerURL,
+            staging,
+        ] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        }
+        let state = await MainActor.run {
+            (
+                controller.assuredDownloads.contains(download),
+                controller.finishedDownloads.contains(download),
+                download.isFinishedProcessing,
+                download.isFailed
+            )
+        }
+        XCTAssertFalse(state.0)
+        XCTAssertFalse(state.1)
+        XCTAssertFalse(state.2)
+        XCTAssertFalse(state.3)
+    }
+
+    func testVerifyingReadableFileWritesChecksumMarker() throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("swiftui-downloads-checksum-repair-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
@@ -62,14 +123,40 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
         XCTAssertTrue(download.hasReadableLocalDestination())
 
-        download.repairVerifiedLocalDestinationChecksumMarkerIfNeeded()
-
-        let deadline = Date().addingTimeInterval(2)
-        while !download.hasVerifiedLocalDestinationChecksumMarker() && Date() < deadline {
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
+        try download.ensureVerifiedLocalDestinationChecksum()
 
         XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+    }
+
+    func testEmptyLocalFileRequiresCleanRedownload() throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-empty-checksum-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let destinationURL = tempDirectory.appendingPathComponent("payload.bin")
+        try Data().write(to: destinationURL, options: .atomic)
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads-checksum.test/empty.bin")!,
+            name: "Empty Checksum Payload",
+            localDestination: destinationURL,
+            localDestinationChecksum: sha1Hex(Data("expected".utf8))
+        )
+
+        XCTAssertThrowsError(
+            try download.ensureVerifiedLocalDestinationChecksum()
+        ) { error in
+            XCTAssertTrue(
+                (error as? DownloadableChecksumVerificationError)?
+                    .requiresCleanRedownload == true
+            )
+        }
     }
 
     func testOrphanCleanupKeepsChecksumMarkerForAssuredDownload() async throws {
@@ -142,6 +229,119 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: destinationURL), expectedPayload)
         XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
         let attemptCount = await attemptExecutor.recordedAttemptCount()
+        XCTAssertEqual(attemptCount, 1)
+    }
+
+    func testDirectChecksumFailureCanRequestCleanRecovery() async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-direct-checksum-recovery-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let expectedPayload = Data("expected-direct-payload".utf8)
+        let destinationURL = tempDirectory.appendingPathComponent("payload.bin")
+        try Data("corrupt-direct-payload".utf8).write(
+            to: destinationURL,
+            options: .atomic
+        )
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads-checksum.test/direct.bin")!,
+            name: "Direct Checksum Recovery",
+            localDestination: destinationURL,
+            localDestinationChecksum: sha1Hex(expectedPayload)
+        )
+        let attemptExecutor = ChecksumRecoveryAttemptExecutor(
+            payload: expectedPayload
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(
+                    download: download,
+                    session: session
+                )
+            }
+        )
+
+        XCTAssertThrowsError(
+            try download.ensureVerifiedLocalDestinationChecksum()
+        ) { error in
+            XCTAssertTrue(
+                (error as? DownloadableChecksumVerificationError)?
+                    .requiresCleanRedownload == true
+            )
+        }
+
+        await controller.recoverLocalChecksumFailure(for: download)
+        let isComplete = try await download.awaitCompletionOrFailure()
+        let attemptCount = await attemptExecutor.recordedAttemptCount()
+        XCTAssertTrue(isComplete)
+        XCTAssertEqual(try Data(contentsOf: destinationURL), expectedPayload)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertEqual(attemptCount, 1)
+    }
+
+    func testConcurrentFinishAndDirectRecoveryUseOneDownloadAttempt() async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-concurrent-checksum-recovery-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let expectedPayload = Data("expected-concurrent-payload".utf8)
+        let destinationURL = tempDirectory.appendingPathComponent("payload.bin")
+        try Data("corrupt-concurrent-payload".utf8).write(
+            to: destinationURL,
+            options: .atomic
+        )
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads-checksum.test/concurrent.bin")!,
+            name: "Concurrent Checksum Recovery",
+            localDestination: destinationURL,
+            localDestinationChecksum: sha1Hex(expectedPayload)
+        )
+        let attemptExecutor = ChecksumRecoveryAttemptExecutor(
+            payload: expectedPayload
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(
+                    download: download,
+                    session: session
+                )
+            }
+        )
+
+        async let finish: Void = controller.finishDownload(download)
+        async let first: Void = controller.recoverLocalChecksumFailure(
+            for: download
+        )
+        async let second: Void = controller.recoverLocalChecksumFailure(
+            for: download
+        )
+        _ = await (finish, first, second)
+
+        let isComplete = try await download.awaitCompletionOrFailure()
+        let attemptCount = await attemptExecutor.recordedAttemptCount()
+        XCTAssertTrue(isComplete)
+        XCTAssertEqual(try Data(contentsOf: destinationURL), expectedPayload)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
         XCTAssertEqual(attemptCount, 1)
     }
 
