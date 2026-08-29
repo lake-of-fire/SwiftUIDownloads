@@ -24,7 +24,7 @@ private final class ImmediatePayloadURLProtocol: URLProtocol {
 }
 
 final class URLResourceDownloadTaskTerminalTests: XCTestCase {
-    func testDestinationInstallFailurePublishesExactlyOneFailureTerminalResult() throws {
+    func testExistingDestinationReplacementFailurePublishesExactlyOneFailureTerminalResult() throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "swiftui-download-terminal-\(UUID().uuidString)",
@@ -36,9 +36,27 @@ final class URLResourceDownloadTaskTerminalTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        let parentThatIsAFile = tempDirectory.appendingPathComponent("parent")
-        try Data("not-a-directory".utf8).write(to: parentThatIsAFile)
-        let destination = parentThatIsAFile.appendingPathComponent("payload.bin")
+        let installDirectory = tempDirectory.appendingPathComponent(
+            "install",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: installDirectory,
+            withIntermediateDirectories: true
+        )
+        let destination = installDirectory.appendingPathComponent("payload.bin")
+        let originalPayload = Data("existing-payload".utf8)
+        try originalPayload.write(to: destination)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o555],
+            ofItemAtPath: installDirectory.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: installDirectory.path
+            )
+        }
 
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ImmediatePayloadURLProtocol.self]
@@ -75,6 +93,10 @@ final class URLResourceDownloadTaskTerminalTests: XCTestCase {
             return
         }
         XCTAssertTrue(error is URLResourceDownloadInstallError)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(
+            try Data(contentsOf: destination),
+            originalPayload,
+            "A failed replacement must preserve the previously installed file"
+        )
     }
 }
