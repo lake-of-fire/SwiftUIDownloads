@@ -10,6 +10,12 @@ private func makeRetryAfterDateFormatter() -> DateFormatter {
     return formatter
 }
 
+func parseHTTPDate(_ value: String) -> Date? {
+    makeRetryAfterDateFormatter().date(
+        from: value.trimmingCharacters(in: .whitespacesAndNewlines)
+    )
+}
+
 func parseRetryAfterSeconds(_ value: String, now: Date = Date()) -> Double? {
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
@@ -129,7 +135,7 @@ public enum URLResourceDownloadInstallError: LocalizedError {
     }
 }
 
-public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol {
+public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol, @unchecked Sendable {
 
     private let session: URLSession
     private let url: URL
@@ -142,6 +148,13 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol 
     fileprivate let subject: PassthroughSubject<PublisherType.Output, PublisherType.Failure>
     private let terminalLock = NSLock()
     private var didPublishTerminalResult = false
+    private var terminalLastModified: Date?
+
+    var responseLastModified: Date? {
+        terminalLock.lock()
+        defer { terminalLock.unlock() }
+        return terminalLastModified
+    }
 
     public var taskIdentifier: Int {
         self.downloadTask.taskIdentifier
@@ -170,9 +183,14 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol 
         self.downloadTask.resume()
     }
 
+    public func cancel() {
+        self.downloadTask.cancel()
+    }
+
     private func publishTerminalResult(
         destinationLocation: URL?,
         etag: String?,
+        lastModified: Date?,
         error: Error?
     ) {
         terminalLock.lock()
@@ -181,6 +199,7 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol 
             return
         }
         didPublishTerminalResult = true
+        terminalLastModified = lastModified
         terminalLock.unlock()
 
         subject.send(.completed(
@@ -216,7 +235,12 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
 
         if let httpResponse = downloadTask.response as? HTTPURLResponse, httpResponse.statusCode < 200 || httpResponse.statusCode > 299 {
             let error = makeHTTPError(from: httpResponse)
-            publishTerminalResult(destinationLocation: nil, etag: nil, error: error)
+            publishTerminalResult(
+                destinationLocation: nil,
+                etag: nil,
+                lastModified: nil,
+                error: error
+            )
         } else {
             do {
                 try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -232,12 +256,16 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
                     destinationLocation: destination,
                     etag: (downloadTask.response as? HTTPURLResponse)?
                         .value(forHTTPHeaderField: "ETag"),
+                    lastModified: (downloadTask.response as? HTTPURLResponse)?
+                        .value(forHTTPHeaderField: "Last-Modified")
+                        .flatMap(parseHTTPDate),
                     error: nil
                 )
             } catch {
                 publishTerminalResult(
                     destinationLocation: nil,
                     etag: nil,
+                    lastModified: nil,
                     error: URLResourceDownloadInstallError
                         .destinationInstallFailed(
                             destination: destination,
@@ -282,6 +310,7 @@ extension URLResourceDownloadTask: URLSessionTaskDelegate {
             publishTerminalResult(
                 destinationLocation: nil,
                 etag: nil,
+                lastModified: nil,
                 error: error
             )
         } else if let httpResponse = task.response as? HTTPURLResponse, httpResponse.statusCode < 200 || httpResponse.statusCode > 299 {
@@ -290,11 +319,17 @@ extension URLResourceDownloadTask: URLSessionTaskDelegate {
                 url: self.url,
                 retryAfterSeconds: retryAfterSeconds(from: httpResponse)
             )
-            publishTerminalResult(destinationLocation: nil, etag: nil, error: error)
+            publishTerminalResult(
+                destinationLocation: nil,
+                etag: nil,
+                lastModified: nil,
+                error: error
+            )
         } else {
             publishTerminalResult(
                 destinationLocation: nil,
                 etag: nil,
+                lastModified: nil,
                 error: URLResourceDownloadInstallError
                     .completedWithoutDownloadedFile(url)
             )

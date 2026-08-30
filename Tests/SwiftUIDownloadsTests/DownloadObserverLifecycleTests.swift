@@ -15,6 +15,33 @@ private actor ImportInvocationCounter {
     }
 }
 
+private actor ImportProcessingGate {
+    private var didStart = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func blockUntilReleased() async {
+        didStart = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilStarted() async {
+        if didStart { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseWaiters.forEach { $0.resume() }
+        releaseWaiters.removeAll()
+    }
+}
+
 private actor SuccessfulAttemptExecutorStub {
     private let payload: Data
     private var invocationCount = 0
@@ -23,7 +50,10 @@ private actor SuccessfulAttemptExecutorStub {
         self.payload = payload
     }
 
-    func execute(download: Downloadable, session _: URLSession) async throws {
+    func execute(
+        download: Downloadable,
+        session _: URLSession
+    ) async throws -> DownloadTransferResult {
         invocationCount += 1
         try FileManager.default.createDirectory(
             at: download.localDestination.deletingLastPathComponent(),
@@ -40,6 +70,11 @@ private actor SuccessfulAttemptExecutorStub {
             download.isFailed = false
             download.isFinishedDownloading = true
         }
+        return DownloadTransferResult(
+            destinationLocation: download.localDestination,
+            etag: nil,
+            lastModified: nil
+        )
     }
 
     func count() -> Int {
@@ -48,6 +83,68 @@ private actor SuccessfulAttemptExecutorStub {
 }
 
 final class DownloadObserverLifecycleTests: XCTestCase {
+    func testOverlappingDownloadCannotReplaceAttemptDuringProcessing() async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-processing-owner-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let payload = Data("processing-owner".utf8)
+        let destination = tempDirectory.appendingPathComponent("payload.bin")
+        let gate = ImportProcessingGate()
+        let download = ImportableDownloadable(
+            url: URL(string: "https://swiftui-downloads-processing-owner.test/payload.bin")!,
+            name: "Processing Owner",
+            localDestination: destination,
+            deleteAfterImport: false,
+            isImported: { false },
+            importHandler: { localURL, _ in
+                XCTAssertEqual(try Data(contentsOf: localURL), payload)
+                await gate.blockUntilReleased()
+            }
+        )
+        let attemptExecutor = SuccessfulAttemptExecutorStub(payload: payload)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(
+                    download: download,
+                    session: session
+                )
+            }
+        )
+
+        let firstAttempt = Task { await controller.download(download) }
+        await gate.waitUntilStarted()
+        await controller.download(download)
+        let invocationCountDuringProcessing = await attemptExecutor.count()
+        XCTAssertEqual(invocationCountDuringProcessing, 1)
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        await gate.release()
+        await firstAttempt.value
+
+        let state = await MainActor.run {
+            (
+                download.isFinishedDownloading,
+                download.isFinishedProcessing,
+                download.isFailed,
+                controller.finishedDownloads.contains(download)
+            )
+        }
+        XCTAssertTrue(state.0)
+        XCTAssertTrue(state.1)
+        XCTAssertFalse(state.2)
+        XCTAssertTrue(state.3)
+    }
+
     private func awaitCompletionOrFailureWithTimeout(
         _ download: Downloadable,
         timeoutSeconds: Double = 1

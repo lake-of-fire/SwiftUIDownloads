@@ -13,7 +13,10 @@ private actor RetryAttemptExecutorStub {
         self.retryAfterSeconds = retryAfterSeconds
     }
 
-    func execute(download: Downloadable, session _: URLSession) async throws {
+    func execute(
+        download: Downloadable,
+        session _: URLSession
+    ) async throws -> DownloadTransferResult {
         attemptDates.append(Date())
 
         if remainingFailures > 0 {
@@ -40,6 +43,11 @@ private actor RetryAttemptExecutorStub {
             download.isFailed = false
             download.isFinishedDownloading = true
         }
+        return DownloadTransferResult(
+            destinationLocation: download.localDestination,
+            etag: nil,
+            lastModified: nil
+        )
     }
 
     func recordedAttemptDates() -> [Date] {

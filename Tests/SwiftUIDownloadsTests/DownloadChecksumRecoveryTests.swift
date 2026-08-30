@@ -17,7 +17,10 @@ private actor ChecksumRecoveryAttemptExecutor {
         self.payload = payload
     }
 
-    func execute(download: Downloadable, session _: URLSession) async throws {
+    func execute(
+        download: Downloadable,
+        session _: URLSession
+    ) async throws -> DownloadTransferResult {
         attemptCount += 1
         try FileManager.default.createDirectory(
             at: download.localDestination.deletingLastPathComponent(),
@@ -34,6 +37,11 @@ private actor ChecksumRecoveryAttemptExecutor {
             download.isFailed = false
             download.isFinishedDownloading = true
         }
+        return DownloadTransferResult(
+            destinationLocation: download.localDestination,
+            etag: nil,
+            lastModified: nil
+        )
     }
 
     func recordedAttemptCount() -> Int {
@@ -41,7 +49,139 @@ private actor ChecksumRecoveryAttemptExecutor {
     }
 }
 
+private actor EmptyCompressedAttemptExecutor {
+    func execute(
+        download: Downloadable,
+        session _: URLSession
+    ) async throws -> DownloadTransferResult {
+        try FileManager.default.createDirectory(
+            at: download.compressedFileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data().write(to: download.compressedFileURL, options: .atomic)
+        await MainActor.run {
+            download.downloadProgress = .completed(
+                destinationLocation: download.compressedFileURL,
+                etag: "empty-update",
+                error: nil
+            )
+            download.isActive = false
+            download.isFailed = false
+            download.isFinishedDownloading = true
+        }
+        return DownloadTransferResult(
+            destinationLocation: download.compressedFileURL,
+            etag: "empty-update",
+            lastModified: nil
+        )
+    }
+}
+
+private actor AsyncCompletionFlag {
+    private var completed = false
+
+    func markCompleted() { completed = true }
+    func value() -> Bool { completed }
+}
+
 final class DownloadChecksumRecoveryTests: XCTestCase {
+    func testZeroByteCompressedPayloadFailsInsteadOfAcceptingOldDestination() async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-zero-compressed-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let destination = tempDirectory.appendingPathComponent("payload.bin")
+        try Data("old-destination".utf8).write(to: destination)
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads-zero.test/payload.bin.br")!,
+            name: "Zero Compressed Payload",
+            localDestination: destination
+        )
+        try Data().write(to: download.compressedFileURL)
+
+        let controller = DownloadController()
+        await controller.finishDownload(download)
+
+        let state = await MainActor.run {
+            (
+                download.isFailed,
+                download.isFinishedDownloading,
+                download.isFinishedProcessing
+            )
+        }
+        XCTAssertTrue(state.0)
+        XCTAssertFalse(state.1)
+        XCTAssertTrue(state.2)
+        XCTAssertEqual(
+            try Data(contentsOf: destination),
+            Data("old-destination".utf8),
+            "A failed compressed update must preserve the previously usable file"
+        )
+    }
+
+    func testFailedCompressedReplacementPreservesSuccessfulDownloadBaseline()
+    async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-failed-baseline-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let destination = tempDirectory.appendingPathComponent("payload.bin")
+        try Data("previous-valid-payload".utf8).write(to: destination)
+        let download = Downloadable(
+            url: URL(
+                string: "https://swiftui-downloads-zero.test/\(UUID().uuidString).bin.br"
+            )!,
+            name: "Failed Replacement Baseline",
+            localDestination: destination
+        )
+        await download.waitForDownloadMetadata()
+        let previousSuccessfulDownload = Date(timeIntervalSince1970: 123)
+        await MainActor.run {
+            download.lastDownloaded = previousSuccessfulDownload
+        }
+
+        let attemptExecutor = EmptyCompressedAttemptExecutor()
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(
+                    download: download,
+                    session: session
+                )
+            }
+        )
+
+        await controller.download(download)
+        let completed = try await download.awaitCompletionOrFailure()
+        XCTAssertFalse(completed)
+
+        let state = await MainActor.run {
+            (download.lastDownloaded, download.lastDownloadedETag)
+        }
+        XCTAssertEqual(state.0, previousSuccessfulDownload)
+        XCTAssertNil(state.1)
+        XCTAssertEqual(
+            try Data(contentsOf: destination),
+            Data("previous-valid-payload".utf8)
+        )
+    }
+
     func testDeleteRemovesPayloadAndAllProcessingArtifacts() async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -222,7 +362,19 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
             }
         )
 
-        await controller.finishDownload(download)
+        let recoveryCompleted = expectation(
+            description: "checksum replacement finishes without re-entering its processor"
+        )
+        let completionFlag = AsyncCompletionFlag()
+        Task {
+            await controller.finishDownload(download)
+            await completionFlag.markCompleted()
+            recoveryCompleted.fulfill()
+        }
+        await fulfillment(of: [recoveryCompleted], timeout: 5)
+        guard await completionFlag.value() else {
+            return
+        }
         let isComplete = try await download.awaitCompletionOrFailure()
 
         XCTAssertTrue(isComplete)
