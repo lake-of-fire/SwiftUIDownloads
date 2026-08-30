@@ -1303,6 +1303,16 @@ public extension DownloadController {
         }
         return download
     }
+
+    /// Invalidates every local artifact and lifecycle flag for a download so
+    /// a caller that rejected the installed bytes can request one clean,
+    /// independently transferred replacement.
+    @DownloadActor
+    public func invalidateLocalArtifacts(
+        for download: Downloadable
+    ) async throws {
+        _ = try await delete(download: download)
+    }
     
     @MainActor
     func isDownloaded(url: URL) -> Bool {

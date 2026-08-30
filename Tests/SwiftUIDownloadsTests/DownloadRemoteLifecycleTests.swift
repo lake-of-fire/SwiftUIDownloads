@@ -215,7 +215,8 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
 
         await controller.download(download)
 
-        XCTAssertTrue(try await download.awaitCompletionOrFailure())
+        let didComplete = try await download.awaitCompletionOrFailure()
+        XCTAssertTrue(didComplete)
         XCTAssertEqual(
             try Data(contentsOf: destination),
             Data("get-response-payload".utf8)
@@ -277,7 +278,8 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         )
 
         await controller.ensureDownloaded(download: download)
-        XCTAssertTrue(try await download.awaitCompletionOrFailure())
+        let didComplete = try await download.awaitCompletionOrFailure()
+        XCTAssertTrue(didComplete)
         let installedRemoteModifiedAt = await MainActor.run {
             download.lastModifiedAt
         }
@@ -561,5 +563,74 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         }
         XCTAssertTrue(state.0)
         XCTAssertFalse(state.1)
+    }
+
+    func testInvalidateLocalArtifactsCancelsAndFencesOwnedTransfer() async throws {
+        let started = expectation(description: "request started")
+        let stopped = expectation(description: "request cancelled")
+        HangingDownloadURLProtocol.didStart = { started.fulfill() }
+        HangingDownloadURLProtocol.didStop = { stopped.fulfill() }
+        defer {
+            HangingDownloadURLProtocol.didStart = nil
+            HangingDownloadURLProtocol.didStop = nil
+        }
+
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-invalidate-owned-transfer-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingDownloadURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads-invalidate.test/payload.bin")!,
+            name: "Invalidate Owned Transfer",
+            localDestination: tempDirectory.appendingPathComponent("payload.bin")
+        )
+
+        let operation = Task {
+            await controller.download(download)
+        }
+        await fulfillment(of: [started], timeout: 2)
+
+        try await controller.invalidateLocalArtifacts(for: download)
+        await operation.value
+        await fulfillment(of: [stopped], timeout: 2)
+
+        let state = await MainActor.run {
+            (
+                controller.assuredDownloads.contains(download),
+                controller.activeDownloads.contains(download),
+                controller.finishedDownloads.contains(download),
+                controller.failedDownloads.contains(download),
+                download.isActive,
+                download.isFinishedDownloading,
+                download.isFinishedProcessing,
+                download.isFailed,
+                download.downloadProgress
+            )
+        }
+        XCTAssertFalse(state.0)
+        XCTAssertFalse(state.1)
+        XCTAssertFalse(state.2)
+        XCTAssertFalse(state.3)
+        XCTAssertFalse(state.4)
+        XCTAssertFalse(state.5)
+        XCTAssertFalse(state.6)
+        XCTAssertFalse(state.7)
+        if case .uninitiated = state.8 {
+            // The cancelled attempt did not republish terminal failure state.
+        } else {
+            XCTFail("An invalidated transfer must remain uninitiated")
+        }
     }
 }

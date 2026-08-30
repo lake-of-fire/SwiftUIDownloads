@@ -182,7 +182,7 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         )
     }
 
-    func testDeleteRemovesPayloadAndAllProcessingArtifacts() async throws {
+    func testInvalidateLocalArtifactsRemovesEveryArtifactAndResetsLifecycleState() async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "swiftui-downloads-delete-artifacts-\(UUID().uuidString)",
@@ -201,14 +201,18 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
             localDestination: destination,
             localDestinationChecksum: sha1Hex(Data("payload".utf8))
         )
-        let staging = destination.appendingPathExtension(
+        let firstStaging = destination.appendingPathExtension(
+            "decompressing.\(UUID().uuidString)"
+        )
+        let secondStaging = destination.appendingPathExtension(
             "decompressing.\(UUID().uuidString)"
         )
         for url in [
             destination,
             download.compressedFileURL,
             download.checksumVerificationMarkerURL,
-            staging,
+            firstStaging,
+            secondStaging,
         ] {
             try Data("artifact".utf8).write(to: url)
         }
@@ -216,31 +220,57 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         let controller = DownloadController()
         await MainActor.run {
             controller.assuredDownloads.insert(download)
+            controller.activeDownloads.insert(download)
             controller.finishedDownloads.insert(download)
+            controller.failedDownloads.insert(download)
+            download.isActive = true
+            download.isFinishedDownloading = true
+            download.isFinishedProcessing = true
+            download.isFailed = true
+            download.downloadProgress = .completed(
+                destinationLocation: destination,
+                etag: "installed-etag",
+                error: nil
+            )
         }
 
-        _ = try await controller.delete(download: download)
+        try await controller.invalidateLocalArtifacts(for: download)
 
         for url in [
             destination,
             download.compressedFileURL,
             download.checksumVerificationMarkerURL,
-            staging,
+            firstStaging,
+            secondStaging,
         ] {
             XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
         }
         let state = await MainActor.run {
             (
                 controller.assuredDownloads.contains(download),
+                controller.activeDownloads.contains(download),
                 controller.finishedDownloads.contains(download),
+                controller.failedDownloads.contains(download),
+                download.isActive,
+                download.isFinishedDownloading,
                 download.isFinishedProcessing,
-                download.isFailed
+                download.isFailed,
+                download.downloadProgress
             )
         }
         XCTAssertFalse(state.0)
         XCTAssertFalse(state.1)
         XCTAssertFalse(state.2)
         XCTAssertFalse(state.3)
+        XCTAssertFalse(state.4)
+        XCTAssertFalse(state.5)
+        XCTAssertFalse(state.6)
+        XCTAssertFalse(state.7)
+        if case .uninitiated = state.8 {
+            // Expected clean lifecycle state.
+        } else {
+            XCTFail("Invalidation must reset download progress")
+        }
     }
 
     func testVerifyingReadableFileWritesChecksumMarker() throws {
