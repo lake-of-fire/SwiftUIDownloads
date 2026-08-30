@@ -1308,7 +1308,7 @@ public extension DownloadController {
     /// a caller that rejected the installed bytes can request one clean,
     /// independently transferred replacement.
     @DownloadActor
-    public func invalidateLocalArtifacts(
+    func invalidateLocalArtifacts(
         for download: Downloadable
     ) async throws {
         _ = try await delete(download: download)
