@@ -432,8 +432,52 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
                 "markerExists": String(FileManager.default.fileExists(atPath: checksumVerificationMarkerURL.path))
             ]
         )
+        do {
+            try verifyChecksum(
+                of: localDestination,
+                expectedChecksum: expectedChecksum
+            )
+        } catch {
+            try? FileManager.default.removeItem(
+                at: checksumVerificationMarkerURL
+            )
+            throw error
+        }
+        try recordVerifiedLocalDestinationChecksum(expectedChecksum: expectedChecksum)
+    }
+
+    func ensureVerifiedChecksum(of candidateURL: URL) throws {
+        guard let expectedChecksum = localDestinationChecksum?.lowercased() else {
+            return
+        }
+        try verifyChecksum(of: candidateURL, expectedChecksum: expectedChecksum)
+    }
+
+    func recordVerifiedLocalDestinationChecksum(
+        checkingCancellation: Bool = true
+    ) throws {
+        guard let expectedChecksum = localDestinationChecksum?.lowercased() else {
+            return
+        }
+        try recordVerifiedLocalDestinationChecksum(
+            expectedChecksum: expectedChecksum,
+            checkingCancellation: checkingCancellation
+        )
+    }
+
+    private func verifyChecksum(
+        of fileURL: URL,
+        expectedChecksum: String
+    ) throws {
+        let fileAttributes = try FileManager.default.attributesOfItem(
+            atPath: fileURL.path
+        )
+        let fileSize = (fileAttributes[.size] as? NSNumber)?.uint64Value ?? 0
+        guard fileSize > 0 else {
+            throw DownloadableChecksumVerificationError.emptyFile(fileURL)
+        }
         let hashStartedAt = Date()
-        let actualChecksum = try sha1Checksum(for: localDestination)
+        let actualChecksum = try sha1Checksum(for: fileURL)
         logReaderOptimizationDiagnostic(
             "download.checksum.sha1Complete",
             [
@@ -442,19 +486,37 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             ]
         )
         guard actualChecksum == expectedChecksum else {
-            try? FileManager.default.removeItem(at: checksumVerificationMarkerURL)
             throw DownloadableChecksumVerificationError.mismatch(
                 expected: expectedChecksum,
                 actual: actualChecksum
             )
         }
+    }
 
+    private func recordVerifiedLocalDestinationChecksum(
+        expectedChecksum: String,
+        checkingCancellation: Bool = true
+    ) throws {
+        let startedAt = Date()
+        let fileAttributes = try FileManager.default.attributesOfItem(
+            atPath: localDestination.path
+        )
+        let fileSize = (fileAttributes[.size] as? NSNumber)?.uint64Value ?? 0
+        guard fileSize > 0 else {
+            throw DownloadableChecksumVerificationError.emptyFile(
+                localDestination
+            )
+        }
+        let modificationDate = (fileAttributes[.modificationDate] as? Date)
+            ?? Date(timeIntervalSince1970: 0)
         let marker = ChecksumVerificationMarker(
             expectedChecksum: expectedChecksum,
             fileSize: fileSize,
             modificationTimeIntervalSince1970: modificationDate.timeIntervalSince1970
         )
-        try Task.checkCancellation()
+        if checkingCancellation {
+            try Task.checkCancellation()
+        }
         let data = try JSONEncoder().encode(marker)
         try data.write(to: checksumVerificationMarkerURL, options: .atomic)
         logReaderOptimizationDiagnostic(
@@ -523,9 +585,11 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     }
     
     @DownloadActor
-    func download(session: URLSession) async -> URLResourceDownloadTask {
+    func download(
+        session: URLSession,
+        destination: URL
+    ) async -> URLResourceDownloadTask {
         let observationGeneration = beginDownloadObservation()
-        let destination = url.pathExtension == "br" ? compressedFileURL : localDestination
         let task = URLResourceDownloadTask(session: session, url: url, destination: destination)
         
         task.publisher.receive(on: DispatchQueue.main).sink(
@@ -587,6 +651,18 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         // The controller installs its terminal waiter before resuming this
         // task. A PassthroughSubject does not replay a fast completion.
         return task
+    }
+
+    func uncompressedTransferStagingURL(operationID: UUID) -> URL {
+        let pathExtension = localDestination.pathExtension
+        let baseName = pathExtension.isEmpty
+            ? localDestination.lastPathComponent
+            : localDestination.deletingPathExtension().lastPathComponent
+        let suffix = pathExtension.isEmpty ? "" : ".\(pathExtension)"
+        return localDestination.deletingLastPathComponent()
+            .appendingPathComponent(
+                "\(baseName).downloading.\(operationID.uuidString)\(suffix)"
+            )
     }
 
     private func beginDownloadObservation() -> UUID {
@@ -979,6 +1055,7 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     private var processingTasks = [String: ProcessingTaskRecord]()
     private var checksumRecoveryTasks = [String: ProcessingTaskRecord]()
     private var downloadAttemptIDs = [String: UUID]()
+    private var activeTransferStagingURLs = Set<URL>()
     private var checksumRecoveriesReadyForProcessing = Set<String>()
     private var checksumRedownloadAttempted = Set<String>()
     private let session: URLSession
@@ -1210,6 +1287,7 @@ public extension DownloadController {
         var saveFiles = Set(retainedDownloads.map(\.localDestination))
             .union(Set(retainedDownloads.map(\.compressedFileURL)))
             .union(Set(retainedDownloads.map(\.checksumVerificationMarkerURL)))
+            .union(activeTransferStagingURLs)
         for download in retainedDownloads {
             if let processingTaskID = processingTasks[download.id]?.id {
                 saveFiles.insert(
@@ -1289,7 +1367,11 @@ public extension DownloadController {
         }
 
         clearDownloadStatusObservers(forDownloadID: download.id)
-        try removeAllLocalArtifacts(for: download, includingDestination: true)
+        try removeAllLocalArtifacts(
+            for: download,
+            includingDestination: true,
+            preservingActiveTransfers: false
+        )
         await MainActor.run {
             assuredDownloads = assuredDownloads.filter { $0.url != download.url }
             finishedDownloads = finishedDownloads.filter { $0.url != download.url }
@@ -1399,23 +1481,42 @@ extension DownloadController {
             return try await attemptExecutor(download, session)
         }
 
-        let task = await download.download(session: session)
-        return try await withTaskCancellationHandler(operation: {
-            try await withCheckedThrowingContinuation { continuation in
-                let waiter = DownloadAttemptTerminalWaiter(
-                    url: download.url,
-                    lastModified: { task.responseLastModified },
-                    continuation: continuation
-                )
-                waiter.subscribe(to: task.publisher)
-                task.resume()
-                if Task.isCancelled {
-                    task.cancel()
+        // Keep uncompressed bytes out of the installed location until the
+        // processing owner has checked size/checksum and completed import.
+        let transferDestination = download.url.pathExtension == "br"
+            ? download.compressedFileURL
+            : download.uncompressedTransferStagingURL(operationID: UUID())
+        let isUncompressedStaging = transferDestination != download.compressedFileURL
+        if isUncompressedStaging {
+            activeTransferStagingURLs.insert(transferDestination)
+        }
+        try? FileManager.default.removeItemIfPresent(at: transferDestination)
+        let task = await download.download(
+            session: session,
+            destination: transferDestination
+        )
+        do {
+            return try await withTaskCancellationHandler(operation: {
+                try await withCheckedThrowingContinuation { continuation in
+                    let waiter = DownloadAttemptTerminalWaiter(
+                        url: download.url,
+                        lastModified: { task.responseLastModified },
+                        continuation: continuation
+                    )
+                    waiter.subscribe(to: task.publisher)
+                    task.resume()
+                    if Task.isCancelled {
+                        task.cancel()
+                    }
                 }
-            }
-        }, onCancel: {
-            task.cancel()
-        })
+            }, onCancel: {
+                task.cancel()
+            })
+        } catch {
+            activeTransferStagingURLs.remove(transferDestination)
+            try? FileManager.default.removeItemIfPresent(at: transferDestination)
+            throw error
+        }
     }
 
     @MainActor
@@ -1504,11 +1605,13 @@ extension DownloadController {
             remoteModifiedAt: remoteModifiedAt,
             downloadAttemptID: downloadAttemptID
         ) {
-            await finishDownload(
+            await finishDownloadedFile(
                 download,
                 etag: transferResult.etag,
                 remoteModifiedAt: transferResult.lastModified,
-                updatesRemoteModifiedAt: updatesRemoteModifiedAt
+                updatesRemoteModifiedAt: updatesRemoteModifiedAt,
+                transferredFileURL: transferResult.destinationLocation,
+                expectedDownloadAttemptID: downloadAttemptID
             )
         }
     }
@@ -1556,12 +1659,31 @@ extension DownloadController {
                     at: download.localDestination.deletingLastPathComponent(),
                     withIntermediateDirectories: true
                 )
-                if FileManager.default.fileExists(atPath: download.localDestination.path) {
-                    try FileManager.default.removeItemIfPresent(at: download.localDestination)
+                let transferDestination = download.url.pathExtension == "br"
+                    ? download.compressedFileURL
+                    : download.uncompressedTransferStagingURL(operationID: UUID())
+                let isUncompressedStaging =
+                    transferDestination != download.compressedFileURL
+                if isUncompressedStaging {
+                    activeTransferStagingURLs.insert(transferDestination)
                 }
-                try FileManager.default.copyItem(at: download.url, to: download.localDestination)
+                try FileManager.default.removeItemIfPresent(at: transferDestination)
+                do {
+                    try FileManager.default.copyItem(
+                        at: download.url,
+                        to: transferDestination
+                    )
+                } catch {
+                    if isUncompressedStaging {
+                        activeTransferStagingURLs.remove(transferDestination)
+                    }
+                    try? FileManager.default.removeItemIfPresent(
+                        at: transferDestination
+                    )
+                    throw error
+                }
                 return DownloadTransferResult(
-                    destinationLocation: download.localDestination,
+                    destinationLocation: transferDestination,
                     etag: etag,
                     lastModified: remoteModifiedAt
                 )
@@ -1653,6 +1775,15 @@ extension DownloadController {
         }
 
         guard downloadAttemptIDs[download.id] == downloadAttemptID else {
+            if let transferResult,
+               transferResult.destinationLocation != download.compressedFileURL {
+                activeTransferStagingURLs.remove(
+                    transferResult.destinationLocation
+                )
+                try? FileManager.default.removeItemIfPresent(
+                    at: transferResult.destinationLocation
+                )
+            }
             return nil
         }
         download.invalidateDownloadObservation()
@@ -1682,12 +1813,10 @@ extension DownloadController {
             clearDownloadStatusObservers(forDownloadID: download.id)
             return nil
         } else {
-            await MainActor.run {
-                download.finishedDownloadingDuringCurrentLaunchAt = Date()
-                download.isFailed = false
-                download.isActive = false
-                download.isFinishedDownloading = true
-            }
+            // Keep transfer completion internal until validation/import and
+            // installation finish. Publishing an intermediate success would
+            // require an actor hop after the ownership check, allowing delete
+            // to invalidate the attempt before stale UI state is written.
             return transferResult
         }
     }
@@ -1798,7 +1927,8 @@ extension DownloadController {
     @DownloadActor
     private func removeAllLocalArtifacts(
         for download: Downloadable,
-        includingDestination: Bool
+        includingDestination: Bool,
+        preservingActiveTransfers: Bool = true
     ) throws {
         if includingDestination {
             try FileManager.default.removeItemIfPresent(
@@ -1818,12 +1948,24 @@ extension DownloadController {
         }
         let stagingPrefix = download.localDestination.lastPathComponent
             + ".decompressing."
+        let transferStagingPrefix = download.localDestination
+            .deletingPathExtension().lastPathComponent + ".downloading."
         let children = try FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: nil
         )
         for child in children
-            where child.lastPathComponent.hasPrefix(stagingPrefix) {
+            where child.lastPathComponent.hasPrefix(stagingPrefix)
+                || child.lastPathComponent.hasPrefix(transferStagingPrefix) {
+            // A cancelled older processor must not remove a candidate owned
+            // by a newer transfer admitted while cancellation was unwinding.
+            guard !preservingActiveTransfers
+                    || !activeTransferStagingURLs.contains(child) else {
+                continue
+            }
+            if !preservingActiveTransfers {
+                activeTransferStagingURLs.remove(child)
+            }
             try FileManager.default.removeItemIfPresent(at: child)
         }
     }
@@ -1836,12 +1978,60 @@ extension DownloadController {
         updatesRemoteModifiedAt: Bool = false,
         recordSuccessfulDownload: Bool = true
     ) async {
+        await finishDownloadedFile(
+            download,
+            etag: etag,
+            remoteModifiedAt: remoteModifiedAt,
+            updatesRemoteModifiedAt: updatesRemoteModifiedAt,
+            recordSuccessfulDownload: recordSuccessfulDownload,
+            transferredFileURL: nil
+        )
+    }
+
+    @DownloadActor
+    private func finishDownloadedFile(
+        _ download: Downloadable,
+        etag: String? = nil,
+        remoteModifiedAt: Date? = nil,
+        updatesRemoteModifiedAt: Bool = false,
+        recordSuccessfulDownload: Bool = true,
+        transferredFileURL: URL?,
+        expectedDownloadAttemptID: UUID? = nil
+    ) async {
+        if let expectedDownloadAttemptID,
+           downloadAttemptIDs[download.id] != expectedDownloadAttemptID {
+            if let transferredFileURL,
+               transferredFileURL != download.localDestination,
+               transferredFileURL != download.compressedFileURL {
+                activeTransferStagingURLs.remove(transferredFileURL)
+                try? FileManager.default.removeItemIfPresent(
+                    at: transferredFileURL
+                )
+            }
+            return
+        }
         if checksumRecoveryTasks[download.id] != nil,
            !checksumRecoveriesReadyForProcessing.contains(download.id) {
+            if let transferredFileURL,
+               transferredFileURL != download.localDestination,
+               transferredFileURL != download.compressedFileURL {
+                activeTransferStagingURLs.remove(transferredFileURL)
+                try? FileManager.default.removeItemIfPresent(
+                    at: transferredFileURL
+                )
+            }
             return
         }
         if let existingTask = processingTasks[download.id]?.task {
             await existingTask.value
+            if let transferredFileURL,
+               transferredFileURL != download.localDestination,
+               transferredFileURL != download.compressedFileURL {
+                activeTransferStagingURLs.remove(transferredFileURL)
+                try? FileManager.default.removeItemIfPresent(
+                    at: transferredFileURL
+                )
+            }
             return
         }
 
@@ -1854,6 +2044,7 @@ extension DownloadController {
                 remoteModifiedAt: remoteModifiedAt,
                 updatesRemoteModifiedAt: updatesRemoteModifiedAt,
                 recordSuccessfulDownload: recordSuccessfulDownload,
+                transferredFileURL: transferredFileURL,
                 processingTaskID: processingTaskID
             )
         }
@@ -1931,11 +2122,12 @@ extension DownloadController {
             }
             if let transferResult {
                 checksumRecoveriesReadyForProcessing.insert(download.id)
-                await finishDownload(
+                await finishDownloadedFile(
                     download,
                     etag: transferResult.etag,
                     remoteModifiedAt: transferResult.lastModified,
-                    updatesRemoteModifiedAt: updatesRemoteModifiedAt
+                    updatesRemoteModifiedAt: updatesRemoteModifiedAt,
+                    transferredFileURL: transferResult.destinationLocation
                 )
             }
             _ = try? await download.awaitCompletionOrFailure()
@@ -1956,7 +2148,8 @@ extension DownloadController {
         _ download: Downloadable,
         etag: String?,
         remoteModifiedAt: Date? = nil,
-        updatesRemoteModifiedAt: Bool = false
+        updatesRemoteModifiedAt: Bool = false,
+        preserveInstalledDestination: Bool = false
     ) async -> DownloadTransferResult? {
         checksumRedownloadAttempted.insert(download.id)
         await MainActor.run { [weak self] in
@@ -1973,15 +2166,19 @@ extension DownloadController {
             download.isFinishedProcessing = false
         }
         guard !Task.isCancelled else { return nil }
-        try? FileManager.default.removeItemIfPresent(
-            at: download.localDestination
-        )
+        if !preserveInstalledDestination {
+            try? FileManager.default.removeItemIfPresent(
+                at: download.localDestination
+            )
+        }
         try? FileManager.default.removeItemIfPresent(
             at: download.compressedFileURL
         )
-        try? FileManager.default.removeItemIfPresent(
-            at: download.checksumVerificationMarkerURL
-        )
+        if !preserveInstalledDestination {
+            try? FileManager.default.removeItemIfPresent(
+                at: download.checksumVerificationMarkerURL
+            )
+        }
         clearDownloadStatusObservers(forDownloadID: download.id)
         guard !Task.isCancelled else { return nil }
         if let owningAttemptID = downloadAttemptIDs[download.id] {
@@ -2015,10 +2212,25 @@ extension DownloadController {
         remoteModifiedAt: Date? = nil,
         updatesRemoteModifiedAt: Bool = false,
         recordSuccessfulDownload: Bool,
+        transferredFileURL: URL? = nil,
         processingTaskID: UUID
     ) async {
         await download.waitForDownloadMetadata()
+        let stagedUncompressedFileURL = transferredFileURL.flatMap { url in
+            url != download.localDestination && url != download.compressedFileURL
+                ? url
+                : nil
+        }
+        if let stagedUncompressedFileURL {
+            activeTransferStagingURLs.insert(stagedUncompressedFileURL)
+        }
         defer {
+            if let stagedUncompressedFileURL {
+                activeTransferStagingURLs.remove(stagedUncompressedFileURL)
+                try? FileManager.default.removeItemIfPresent(
+                    at: stagedUncompressedFileURL
+                )
+            }
             clearProcessingTask(forDownloadID: download.id, processingTaskID: processingTaskID)
         }
 
@@ -2059,14 +2271,16 @@ extension DownloadController {
             // Confirm non-empty. Filesystem/stat failures remain ordinary
             // processing errors; only a successfully observed zero-byte file
             // is classified as deterministic local corruption.
+            let processingFileURL = stagedUncompressedFileURL
+                ?? download.localDestination
             let resourceValues: URLResourceValues
             do {
-                resourceValues = try download.localDestination.resourceValues(
+                resourceValues = try processingFileURL.resourceValues(
                     forKeys: [.fileSizeKey]
                 )
             } catch {
                 throw DownloadLocalFileInspectionError(
-                    url: download.localDestination,
+                    url: processingFileURL,
                     underlyingError: error
                 )
             }
@@ -2078,14 +2292,18 @@ extension DownloadController {
                     return
                 }
                 throw DownloadableChecksumVerificationError.emptyFile(
-                    download.localDestination
+                    processingFileURL
                 )
             }
 
             let verifyStartedAt = Date()
             try Task.checkCancellation()
             let checksumTask = Task.detached(priority: .utility) {
-                try download.ensureVerifiedLocalDestinationChecksum()
+                if stagedUncompressedFileURL != nil {
+                    try download.ensureVerifiedChecksum(of: processingFileURL)
+                } else {
+                    try download.ensureVerifiedLocalDestinationChecksum()
+                }
             }
             try await withTaskCancellationHandler(operation: {
                 try await checksumTask.value
@@ -2115,12 +2333,64 @@ extension DownloadController {
                         }
                     }
                 }
-                try await importable.importHandler(download.localDestination, progressHandler)
+                try await importable.importHandler(processingFileURL, progressHandler)
                 try Task.checkCancellation()
                 importElapsed = Date().timeIntervalSince(importStartedAt)
-                if importable.deleteAfterImport {
-                    try? FileManager.default.removeItem(at: download.localDestination)
+            }
+
+            if let stagedUncompressedFileURL {
+                try Task.checkCancellation()
+                guard processingTasks[download.id]?.id == processingTaskID else {
+                    throw CancellationError()
                 }
+                // This synchronous block is the install linearization point.
+                // No suspension occurs between the last ownership check and
+                // replacement of the previously usable artifact.
+                if let importable = download as? ImportableDownloadable,
+                   importable.deleteAfterImport {
+                    try? FileManager.default.removeItemIfPresent(
+                        at: download.localDestination
+                    )
+                    try? FileManager.default.removeItemIfPresent(
+                        at: download.checksumVerificationMarkerURL
+                    )
+                } else {
+                    do {
+                        try FileManager.default.createDirectory(
+                            at: download.localDestination
+                                .deletingLastPathComponent(),
+                            withIntermediateDirectories: true
+                        )
+                        if FileManager.default.fileExists(
+                            atPath: download.localDestination.path
+                        ) {
+                            _ = try FileManager.default.replaceItemAt(
+                                download.localDestination,
+                                withItemAt: stagedUncompressedFileURL
+                            )
+                        } else {
+                            try FileManager.default.moveItem(
+                                at: stagedUncompressedFileURL,
+                                to: download.localDestination
+                            )
+                        }
+                    } catch {
+                        throw URLResourceDownloadInstallError
+                            .destinationInstallFailed(
+                                destination: download.localDestination,
+                                underlyingError: error
+                            )
+                    }
+                    try? FileManager.default.removeItemIfPresent(
+                        at: download.checksumVerificationMarkerURL
+                    )
+                    try download.recordVerifiedLocalDestinationChecksum(
+                        checkingCancellation: false
+                    )
+                }
+            } else if let importable = download as? ImportableDownloadable,
+                      importable.deleteAfterImport {
+                try? FileManager.default.removeItem(at: download.localDestination)
             }
 //              print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
             
@@ -2170,7 +2440,8 @@ extension DownloadController {
                     download,
                     etag: etag,
                     remoteModifiedAt: remoteModifiedAt,
-                    updatesRemoteModifiedAt: updatesRemoteModifiedAt
+                    updatesRemoteModifiedAt: updatesRemoteModifiedAt,
+                    preserveInstalledDestination: stagedUncompressedFileURL != nil
                 )
                 if !Task.isCancelled, let transferResult {
                     // This processor owns the checksum-recovery attempt from
@@ -2182,6 +2453,7 @@ extension DownloadController {
                         remoteModifiedAt: transferResult.lastModified,
                         updatesRemoteModifiedAt: updatesRemoteModifiedAt,
                         recordSuccessfulDownload: true,
+                        transferredFileURL: transferResult.destinationLocation,
                         processingTaskID: processingTaskID
                     )
                 } else {
@@ -2194,7 +2466,8 @@ extension DownloadController {
                 if processingTasks[download.id]?.id == processingTaskID {
                     try? removeAllLocalArtifacts(
                         for: download,
-                        includingDestination: download.localDestinationChecksum != nil
+                        includingDestination: stagedUncompressedFileURL == nil
+                            && download.localDestinationChecksum != nil
                             && !download.hasVerifiedLocalDestinationChecksumMarker()
                     )
                 }
@@ -2240,12 +2513,14 @@ extension DownloadController {
                     : (download as? ImportableDownloadable)?.deleteAfterImport
                         ?? true
                 try? FileManager.default.removeItem(at: download.compressedFileURL)
-                if shouldDeleteLocal {
+                if shouldDeleteLocal && stagedUncompressedFileURL == nil {
                     try? FileManager.default.removeItem(at: download.localDestination)
                 }
-                try? FileManager.default.removeItem(
-                    at: download.checksumVerificationMarkerURL
-                )
+                if stagedUncompressedFileURL == nil {
+                    try? FileManager.default.removeItem(
+                        at: download.checksumVerificationMarkerURL
+                    )
+                }
             }
             clearDownloadStatusObservers(forDownloadID: download.id)
         }

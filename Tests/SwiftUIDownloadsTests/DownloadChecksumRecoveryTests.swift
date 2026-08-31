@@ -9,6 +9,35 @@ private func sha1Hex(_ data: Data) -> String {
         .joined()
 }
 
+private final class CorruptUncompressedUpdateURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["ETag": "corrupt-update"]
+        )!
+        client?.urlProtocol(
+            self,
+            didReceive: response,
+            cacheStoragePolicy: .notAllowed
+        )
+        client?.urlProtocol(self, didLoad: Data("corrupt-update".utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private enum TestImportError: Error {
+    case rejectedCandidate
+}
+
 private actor ChecksumRecoveryAttemptExecutor {
     private(set) var attemptCount = 0
     private let payload: Data
@@ -85,6 +114,115 @@ private actor AsyncCompletionFlag {
 }
 
 final class DownloadChecksumRecoveryTests: XCTestCase {
+    func testCorruptUncompressedUpdatePreservesInstalledDestination()
+    async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-staged-checksum-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let installedPayload = Data("previous-valid-payload".utf8)
+        let destination = tempDirectory.appendingPathComponent("payload.bin")
+        try installedPayload.write(to: destination, options: .atomic)
+        let download = Downloadable(
+            url: URL(
+                string: "https://swiftui-downloads-staged.test/payload.bin"
+            )!,
+            name: "Staged Checksum Update",
+            localDestination: destination,
+            localDestinationChecksum: sha1Hex(installedPayload)
+        )
+        try download.ensureVerifiedLocalDestinationChecksum()
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [
+            CorruptUncompressedUpdateURLProtocol.self
+        ]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+
+        await controller.download(download)
+
+        let completed = try await download.awaitCompletionOrFailure()
+        XCTAssertFalse(completed)
+        XCTAssertEqual(try Data(contentsOf: destination), installedPayload)
+        XCTAssertTrue(
+            download.hasVerifiedLocalDestinationChecksumMarker(),
+            "A rejected candidate must not invalidate the installed baseline"
+        )
+        let remainingFiles = try FileManager.default.contentsOfDirectory(
+            at: tempDirectory,
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertFalse(remainingFiles.contains { url in
+            url.lastPathComponent.hasPrefix("payload.downloading.")
+        })
+    }
+
+    func testRejectedUncompressedImportPreservesInstalledDestination()
+    async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-staged-import-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let installedPayload = Data("previous-importable-payload".utf8)
+        let destination = tempDirectory.appendingPathComponent("payload.bin")
+        try installedPayload.write(to: destination, options: .atomic)
+        let download = ImportableDownloadable(
+            url: URL(
+                string: "https://swiftui-downloads-staged.test/import.bin"
+            )!,
+            name: "Staged Import Update",
+            localDestination: destination,
+            deleteAfterImport: false,
+            isImported: { false },
+            importHandler: { candidateURL, _ in
+                XCTAssertEqual(
+                    try Data(contentsOf: candidateURL),
+                    Data("corrupt-update".utf8)
+                )
+                XCTAssertEqual(
+                    try Data(contentsOf: destination),
+                    installedPayload,
+                    "The installed file must remain readable during import"
+                )
+                throw TestImportError.rejectedCandidate
+            }
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [
+            CorruptUncompressedUpdateURLProtocol.self
+        ]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+
+        await controller.download(download)
+
+        let completed = try await download.awaitCompletionOrFailure()
+        XCTAssertFalse(completed)
+        XCTAssertEqual(try Data(contentsOf: destination), installedPayload)
+        let importError = await MainActor.run { download.lastImportError }
+        guard let importError else {
+            return XCTFail("Expected the rejected candidate error")
+        }
+        XCTAssertTrue(importError is TestImportError)
+    }
+
     func testZeroByteCompressedPayloadFailsInsteadOfAcceptingOldDestination() async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
