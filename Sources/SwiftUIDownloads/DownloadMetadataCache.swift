@@ -189,7 +189,8 @@ final class DownloadMetadataCache: @unchecked Sendable {
         mutation: (inout DownloadMetadata, _ isStoredFieldKnown: Bool) -> Bool
     ) {
         let shouldStartSaveTask: Bool? = withLock {
-            guard mutation(&metadata, knownStoredFields.contains(field)) else { return nil }
+            let changed = mutation(&metadata, knownStoredFields.contains(field))
+            guard changed || (latestSaveError != nil && !dirtyFields.isEmpty) else { return nil }
             mutationRevision &+= 1
             dirtyFields.insert(field)
             latestSaveError = nil

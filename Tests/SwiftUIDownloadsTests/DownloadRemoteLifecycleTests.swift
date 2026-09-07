@@ -188,6 +188,34 @@ private actor SuccessfulRemoteAttemptExecutor {
 }
 
 final class DownloadRemoteLifecycleTests: XCTestCase {
+    @MainActor
+    func testFilteredCancellationLeavesOtherSessionTransfersRunning() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingDownloadURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let started = expectation(description: "Both transfers started")
+        started.expectedFulfillmentCount = 2
+        HangingDownloadURLProtocol.didStart = { started.fulfill() }
+        defer { HangingDownloadURLProtocol.didStart = nil }
+        let firstURL = URL(string: "https://cancellation.test/first")!
+        let secondURL = URL(string: "https://cancellation.test/second")!
+        let first = session.dataTask(with: firstURL)
+        let second = session.dataTask(with: secondURL)
+        first.taskDescription = firstURL.absoluteString
+        second.taskDescription = secondURL.absoluteString
+        first.resume()
+        second.resume()
+        await fulfillment(of: [started], timeout: 2)
+
+        await controller.cancelInProgressDownloads(matchingDownloadURL: firstURL)
+        XCTAssertNotEqual(first.state, .running)
+        XCTAssertEqual(second.state, .running)
+        await controller.cancelInProgressDownloads()
+        XCTAssertNotEqual(second.state, .running)
+    }
+
     func testProductionGETHandsResponseValidatorsToInstalledArtifact()
     async throws {
         let tempDirectory = FileManager.default.temporaryDirectory

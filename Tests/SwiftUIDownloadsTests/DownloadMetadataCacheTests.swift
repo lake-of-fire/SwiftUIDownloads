@@ -224,6 +224,24 @@ final class DownloadMetadataCacheTests: XCTestCase {
     }
 
     @MainActor
+    func testIdenticalAssignmentRetriesFailedSave() async throws {
+        let store = RecordingDownloadMetadataStore(metadata: DownloadMetadata(), saveFailureCount: 1)
+        let download = Downloadable(
+            url: URL(string: "https://example.com/retry-identical.zip")!, name: "Retry",
+            localDestination: URL(fileURLWithPath: "/tmp/retry-identical.zip"), metadataStore: store
+        )
+        await download.waitForDownloadMetadata()
+        download.lastDownloadedETag = "new"
+        do {
+            try await download.waitForDownloadMetadataPersistence()
+            XCTFail("Expected initial save to fail")
+        } catch is DownloadMetadataPersistenceError { }
+        download.lastDownloadedETag = "new"
+        try await download.waitForDownloadMetadataPersistence()
+        XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "new")
+    }
+
+    @MainActor
     func testAssigningLoadedValuesDoesNotSchedulePersistence() async throws {
         let checkedAt = Date(timeIntervalSince1970: 100)
         let store = RecordingDownloadMetadataStore(

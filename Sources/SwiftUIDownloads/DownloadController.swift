@@ -1929,7 +1929,11 @@ extension DownloadController {
     @MainActor
     public func cancelInProgressDownloads(matchingDownloadURL downloadURL: URL? = nil) async {
         let allTasks = await session.allTasks
-        for (task, download) in allTasks.map({ task in
+        let matchingTasks = allTasks.filter { task in
+            guard let downloadURL else { return true }
+            return task.taskDescription == downloadURL.absoluteString
+        }
+        for (task, download) in matchingTasks.map({ task in
             let download = assuredDownloads.first(where: {
                 if let downloadURL = downloadURL, $0.url != downloadURL {
                     return false
