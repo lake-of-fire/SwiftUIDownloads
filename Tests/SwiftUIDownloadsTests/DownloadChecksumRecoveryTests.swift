@@ -174,8 +174,10 @@ private actor SequencedCompressedAttemptExecutor {
     private(set) var attemptCount = 0
     private let compressedPayloads: [Data]
 
-    init(payloads: [Data]) throws {
-        compressedPayloads = try payloads.map { payload in
+    private let cancelAfterAttempt: Int?
+
+    init(payloads: [Data], cancelAfterAttempt: Int? = nil) throws {
+        self.cancelAfterAttempt = cancelAfterAttempt        compressedPayloads = try payloads.map { payload in
             guard let compressed = (payload as NSData).brotliCompressed() else {
                 throw CocoaError(.fileWriteUnknown)
             }
@@ -200,7 +202,10 @@ private actor SequencedCompressedAttemptExecutor {
             to: candidateURL,
             options: .atomic
         )
-        return DownloadTransferResult(
+
+        if attemptCount == cancelAfterAttempt {
+            withUnsafeCurrentTask { $0?.cancel() }
+        }        return DownloadTransferResult(
             destinationLocation: candidateURL,
             etag: "compressed-candidate-\(attemptCount)",
             lastModified: nil
@@ -218,6 +223,52 @@ private actor AsyncCompletionFlag {
 }
 
 final class DownloadChecksumRecoveryTests: XCTestCase {
+
+    func testEmptyCompressedReplacementCannotInheritPriorImportSuccess() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-empty-replacement-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("payload.bin")
+        let priorPayload = Data("already-imported-version".utf8)
+        try priorPayload.write(to: destination)
+        let importCalled = AsyncCompletionFlag()
+        let download = ImportableDownloadable(
+            url: URL(string: "https://download-empty.test/\(UUID().uuidString).br")!,
+            name: "Empty replacement",
+            localDestination: destination,
+            deleteAfterImport: false,
+            isImported: { true },
+            importHandler: { _, _ in await importCalled.markCompleted() }
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            let candidate = download.compressedTransferStagingURL(operationID: UUID())
+            // A complete Brotli stream encoding an empty body, not a truncated file.
+            try Data([0x3b]).write(to: candidate)
+            return DownloadTransferResult(destinationLocation: candidate, etag: "empty", lastModified: nil)
+        })
+
+        await controller.download(download)
+
+        let state = await MainActor.run {
+            (download.isFailed, download.isFinishedDownloading, download.lastImportError)
+        }
+        XCTAssertTrue(state.0)
+        XCTAssertFalse(state.1)
+        guard let error = state.2 as? DownloadableChecksumVerificationError,
+              case let .emptyFile(candidate) = error else {
+            XCTFail("Expected empty expanded candidate rejection, got \(String(describing: state.2))")
+            return
+        }
+        XCTAssertNotEqual(candidate, destination)
+        XCTAssertEqual(candidate.deletingLastPathComponent(), directory)
+        XCTAssertEqual(try Data(contentsOf: destination), priorPayload)
+        let didImport = await importCalled.value()
+        XCTAssertFalse(didImport)
+    }
     func testCorruptUncompressedUpdatePreservesInstalledDestination()
     async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
@@ -266,8 +317,8 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
             includingPropertiesForKeys: nil
         )
         XCTAssertFalse(remainingFiles.contains { url in
-            url.lastPathComponent.hasPrefix("payload.downloading.")
-        })
+
+            url.lastPathComponent.contains(".downloading.")        })
     }
 
     func testRejectedUncompressedImportPreservesInstalledDestination()
@@ -504,6 +555,52 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         })
     }
 
+
+    func testCancellationAfterCleanCompressedRetryReturnsDiscardsCandidateAndPublishesFailure() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("download-retry-return-cancel-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = Data("previous-valid-install".utf8)
+        let destination = directory.appendingPathComponent("payload.bin")
+        try payload.write(to: destination, options: .atomic)
+        let download = Downloadable(
+            url: URL(string: "https://download-retry-return.test/\(UUID().uuidString).br")!,
+            name: "Cancelled clean retry",
+            localDestination: destination,
+            localDestinationChecksum: sha1Hex(payload)
+        )
+        try download.ensureVerifiedLocalDestinationChecksum()
+        let executor = try SequencedCompressedAttemptExecutor(
+            payloads: [Data("wrong-checksum".utf8), payload],
+            cancelAfterAttempt: 2
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await executor.execute(download: download, session: session)
+            }
+        )
+
+        await controller.download(download)
+
+        let attempts = await executor.recordedAttemptCount()
+        XCTAssertEqual(attempts, 2)
+        let state = await MainActor.run {
+            (download.isFailed, download.isFinishedProcessing, controller.failedDownloads.contains(download))
+        }
+        XCTAssertTrue(state.0)
+        XCTAssertFalse(state.1)
+        XCTAssertTrue(state.2)
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        let remainingFiles = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        XCTAssertFalse(remainingFiles.contains {
+            $0.lastPathComponent.contains(".downloading.") || $0.lastPathComponent.contains(".decompressing.")
+        })
+    }
     func testRejectedCompressedImportPreservesInstalledDestination()
     async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
@@ -957,6 +1054,34 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
     }
 
+
+    func testSameSizeReplacementWithIdenticalModificationTimeCannotReuseChecksumMarker() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("download-marker-inode-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("payload.bin")
+        let payload = Data("verified".utf8)
+        try payload.write(to: destination, options: .atomic)
+        let download = Downloadable(
+            url: URL(string: "https://download-marker.test/\(UUID().uuidString)")!,
+            name: "Exact marker identity",
+            localDestination: destination,
+            localDestinationChecksum: sha1Hex(payload)
+        )
+        try download.ensureVerifiedLocalDestinationChecksum()
+        let original = try FileManager.default.attributesOfItem(atPath: destination.path)
+        let modificationDate = try XCTUnwrap(original[.modificationDate] as? Date)
+        try Data("replaced".utf8).write(to: destination, options: .atomic)
+        try FileManager.default.setAttributes([.modificationDate: modificationDate], ofItemAtPath: destination.path)
+        let replacement = try FileManager.default.attributesOfItem(atPath: destination.path)
+        XCTAssertEqual(replacement[.size] as? NSNumber, original[.size] as? NSNumber)
+        XCTAssertEqual(replacement[.modificationDate] as? Date, modificationDate)
+        XCTAssertNotEqual(replacement[.systemFileNumber] as? NSNumber, original[.systemFileNumber] as? NSNumber)
+
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertThrowsError(try download.ensureVerifiedLocalDestinationChecksum())
+    }
     func testEmptyLocalFileRequiresCleanRedownload() throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -1012,9 +1137,21 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         )
         try download.ensureVerifiedLocalDestinationChecksum()
 
+        let abandonedTransferURL = download.compressedTransferStagingURL(operationID: UUID())
+        let abandonedExpansionURL = destinationURL.appendingPathExtension("decompressing.\(UUID().uuidString)")
+        try Data("abandoned transfer".utf8).write(to: abandonedTransferURL)
+        try Data("abandoned expansion".utf8).write(to: abandonedExpansionURL)
+        // Reconstruct both owners as a later launch would, retaining only the
+        // installed artifact and its on-disk verification marker.
+        let reopenedDownload = Downloadable(
+            url: download.url,
+            name: download.name,
+            localDestination: destinationURL,
+            localDestinationChecksum: sha1Hex(payload)
+        )
         let controller = DownloadController()
         await MainActor.run { () -> Void in
-            controller.assuredDownloads.insert(download)
+            controller.assuredDownloads.insert(reopenedDownload)
         }
 
         try await controller.deleteOrphanFiles(in: [directory])
@@ -1022,6 +1159,9 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: destinationURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: download.checksumVerificationMarkerURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: orphanURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: abandonedTransferURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: abandonedExpansionURL.path))
+        XCTAssertTrue(reopenedDownload.hasVerifiedLocalDestinationChecksumMarker())
     }
 
     func testOrphanCleanupPreservesGeneratedArtifactDirectoryAndDescendants() async throws {
@@ -1174,8 +1314,10 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
             }
         )
 
-        await controller.download(download)
 
+        let hasLocalArtifact = await download.existsLocally()
+        XCTAssertFalse(hasLocalArtifact, "A stale .br cannot authorize local processing of an uncompressed download")
+        await controller.ensureDownloaded([download])
         let isComplete = try await download.awaitCompletionOrFailure()
         XCTAssertTrue(isComplete)
         XCTAssertEqual(try Data(contentsOf: destinationURL), expectedPayload)
