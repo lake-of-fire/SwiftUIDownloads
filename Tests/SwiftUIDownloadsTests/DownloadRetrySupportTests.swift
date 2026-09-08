@@ -7,6 +7,33 @@ final class DownloadRetrySupportTests: XCTestCase {
         XCTAssertEqual(parsed, 7)
     }
 
+    func testRetryAfterRejectsNonfiniteAndNegativeValues() {
+        for header in ["nan", "inf", "-inf", "1e999", "-7"] {
+            XCTAssertNil(parseRetryAfterSeconds(header), header)
+        }
+        for value in [Double.nan, .infinity, -.infinity, -1] {
+            let error = URLResourceDownloadHTTPError(statusCode: 503, url: nil, retryAfterSeconds: value)
+            XCTAssertNil(error.retryAfterSeconds)
+            XCTAssertFalse(error.localizedDescription.contains("Retry-After"))
+        }
+    }
+
+    func testOversizedRetryAfterCanBeReportedAndClamped() throws {
+        let parsed = try XCTUnwrap(parseRetryAfterSeconds("99999999999999999999"))
+        let policy = DownloadRetryPolicy(maxAttempts: 3, initialDelaySeconds: 1,
+                                         maxDelaySeconds: 8, jitterFraction: 0,
+                                         maxServerRetryAfterSeconds: 30)
+        for url in [nil, URL(string: "https://example.com/archive")] {
+            for value in [parsed, Double(Int.max), Double.greatestFiniteMagnitude] {
+                let error = URLResourceDownloadHTTPError(statusCode: 503, url: url, retryAfterSeconds: value)
+                XCTAssertTrue(error.localizedDescription.contains("Retry-After"))
+                XCTAssertEqual(policy.retryDelaySeconds(forAttempt: 2, error: error), 30)
+            }
+        }
+        let ordinary = URLResourceDownloadHTTPError(statusCode: 429, url: nil, retryAfterSeconds: 7)
+        XCTAssertTrue(ordinary.localizedDescription.hasSuffix("Retry-After 7s"))
+    }
+
     func testParseRetryAfterSeconds_httpDate() {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let parsed = parseRetryAfterSeconds(

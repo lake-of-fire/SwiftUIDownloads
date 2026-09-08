@@ -16,15 +16,19 @@ func parseHTTPDate(_ value: String) -> Date? {
     )
 }
 
+private func validatedRetryAfterSeconds(_ seconds: Double) -> Double? {
+    seconds.isFinite && seconds >= 0 ? seconds : nil
+}
+
 func parseRetryAfterSeconds(_ value: String, now: Date = Date()) -> Double? {
     let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else { return nil }
 
     if let deltaSeconds = Double(trimmed) {
-        return max(0, deltaSeconds)
+        return validatedRetryAfterSeconds(deltaSeconds)
     }
     if let retryDate = makeRetryAfterDateFormatter().date(from: trimmed) {
-        return max(0, retryDate.timeIntervalSince(now))
+        return validatedRetryAfterSeconds(max(0, retryDate.timeIntervalSince(now)))
     }
     return nil
 }
@@ -44,21 +48,21 @@ public struct URLResourceDownloadHTTPError: LocalizedError, Sendable {
     public init(statusCode: Int, url: URL?, retryAfterSeconds: Double? = nil) {
         self.statusCode = statusCode
         self.url = url
-        self.retryAfterSeconds = retryAfterSeconds
+        self.retryAfterSeconds = retryAfterSeconds.flatMap(validatedRetryAfterSeconds)
     }
 
     public var errorDescription: String? {
         let status = HTTPURLResponse.localizedString(forStatusCode: statusCode)
+        var description = "HTTP \(statusCode) (\(status))"
         if let url {
-            if let retryAfterSeconds {
-                return "HTTP \(statusCode) (\(status)) for \(url.absoluteString), Retry-After \(Int(retryAfterSeconds))s"
-            }
-            return "HTTP \(statusCode) (\(status)) for \(url.absoluteString)"
+            description += " for \(url.absoluteString)"
         }
         if let retryAfterSeconds {
-            return "HTTP \(statusCode) (\(status)), Retry-After \(Int(retryAfterSeconds))s"
+            let seconds = retryAfterSeconds.rounded(.towardZero)
+            let formattedSeconds = Int(exactly: seconds).map(String.init) ?? String(seconds)
+            description += ", Retry-After \(formattedSeconds)s"
         }
-        return "HTTP \(statusCode) (\(status))"
+        return description
     }
 }
 
