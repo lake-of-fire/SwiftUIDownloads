@@ -106,6 +106,14 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
     }
 }
 
+private actor ImportInvocationRecorder {
+    private(set) var count = 0
+
+    func recordInvocation() {
+        count += 1
+    }
+}
+
 final class DownloadMetadataCacheTests: XCTestCase {
     @MainActor
     func testDownloadableHydratesMetadataWithOneBulkStoreRead() async {
@@ -239,6 +247,147 @@ final class DownloadMetadataCacheTests: XCTestCase {
         download.lastDownloadedETag = "new"
         try await download.waitForDownloadMetadataPersistence()
         XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "new")
+    }
+
+    @MainActor
+    func testFinishRetriesMetadataPersistenceWithoutReprocessingInstalledArtifact() async throws {
+        let payload = Data("installed artifact".utf8)
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-metadata-retry-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let destination = temporaryDirectory.appendingPathComponent("downloaded.txt")
+        try payload.write(to: destination)
+        let store = RecordingDownloadMetadataStore(
+            metadata: DownloadMetadata(),
+            saveFailureCount: 1
+        )
+        let importInvocations = ImportInvocationRecorder()
+        let download = ImportableDownloadable(
+            url: URL(string: "https://example.com/metadata-retry.txt")!,
+            name: "Metadata retry",
+            localDestination: destination,
+            deleteAfterImport: false,
+            metadataStore: store,
+            isImported: { await importInvocations.count > 0 },
+            importHandler: { url, _ in
+                _ = try Data(contentsOf: url)
+                await importInvocations.recordInvocation()
+            }
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let remoteModifiedAt = Date(timeIntervalSince1970: 500)
+        download.shouldCheckForUpdates = false
+
+        await controller.finishDownload(
+            download,
+            etag: "new-etag",
+            remoteModifiedAt: remoteModifiedAt,
+            updatesRemoteModifiedAt: true
+        )
+
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertTrue(download.isFailed)
+        XCTAssertFalse(controller.finishedDownloads.contains(download))
+        XCTAssertTrue(controller.failedDownloads.contains(download))
+        XCTAssertNotNil(download.failureMessage)
+        XCTAssertEqual(store.saveCount, 1)
+        XCTAssertNil(store.storedMetadata.lastDownloadedETag)
+        XCTAssertNil(store.storedMetadata.lastModifiedAt)
+        let initialImportCount = await importInvocations.count
+        XCTAssertEqual(initialImportCount, 1)
+
+        await controller.ensureDownloaded(download: download)
+
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertFalse(download.isFailed)
+        XCTAssertTrue(download.isFinishedDownloading)
+        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertTrue(controller.finishedDownloads.contains(download))
+        XCTAssertFalse(controller.failedDownloads.contains(download))
+        XCTAssertNil(download.failureMessage)
+        XCTAssertEqual(store.saveCount, 2)
+        XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "new-etag")
+        XCTAssertEqual(store.storedMetadata.lastModifiedAt, remoteModifiedAt)
+        XCTAssertNotNil(store.storedMetadata.lastDownloadedAt)
+        XCTAssertNotNil(store.storedMetadata.lastCheckedETagAt)
+        let retriedImportCount = await importInvocations.count
+        XCTAssertEqual(retriedImportCount, 1)
+    }
+
+    @MainActor
+    func testFinishPublishesSuccessAfterMetadataIsVisibleToFreshCache() async throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-metadata-acknowledgement-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let metadataSuiteName = "swiftui-downloads-metadata-acknowledgement-\(UUID().uuidString)"
+        guard let metadataDefaults = UserDefaults(suiteName: metadataSuiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite for metadata store.")
+            return
+        }
+        defer {
+            metadataDefaults.removePersistentDomain(forName: metadataSuiteName)
+        }
+
+        let destination = temporaryDirectory.appendingPathComponent("downloaded.txt")
+        try Data("durable artifact".utf8).write(to: destination)
+        let url = URL(string: "https://example.com/durable-metadata.txt")!
+        let firstStore = UserDefaultsDownloadableMetadataStore(
+            userDefaults: metadataDefaults,
+            metadataCacheNamespace: "first-\(UUID().uuidString)"
+        )
+        let firstDownload = Downloadable(
+            url: url,
+            name: "Durable metadata",
+            localDestination: destination,
+            metadataStore: firstStore
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let remoteModifiedAt = Date(timeIntervalSince1970: 600)
+
+        await controller.finishDownload(
+            firstDownload,
+            etag: "durable-etag",
+            remoteModifiedAt: remoteModifiedAt,
+            updatesRemoteModifiedAt: true
+        )
+
+        XCTAssertTrue(controller.finishedDownloads.contains(firstDownload))
+        let secondStore = UserDefaultsDownloadableMetadataStore(
+            userDefaults: metadataDefaults,
+            metadataCacheNamespace: "second-\(UUID().uuidString)"
+        )
+        let secondDownload = Downloadable(
+            url: url,
+            name: "Fresh metadata reader",
+            localDestination: destination,
+            metadataStore: secondStore
+        )
+        await secondDownload.waitForDownloadMetadata()
+
+        XCTAssertEqual(secondDownload.lastDownloadedETag, "durable-etag")
+        XCTAssertEqual(secondDownload.lastModifiedAt, remoteModifiedAt)
+        XCTAssertNotNil(secondDownload.lastDownloaded)
+        XCTAssertNotNil(secondDownload.lastCheckedETagAt)
     }
 
     @MainActor

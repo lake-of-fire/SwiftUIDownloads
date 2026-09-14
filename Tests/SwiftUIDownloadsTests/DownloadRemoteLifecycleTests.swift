@@ -66,6 +66,30 @@ private final class ModifiedHEADURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+private final class ETagOnlyHEADURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["ETag": "remote-b"]
+        )!
+        client?.urlProtocol(
+            self,
+            didReceive: response,
+            cacheStoragePolicy: .notAllowed
+        )
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 private final class LastModifiedOnlyHEADURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest {
@@ -155,17 +179,25 @@ private actor EmptyCompressedRemoteAttemptExecutor {
 private actor SuccessfulRemoteAttemptExecutor {
     private let etag: String?
     private let lastModified: Date?
+    private let payload: Data
+    private var invocationCount = 0
 
-    init(etag: String? = nil, lastModified: Date? = nil) {
+    init(
+        etag: String? = nil,
+        lastModified: Date? = nil,
+        payload: Data = Data("replacement-payload".utf8)
+    ) {
         self.etag = etag
         self.lastModified = lastModified
+        self.payload = payload
     }
 
     func execute(
         download: Downloadable,
         session _: URLSession
     ) async throws -> DownloadTransferResult {
-        try Data("replacement-payload".utf8).write(
+        invocationCount += 1
+        try payload.write(
             to: download.localDestination,
             options: .atomic
         )
@@ -185,9 +217,168 @@ private actor SuccessfulRemoteAttemptExecutor {
             lastModified: lastModified
         )
     }
+
+    func count() -> Int { invocationCount }
+}
+
+private enum ValidatorMetadataStoreError: Error {
+    case injectedLoadFailure
+}
+
+private final class ValidatorMetadataBacking: @unchecked Sendable {
+    private let lock = NSLock()
+    private var metadata: DownloadMetadata
+    private var remainingLoadFailures: Int
+
+    init(
+        metadata: DownloadMetadata = DownloadMetadata(),
+        loadFailureCount: Int
+    ) {
+        self.metadata = metadata
+        remainingLoadFailures = loadFailureCount
+    }
+
+    func load() throws -> DownloadMetadata {
+        lock.lock()
+        defer { lock.unlock() }
+        if remainingLoadFailures > 0 {
+            remainingLoadFailures -= 1
+            throw ValidatorMetadataStoreError.injectedLoadFailure
+        }
+        return metadata
+    }
+
+    func update(_ body: (inout DownloadMetadata) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        body(&metadata)
+    }
+}
+
+private struct ValidatorMetadataStore: DownloadableMetadataStore {
+    let metadataCacheNamespace: String
+    let backing: ValidatorMetadataBacking
+
+    init(backing: ValidatorMetadataBacking) {
+        self.backing = backing
+        metadataCacheNamespace = "validator-metadata-\(UUID().uuidString)"
+    }
+
+    func loadMetadata(for _: URL) throws -> DownloadMetadata {
+        try backing.load()
+    }
+
+    func saveMetadata(
+        _ metadata: DownloadMetadata,
+        fields: DownloadMetadataFields,
+        for _: URL
+    ) {
+        backing.update { storedMetadata in
+            if fields.contains(.lastDownloadedETag) {
+                storedMetadata.lastDownloadedETag = metadata.lastDownloadedETag
+            }
+            if fields.contains(.lastCheckedETagAt) {
+                storedMetadata.lastCheckedETagAt = metadata.lastCheckedETagAt
+            }
+            if fields.contains(.lastDownloadedAt) {
+                storedMetadata.lastDownloadedAt = metadata.lastDownloadedAt
+            }
+            if fields.contains(.lastModifiedAt) {
+                storedMetadata.lastModifiedAt = metadata.lastModifiedAt
+            }
+        }
+    }
+
+    func lastDownloadedETag(for _: URL) -> String? {
+        try? backing.load().lastDownloadedETag
+    }
+
+    func setLastDownloadedETag(_ etag: String?, for _: URL) {
+        backing.update { $0.lastDownloadedETag = etag }
+    }
+
+    func lastCheckedETagAt(for _: URL) -> Date? {
+        try? backing.load().lastCheckedETagAt
+    }
+
+    func setLastCheckedETagAt(_ date: Date?, for _: URL) {
+        backing.update { $0.lastCheckedETagAt = date }
+    }
+
+    func lastDownloaded(for _: URL) -> Date? {
+        try? backing.load().lastDownloadedAt
+    }
+
+    func setLastDownloaded(_ date: Date?, for _: URL) {
+        backing.update { $0.lastDownloadedAt = date }
+    }
+
+    func lastModifiedAt(for _: URL) -> Date? {
+        try? backing.load().lastModifiedAt
+    }
+
+    func setLastModifiedAt(_ date: Date?, for _: URL) {
+        backing.update { $0.lastModifiedAt = date }
+    }
 }
 
 final class DownloadRemoteLifecycleTests: XCTestCase {
+    func testMissingInstalledETagRequiresGETBeforePublishingRemoteETag() async throws {
+        try await assertMissingInstalledETagRequiresGET(loadFailureCount: 0)
+    }
+
+    func testMetadataLoadFailureRequiresGETBeforePublishingRemoteETag() async throws {
+        try await assertMissingInstalledETagRequiresGET(loadFailureCount: 1)
+    }
+
+    func testKnownEqualETagDoesNotReplaceInstalledArtifact() async throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-known-validator-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let localA = Data("installed-a".utf8)
+        let destination = temporaryDirectory.appendingPathComponent("payload.bin")
+        try localA.write(to: destination)
+        let metadataBacking = ValidatorMetadataBacking(
+            metadata: DownloadMetadata(lastDownloadedETag: "remote-b"),
+            loadFailureCount: 0
+        )
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads-known-validator.test/payload.bin")!,
+            name: "Known Installed Validator",
+            localDestination: destination,
+            metadataStore: ValidatorMetadataStore(backing: metadataBacking)
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let attemptExecutor = SuccessfulRemoteAttemptExecutor(
+            etag: "unexpected-replacement"
+        )
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(download: download, session: session)
+            }
+        )
+
+        await controller.ensureDownloaded(download: download)
+
+        let replacementCount = await attemptExecutor.count()
+        XCTAssertEqual(replacementCount, 0)
+        XCTAssertEqual(try Data(contentsOf: destination), localA)
+        let installedETag = await MainActor.run { download.lastDownloadedETag }
+        XCTAssertEqual(installedETag, "remote-b")
+    }
+
     func testProductionGETHandsResponseValidatorsToInstalledArtifact()
     async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
@@ -632,5 +823,79 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         } else {
             XCTFail("An invalidated transfer must remain uninitiated")
         }
+    }
+
+    private func assertMissingInstalledETagRequiresGET(
+        loadFailureCount: Int
+    ) async throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-validator-authority-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let localA = Data("installed-a".utf8)
+        let remoteB = Data("remote-b".utf8)
+        let destination = temporaryDirectory.appendingPathComponent("payload.bin")
+        try localA.write(to: destination)
+        let url = URL(string: "https://swiftui-downloads-validator.test/payload.bin")!
+        let metadataBacking = ValidatorMetadataBacking(
+            loadFailureCount: loadFailureCount
+        )
+        let download = Downloadable(
+            url: url,
+            name: "Unknown Installed Validator",
+            localDestination: destination,
+            metadataStore: ValidatorMetadataStore(backing: metadataBacking)
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let attemptExecutor = SuccessfulRemoteAttemptExecutor(
+            etag: "remote-b",
+            payload: remoteB
+        )
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(download: download, session: session)
+            }
+        )
+
+        await controller.ensureDownloaded(download: download)
+        try await download.waitForDownloadMetadataPersistence()
+
+        let replacementCount = await attemptExecutor.count()
+        XCTAssertEqual(replacementCount, 1)
+        XCTAssertEqual(try Data(contentsOf: destination), remoteB)
+
+        let freshDownload = Downloadable(
+            url: url,
+            name: "Fresh Validator Reader",
+            localDestination: destination,
+            metadataStore: ValidatorMetadataStore(backing: metadataBacking)
+        )
+        await freshDownload.waitForDownloadMetadata()
+        let freshInstalledETag = await MainActor.run {
+            freshDownload.lastDownloadedETag
+        }
+        XCTAssertEqual(freshInstalledETag, "remote-b")
+
+        let knownEqualResult = await controller.checkRemoteModification(
+            for: freshDownload
+        )
+        guard case let .available(modified, _, etag) = knownEqualResult else {
+            return XCTFail("Expected the known validator check to be available")
+        }
+        XCTAssertFalse(modified)
+        XCTAssertEqual(etag, "remote-b")
+        let countAfterKnownEqualCheck = await attemptExecutor.count()
+        XCTAssertEqual(countAfterKnownEqualCheck, 1)
     }
 }
