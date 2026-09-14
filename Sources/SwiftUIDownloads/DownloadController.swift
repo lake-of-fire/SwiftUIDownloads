@@ -1199,6 +1199,7 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     private var activeTransferStagingURLs = Set<URL>()
     private var checksumRecoveriesReadyForProcessing = Set<String>()
     private var checksumRedownloadAttempted = Set<String>()
+    private var completionMetadataRetryDownloadIDs = Set<String>()
     private let session: URLSession
     private let attemptExecutor: DownloadAttemptExecutor?
     private let retryPolicyProvider: @Sendable () -> DownloadRetryPolicy
@@ -1518,6 +1519,7 @@ public extension DownloadController {
     func delete(download: Downloadable) async throws -> Downloadable {
         // Fence any delegate/retry completion that arrives after deletion.
         downloadAttemptIDs[download.id] = nil
+        completionMetadataRetryDownloadIDs.remove(download.id)
         download.invalidateDownloadObservation()
         let downloadRecord = downloadTasks[download.id]
         let processingRecord = processingTasks[download.id]
@@ -1544,6 +1546,7 @@ public extension DownloadController {
             return try await delete(download: download)
         }
 
+        completionMetadataRetryDownloadIDs.remove(download.id)
         clearDownloadStatusObservers(forDownloadID: download.id)
         try removeAllLocalArtifacts(
             for: download,
@@ -2485,6 +2488,41 @@ extension DownloadController {
         processingTaskID: UUID
     ) async {
         await download.waitForDownloadMetadata()
+        if transferredFileURL != nil {
+            // A transferred replacement owns a new completion result. Its
+            // metadata supersedes any dirty completion values retained from
+            // processing the previously installed artifact.
+            completionMetadataRetryDownloadIDs.remove(download.id)
+        } else if completionMetadataRetryDownloadIDs.contains(download.id) {
+            do {
+                let metadata = download.cachedDownloadMetadata
+                await MainActor.run {
+                    // Identical assignments deliberately ask the cache to
+                    // retry all dirty fields after its prior save failure.
+                    download.lastDownloadedETag = metadata.lastDownloadedETag
+                    download.lastCheckedETagAt = metadata.lastCheckedETagAt
+                    download.lastDownloaded = metadata.lastDownloadedAt
+                    download.lastModifiedAt = metadata.lastModifiedAt
+                }
+                try await download.waitForDownloadMetadataPersistence()
+                try Task.checkCancellation()
+                guard processingTasks[download.id]?.id == processingTaskID else {
+                    throw CancellationError()
+                }
+                completionMetadataRetryDownloadIDs.remove(download.id)
+                await publishSuccessfulCompletion(download)
+                checksumRedownloadAttempted.remove(download.id)
+                clearDownloadStatusObservers(forDownloadID: download.id)
+            } catch {
+                if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                    await markDownloadCancelled(download, error: error)
+                } else {
+                    await publishCompletionMetadataFailure(error, for: download)
+                }
+            }
+            clearProcessingTask(forDownloadID: download.id, processingTaskID: processingTaskID)
+            return
+        }
         let transferredCompressedFileURL = transferredFileURL.flatMap { url in
             download.url.pathExtension == "br"
                 && url != download.localDestination ? url : nil
@@ -2717,7 +2755,7 @@ extension DownloadController {
             }
 //              print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
             
-            await MainActor.run { [weak self] in
+            await MainActor.run {
                 download.fileSize = UInt64(fileSize)
 
                 // This timestamp is queued as the baseline for Last-Modified                // comparisons, so advance it only after the downloaded bytes
@@ -2741,22 +2779,30 @@ extension DownloadController {
                         download.lastCheckedETagAt = Date()
                     }
                 }
-                self?.failedDownloads.remove(download)
-                self?.activeDownloads.remove(download)
-                self?.finishedDownloads.insert(download)
-                download.isFailed = false
-                download.isActive = false
-                download.isFinishedDownloading = true
-                download.isFinishedProcessing = true
-                if let importable = download as? ImportableDownloadable {
-                    importable.importProgress = nil
-                    importable.importStatusText = nil
+            }
+            if recordSuccessfulDownload {
+                try await download.waitForDownloadMetadataPersistence()
+                try Task.checkCancellation()
+                guard processingTasks[download.id]?.id == processingTaskID else {
+                    throw CancellationError()
                 }
                 self?.refreshPublishedDownloadState()
             }
+            completionMetadataRetryDownloadIDs.remove(download.id)
+            await publishSuccessfulCompletion(download)
             checksumRedownloadAttempted.remove(download.id)
             clearDownloadStatusObservers(forDownloadID: download.id)
         } catch {
+            if error is DownloadMetadataPersistenceError {
+                completionMetadataRetryDownloadIDs.insert(download.id)
+                if Task.isCancelled
+                    || processingTasks[download.id]?.id != processingTaskID {
+                    await markDownloadCancelled(download)
+                } else {
+                    await publishCompletionMetadataFailure(error, for: download)
+                }
+                return
+            }
             if requiresCleanChecksumRedownload(error)
                 && download.localDestinationChecksum != nil
                 && (!finishStartedWithCompressedFile
@@ -2845,6 +2891,10 @@ extension DownloadController {
 
     @DownloadActor
     private func markDownloadAsProcessed(_ download: Downloadable) async {
+        if completionMetadataRetryDownloadIDs.contains(download.id) {
+            await finishDownload(download, recordSuccessfulDownload: false)
+            return
+        }
         await { @MainActor [weak self] in
             download.isFailed = false
             download.isActive = false
@@ -2855,6 +2905,59 @@ extension DownloadController {
             self?.finishedDownloads.insert(download)
             self?.refreshPublishedDownloadState()
         }()
+    }
+
+    @DownloadActor
+    private func publishSuccessfulCompletion(_ download: Downloadable) async {
+        await MainActor.run { [weak self] in
+            self?.failedDownloads.remove(download)
+            self?.activeDownloads.remove(download)
+            self?.finishedDownloads.insert(download)
+            download.isFailed = false
+            download.isActive = false
+            download.isFinishedDownloading = true
+            download.isFinishedProcessing = true
+            if case let .completed(destinationLocation, etag, error) = download.downloadProgress,
+               error is DownloadMetadataPersistenceError {
+                download.downloadProgress = .completed(
+                    destinationLocation: destinationLocation,
+                    etag: etag,
+                    error: nil
+                )
+            }
+            if let importable = download as? ImportableDownloadable {
+                importable.lastImportError = nil
+                importable.importProgress = nil
+                importable.importStatusText = nil
+            }
+        }
+    }
+
+    @DownloadActor
+    private func publishCompletionMetadataFailure(
+        _ error: Error,
+        for download: Downloadable
+    ) async {
+        await MainActor.run { [weak self] in
+            if let importable = download as? ImportableDownloadable {
+                importable.lastImportError = error
+                importable.importProgress = nil
+                importable.importStatusText = "Saving download metadata failed"
+            }
+            self?.failedDownloads.insert(download)
+            self?.activeDownloads.remove(download)
+            self?.finishedDownloads.remove(download)
+            download.isFailed = true
+            download.isActive = false
+            download.isFinishedDownloading = false
+            download.isFinishedProcessing = true
+            download.downloadProgress = .completed(
+                destinationLocation: download.localDestination,
+                etag: download.lastDownloadedETag,
+                error: error
+            )
+        }
+        clearDownloadStatusObservers(forDownloadID: download.id)
     }
     
     enum RemoteModificationCheckResult {
@@ -2911,12 +3014,25 @@ extension DownloadController {
                 )
             }
 
-            if let etag, let lastDownloadedETag, etag != lastDownloadedETag {
-                return .available(
-                    modified: true,
-                    modifiedAt: nil,
-                    etag: etag
-                )
+            if let etag {
+                // A remote validator can establish equality only when the
+                // installed artifact has a validator to compare with it.
+                // Otherwise treating the response as unchanged would attach
+                // the remote identity to unverified local bytes.
+                guard let lastDownloadedETag else {
+                    return .available(
+                        modified: true,
+                        modifiedAt: nil,
+                        etag: etag
+                    )
+                }
+                if etag != lastDownloadedETag {
+                    return .available(
+                        modified: true,
+                        modifiedAt: nil,
+                        etag: etag
+                    )
+                }
             }
 
             return .available(
