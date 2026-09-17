@@ -239,8 +239,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     public let localDestinationChecksum: String?
     /// Generated artifacts which belong to this download but are not the
     /// downloaded payload itself. Orphan cleanup preserves these directories
-    /// and their descendants.
-    public let preservedLocalArtifactDirectories: Set<URL>
+
+    /// and their descendants when they are contained by its cleanup root.    public let preservedLocalArtifactDirectories: Set<URL>
     var isFromBackgroundAssetsDownloader: Bool? = nil
     public let metadataStore: any DownloadableMetadataStore
     private let downloadMetadataCache: DownloadMetadataCache
@@ -1256,20 +1256,32 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
             .store(in: &cancellables)
     }
 
-    /// Republishes aggregate state after a child download changes lifecycle
-    /// flags. Views derive their rows from the controller's sets, so observing
-    /// the child alone is insufficient to remove a just-installed row.
+
+    /// Re-derive aggregate publication from each child's current lifecycle
+    /// state after publisher scheduling. Captured set values can be stale by
+    /// the time this work reaches the main actor.
     @MainActor
     private func refreshPublishedDownloadState() {
-        let hasActiveDownload = activeDownloads.contains {
-            $0.isActive
+        let currentActiveDownloads = Set(activeDownloads.filter {            $0.isActive
                 && !$0.isFailed
                 && !$0.isFinishedDownloading
                 && !$0.isFinishedProcessing
+
+        })
+        let currentFailedDownloads = Set(failedDownloads.filter(\.isFailed))
+        let currentFinishedDownloads = Set(finishedDownloads.filter {
+            $0.isFinishedDownloading && !$0.isFailed
+        })
+        if activeDownloads != currentActiveDownloads {
+            activeDownloads = currentActiveDownloads
         }
-        let hasFailedDownload = failedDownloads.contains(where: \.isFailed)
-        let pending = hasActiveDownload || hasFailedDownload
-        if isPending != pending {
+        if failedDownloads != currentFailedDownloads {
+            failedDownloads = currentFailedDownloads
+        }
+        if finishedDownloads != currentFinishedDownloads {
+            finishedDownloads = currentFinishedDownloads
+        }
+        let pending = !currentActiveDownloads.isEmpty || !currentFailedDownloads.isEmpty        if isPending != pending {
             isPending = pending
         } else {
             objectWillChange.send()
@@ -1471,6 +1483,10 @@ public extension DownloadController {
         
         for location in locations {
             let dir = location.directoryURL
+            let preservedDirectories = preservedArtifactDirectories(
+                from: retainedDownloads,
+                containedBy: dir
+            )
             let path = dir.path
             let enumerator = FileManager.default.enumerator(atPath: path)
             
@@ -1513,6 +1529,23 @@ public extension DownloadController {
                 try FileManager.default.removeItemIfPresent(at: orphanDir)
             }
         }
+    }
+
+    private func preservedArtifactDirectories(
+        from downloads: Set<Downloadable>,
+        containedBy cleanupRoot: URL
+    ) -> Set<URL> {
+        let resolvedRoot = cleanupRoot.resolvingSymlinksInPath().standardizedFileURL
+        return Set(downloads.flatMap(\.preservedLocalArtifactDirectories).compactMap {
+            let declaredDirectory = $0.standardizedFileURL
+            let resolvedDirectory = declaredDirectory.resolvingSymlinksInPath().standardizedFileURL
+            guard resolvedDirectory != resolvedRoot,
+                  resolvedDirectory.path.hasPrefix(resolvedRoot.path + "/")
+            else {
+                return nil
+            }
+            return declaredDirectory
+        })
     }
     
     @DownloadActor
@@ -1614,13 +1647,6 @@ extension DownloadController {
         var perDownloadCancellables = Set<AnyCancellable>()
         download.$isActive.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] _ in
             Task { @MainActor [weak self] in
-                // Publisher delivery and the MainActor task are two separate
-                // scheduling hops. A queued `true` can otherwise run after
-                // terminal processing has already set the download inactive
-                // and removed it from `activeDownloads`, permanently
-                // resurrecting a completed download as pending. Reconcile
-                // from the current aggregate state instead of the captured
-                // event value.
                 if download.isActive
                     && !download.isFailed
                     && !download.isFinishedDownloading
@@ -1645,8 +1671,8 @@ extension DownloadController {
         download.$isFinishedDownloading.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self, weak download] _ in
             Task { @MainActor [weak self, weak download] in
                 guard let download else { return }
-                if download.isFinishedDownloading {
-                    self?.failedDownloads.remove(download)
+
+                if download.isFinishedDownloading && !download.isFailed {                    self?.failedDownloads.remove(download)
                     self?.finishedDownloads.insert(download)
                     self?.activeDownloads.remove(download)
                     if !(download.isFromBackgroundAssetsDownloader ?? true) {

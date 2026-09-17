@@ -83,6 +83,43 @@ private actor SuccessfulAttemptExecutorStub {
 }
 
 final class DownloadObserverLifecycleTests: XCTestCase {
+    func testQueuedActiveAggregateDoesNotResurrectTerminalDownload() async throws {
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "swiftui-downloads-terminal-observation-\(UUID().uuidString).bin"
+        )
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads.test/terminal-observation.bin")!,
+            name: "Terminal Observation",
+            localDestination: destination
+        )
+        let controller = DownloadController()
+
+        await MainActor.run {
+            download.isActive = true
+            controller.activeDownloads.insert(download)
+
+            // The aggregate publisher has captured the active set, but this
+            // child reaches terminal state before its scheduled handler runs.
+            download.isActive = false
+            download.isFinishedDownloading = true
+            download.isFinishedProcessing = true
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let state = await MainActor.run {
+            (
+                controller.activeDownloads.contains(download),
+                controller.unfinishedDownloads.contains(download),
+                controller.unfinishedDownloadsIncludingImports.contains(download),
+                controller.isPending
+            )
+        }
+        XCTAssertFalse(state.0)
+        XCTAssertFalse(state.1)
+        XCTAssertFalse(state.2)
+        XCTAssertFalse(state.3)
+    }
+
     func testOverlappingDownloadCannotReplaceAttemptDuringProcessing() async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -237,14 +274,18 @@ final class DownloadObserverLifecycleTests: XCTestCase {
                 download.isActive,
                 controller.activeDownloads.contains(download),
                 controller.finishedDownloads.contains(download),
-                controller.isPending
+
+                controller.unfinishedDownloads.contains(download),
+                controller.unfinishedDownloadsIncludingImports.contains(download),                controller.isPending
             )
         }
         XCTAssertFalse(terminalState.0)
         XCTAssertFalse(terminalState.1)
         XCTAssertTrue(terminalState.2)
         XCTAssertFalse(terminalState.3)
-    }
+
+        XCTAssertFalse(terminalState.4)
+        XCTAssertFalse(terminalState.5)    }
 
     func testLocalFileMissingFailureUpdatesFailedSetAndAllowsRetryWithoutHanging() async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
