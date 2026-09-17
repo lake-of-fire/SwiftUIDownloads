@@ -1024,6 +1024,57 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: orphanURL.path))
     }
 
+    func testOrphanCleanupPreservesGeneratedArtifactDirectoryAndDescendants() async throws {
+        let parentName = "swiftui-downloads-generated-artifacts-\(UUID().uuidString)"
+        let directory = DownloadDirectory.appSupport(
+            parentDirectoryName: parentName,
+            groupIdentifier: nil
+        )
+        let directoryURL = directory.directoryURL
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+
+        let destinationURL = directoryURL.appendingPathComponent("payload.bin")
+        try Data("payload".utf8).write(to: destinationURL, options: .atomic)
+        let generatedDirectoryURL = directoryURL.appendingPathComponent(
+            ".runtime-snapshots",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: generatedDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        let generatedArtifactURL = generatedDirectoryURL
+            .appendingPathComponent("payload.snapshot")
+        try Data("snapshot".utf8).write(
+            to: generatedArtifactURL,
+            options: .atomic
+        )
+        let orphanURL = directoryURL.appendingPathComponent("orphan.tmp")
+        try Data("orphan".utf8).write(to: orphanURL, options: .atomic)
+
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads.test/generated.bin")!,
+            name: "Generated Artifacts",
+            localDestination: destinationURL,
+            preservedLocalArtifactDirectories: [generatedDirectoryURL]
+        )
+        let controller = DownloadController()
+        await MainActor.run { () -> Void in
+            controller.assuredDownloads.insert(download)
+        }
+
+        try await controller.deleteOrphanFiles(in: [directory])
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: generatedArtifactURL.path)
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphanURL.path))
+    }
+
     func testChecksumMismatchWithoutCompressedFileRetriesCleanDownload() async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("swiftui-downloads-checksum-retry-\(UUID().uuidString)", isDirectory: true)

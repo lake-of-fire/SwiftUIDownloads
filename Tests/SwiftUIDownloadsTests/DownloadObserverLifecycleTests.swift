@@ -136,13 +136,17 @@ final class DownloadObserverLifecycleTests: XCTestCase {
                 download.isFinishedDownloading,
                 download.isFinishedProcessing,
                 download.isFailed,
-                controller.finishedDownloads.contains(download)
+                controller.finishedDownloads.contains(download),
+                controller.unfinishedDownloadsIncludingImports.contains(download),
+                controller.isPending
             )
         }
         XCTAssertTrue(state.0)
         XCTAssertTrue(state.1)
         XCTAssertFalse(state.2)
         XCTAssertTrue(state.3)
+        XCTAssertFalse(state.4)
+        XCTAssertFalse(state.5)
     }
 
     private func awaitCompletionOrFailureWithTimeout(
@@ -228,6 +232,18 @@ final class DownloadObserverLifecycleTests: XCTestCase {
         try await Task.sleep(nanoseconds: 100_000_000)
         let finalImportCount = await counter.value()
         XCTAssertEqual(finalImportCount, 3)
+        let terminalState = await MainActor.run {
+            (
+                download.isActive,
+                controller.activeDownloads.contains(download),
+                controller.finishedDownloads.contains(download),
+                controller.isPending
+            )
+        }
+        XCTAssertFalse(terminalState.0)
+        XCTAssertFalse(terminalState.1)
+        XCTAssertTrue(terminalState.2)
+        XCTAssertFalse(terminalState.3)
     }
 
     func testLocalFileMissingFailureUpdatesFailedSetAndAllowsRetryWithoutHanging() async throws {

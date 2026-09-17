@@ -237,6 +237,10 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     public let localDestination: URL
     /// If the file is compressed, this is the post-decompression checksum.
     public let localDestinationChecksum: String?
+    /// Generated artifacts which belong to this download but are not the
+    /// downloaded payload itself. Orphan cleanup preserves these directories
+    /// and their descendants.
+    public let preservedLocalArtifactDirectories: Set<URL>
     var isFromBackgroundAssetsDownloader: Bool? = nil
     public let metadataStore: any DownloadableMetadataStore
     private let downloadMetadataCache: DownloadMetadataCache
@@ -372,6 +376,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         name: String,
         localDestination: URL,
         localDestinationChecksum: String? = nil,
+        preservedLocalArtifactDirectories: Set<URL> = [],
         isFromBackgroundAssetsDownloader: Bool? = nil,
         metadataStore: (any DownloadableMetadataStore)? = nil
     ) {
@@ -380,6 +385,9 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         self.name = name
         self.localDestination = localDestination
         self.localDestinationChecksum = localDestinationChecksum
+        self.preservedLocalArtifactDirectories = Set(
+            preservedLocalArtifactDirectories.map(\.standardizedFileURL)
+        )
         self.isFromBackgroundAssetsDownloader = isFromBackgroundAssetsDownloader
         let resolvedMetadataStore = metadataStore ?? UserDefaultsDownloadableMetadataStore()
         self.metadataStore = resolvedMetadataStore
@@ -390,7 +398,13 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     }
     
     public static func == (lhs: Downloadable, rhs: Downloadable) -> Bool {
-        return lhs.url == rhs.url && lhs.mirrorURL == rhs.mirrorURL && lhs.name == rhs.name && lhs.localDestination == rhs.localDestination && lhs.localDestinationChecksum == rhs.localDestinationChecksum
+        return lhs.url == rhs.url
+            && lhs.mirrorURL == rhs.mirrorURL
+            && lhs.name == rhs.name
+            && lhs.localDestination == rhs.localDestination
+            && lhs.localDestinationChecksum == rhs.localDestinationChecksum
+            && lhs.preservedLocalArtifactDirectories
+                == rhs.preservedLocalArtifactDirectories
     }
     
     public var localDestinationFilename: String {
@@ -971,6 +985,7 @@ public extension Downloadable {
         filename: String? = nil,
         url: URL,
         localDestinationChecksum: String? = nil,
+        preservedLocalArtifactDirectories: Set<URL> = [],
         metadataStore: (any DownloadableMetadataStore)? = nil
     ) {
 //        let filename = filename ?? url.lastPathComponent.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? url.lastPathComponent
@@ -982,6 +997,7 @@ public extension Downloadable {
             name: name,
             localDestination: destination.directoryURL.appendingPathComponent(filename),
             localDestinationChecksum: localDestinationChecksum,
+            preservedLocalArtifactDirectories: preservedLocalArtifactDirectories,
             metadataStore: metadataStore
         )
     }
@@ -1150,15 +1166,29 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
 
     @MainActor
     public var unfinishedDownloads: [Downloadable] {
-        let downloads: [Downloadable] = Array(Set(activeDownloads).union(Set(failedDownloads)))
+        let active = activeDownloads.filter {
+            $0.isActive
+                && !$0.isFailed
+                && !$0.isFinishedDownloading
+                && !$0.isFinishedProcessing
+        }
+        let failed = failedDownloads.filter(\.isFailed)
+        let downloads: [Downloadable] = Array(Set(active).union(Set(failed)))
         return downloads.sorted(by: { $0.name > $1.name })
     }
 
     @MainActor
     public var unfinishedDownloadsIncludingImports: [Downloadable] {
         let importing = finishedDownloads.filter { !$0.isFinishedProcessing }
-        let downloads = Set(activeDownloads)
-            .union(Set(failedDownloads))
+        let active = activeDownloads.filter {
+            $0.isActive
+                && !$0.isFailed
+                && !$0.isFinishedDownloading
+                && !$0.isFinishedProcessing
+        }
+        let failed = failedDownloads.filter(\.isFailed)
+        let downloads = Set(active)
+            .union(Set(failed))
             .union(Set(importing))
         return Array(downloads).sorted(by: { $0.name > $1.name })
     }
@@ -1213,13 +1243,32 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
 //            .print("#")
             .combineLatest($failedDownloads.removeDuplicates())
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] (active, failed) in
+            .sink { [weak self] _, _ in
                 Task { @MainActor [weak self] in
-//                    debugPrint("# update isPending...", active.isEmpty, failed.isEmpty)
-                    self?.isPending = !(active.isEmpty && failed.isEmpty)
+                    self?.refreshPublishedDownloadState()
                 }
             }
             .store(in: &cancellables)
+    }
+
+    /// Republishes aggregate state after a child download changes lifecycle
+    /// flags. Views derive their rows from the controller's sets, so observing
+    /// the child alone is insufficient to remove a just-installed row.
+    @MainActor
+    private func refreshPublishedDownloadState() {
+        let hasActiveDownload = activeDownloads.contains {
+            $0.isActive
+                && !$0.isFailed
+                && !$0.isFinishedDownloading
+                && !$0.isFinishedProcessing
+        }
+        let hasFailedDownload = failedDownloads.contains(where: \.isFailed)
+        let pending = hasActiveDownload || hasFailedDownload
+        if isPending != pending {
+            isPending = pending
+        } else {
+            objectWillChange.send()
+        }
     }
 
     private func configureAppLifecycleObservers() {
@@ -1402,6 +1451,11 @@ public extension DownloadController {
             .union(Set(retainedDownloads.map(\.compressedFileURL)))
             .union(Set(retainedDownloads.map(\.checksumVerificationMarkerURL)))
             .union(activeTransferStagingURLs)
+        let preservedDirectories = Set(
+            retainedDownloads
+                .flatMap(\.preservedLocalArtifactDirectories)
+                .map(\.standardizedFileURL)
+        )
         for download in retainedDownloads {
             if let processingTaskID = processingTasks[download.id]?.id {
                 saveFiles.insert(
@@ -1422,6 +1476,12 @@ public extension DownloadController {
             
             while let filename = enumerator?.nextObject() as? String {
                 let fileURL = URL(fileURLWithPath: filename, relativeTo: dir).absoluteURL
+
+                if preservedDirectories.contains(fileURL.standardizedFileURL) {
+                    seenSavedFiles.insert(fileURL)
+                    enumerator?.skipDescendants()
+                    continue
+                }
                 
                 var shouldSkip = false
                 var currentPath = fileURL
@@ -1545,18 +1605,28 @@ extension DownloadController {
         clearDownloadStatusObservers(forDownloadID: download.id)
 
         var perDownloadCancellables = Set<AnyCancellable>()
-        download.$isActive.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] isActive in
+        download.$isActive.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] _ in
             Task { @MainActor [weak self] in
-                if isActive {
+                // Publisher delivery and the MainActor task are two separate
+                // scheduling hops. A queued `true` can otherwise run after
+                // terminal processing has already set the download inactive
+                // and removed it from `activeDownloads`, permanently
+                // resurrecting a completed download as pending. Reconcile
+                // from the current aggregate state instead of the captured
+                // event value.
+                if download.isActive
+                    && !download.isFailed
+                    && !download.isFinishedDownloading
+                    && !download.isFinishedProcessing {
                     self?.activeDownloads.insert(download)
                 } else {
                     self?.activeDownloads.remove(download)
                 }
             }
         }.store(in: &perDownloadCancellables)
-        download.$isFailed.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] isFailed in
+        download.$isFailed.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] _ in
             Task { @MainActor [weak self] in
-                if isFailed {
+                if download.isFailed {
                     self?.finishedDownloads.remove(download)
                     self?.failedDownloads.insert(download)
                     self?.activeDownloads.remove(download)
@@ -1565,22 +1635,26 @@ extension DownloadController {
                 }
             }
         }.store(in: &perDownloadCancellables)
-        download.$isFinishedDownloading.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self, weak download] isFinishedDownloading in
+        download.$isFinishedDownloading.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self, weak download] _ in
             Task { @MainActor [weak self, weak download] in
-                if isFinishedDownloading {
-                    if let download = download {
-                        self?.failedDownloads.remove(download)
-                        self?.finishedDownloads.insert(download)
-                        self?.activeDownloads.remove(download)
-                    }
-                    if !(download?.isFromBackgroundAssetsDownloader ?? true) {
+                guard let download else { return }
+                if download.isFinishedDownloading {
+                    self?.failedDownloads.remove(download)
+                    self?.finishedDownloads.insert(download)
+                    self?.activeDownloads.remove(download)
+                    if !(download.isFromBackgroundAssetsDownloader ?? true) {
                         try? await self?.cancelInProgressDownloads(
                             inDownloadExtension: true
                         )
                     }
-                } else if let download = download {
+                } else {
                     self?.finishedDownloads.remove(download)
                 }
+            }
+        }.store(in: &perDownloadCancellables)
+        download.$isFinishedProcessing.removeDuplicates().receive(on: DispatchQueue.main).sink { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshPublishedDownloadState()
             }
         }.store(in: &perDownloadCancellables)
 
@@ -2587,6 +2661,7 @@ extension DownloadController {
                     importable.importProgress = nil
                     importable.importStatusText = nil
                 }
+                self?.refreshPublishedDownloadState()
             }
             checksumRedownloadAttempted.remove(download.id)
             clearDownloadStatusObservers(forDownloadID: download.id)
@@ -2652,6 +2727,7 @@ extension DownloadController {
                         etag: nil,
                         error: error
                     )
+                    self?.refreshPublishedDownloadState()
                 }
                 clearDownloadStatusObservers(forDownloadID: download.id)
                 return
@@ -2687,6 +2763,7 @@ extension DownloadController {
                         at: download.checksumVerificationMarkerURL
                     )
                 }
+                self?.refreshPublishedDownloadState()
             }
             clearDownloadStatusObservers(forDownloadID: download.id)
         }
@@ -2702,6 +2779,7 @@ extension DownloadController {
             self?.failedDownloads.remove(download)
             self?.activeDownloads.remove(download)
             self?.finishedDownloads.insert(download)
+            self?.refreshPublishedDownloadState()
         }()
     }
     
