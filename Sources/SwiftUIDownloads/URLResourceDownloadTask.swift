@@ -306,7 +306,7 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
 extension URLResourceDownloadTask: URLSessionTaskDelegate {
 
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard session == self.session, downloadTask == self.downloadTask else {
+        guard session == self.session, task == self.downloadTask else {
             return
         }
 
