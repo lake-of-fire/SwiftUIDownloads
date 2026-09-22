@@ -175,7 +175,12 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol,
         self.subject.eraseToAnyPublisher()
     }
 
-    public init(session: URLSession, url: URL, destination: URL) {
+    public init(
+        session: URLSession,
+        url: URL,
+        destination: URL,
+        operationKey: DownloadOperationKey
+    ) {
         self.session = session
         self.url = url
         self.destination = destination
@@ -183,7 +188,7 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol,
         self.subject = PassthroughSubject<PublisherType.Output, PublisherType.Failure>()
 
         self.downloadTask = session.downloadTask(with: self.url)
-        self.downloadTask.taskDescription = self.url.absoluteString
+        self.downloadTask.taskDescription = operationKey.taskDescription
 
         self.subject.send(.uninitiated)
     }

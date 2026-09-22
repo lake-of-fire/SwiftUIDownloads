@@ -278,6 +278,125 @@ fileprivate extension Array where Element: Hashable {
     }
 }
 
+/// The canonical identity of one download operation.
+///
+/// Remote validators may be shared by source URL, but transfer ownership is
+/// scoped to both the standardized source and installed destination.
+public struct DownloadOperationKey: Hashable, Sendable {
+    private static let taskDescriptionPrefix = "SwiftUIDownloads.DownloadOperationKey.v1."
+
+    public let sourceURL: URL
+    public let destinationURL: URL
+
+    public init(sourceURL: URL, destinationURL: URL) {
+        self.sourceURL = Self.standardizedSourceURL(sourceURL)
+        self.destinationURL = destinationURL.absoluteURL.standardizedFileURL
+    }
+
+    static func standardizedSourceURL(_ sourceURL: URL) -> URL {
+        sourceURL.isFileURL
+            ? sourceURL.absoluteURL.standardizedFileURL
+            : sourceURL.absoluteURL.standardized
+    }
+
+    /// A reversible representation used to associate URLSession tasks with
+    /// their exact logical operation.
+    public var taskDescription: String {
+        let encodedSource = Data(sourceURL.absoluteString.utf8).base64EncodedString()
+        let encodedDestination = Data(destinationURL.absoluteString.utf8).base64EncodedString()
+        return Self.taskDescriptionPrefix + encodedSource + "." + encodedDestination
+    }
+
+    public init?(taskDescription: String) {
+        guard taskDescription.hasPrefix(Self.taskDescriptionPrefix) else { return nil }
+        let payload = taskDescription.dropFirst(Self.taskDescriptionPrefix.count)
+        let components = payload.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+        guard components.count == 2,
+              let sourceData = Data(base64Encoded: String(components[0])),
+              let destinationData = Data(base64Encoded: String(components[1])),
+              let sourceString = String(data: sourceData, encoding: .utf8),
+              let destinationString = String(data: destinationData, encoding: .utf8),
+              let sourceURL = URL(string: sourceString),
+              let destinationURL = URL(string: destinationString)
+        else {
+            return nil
+        }
+        self.init(sourceURL: sourceURL, destinationURL: destinationURL)
+    }
+}
+
+public enum DownloadExecutionKind: Hashable, Sendable {
+    case download
+    case importable(
+        deleteAfterImport: Bool,
+        glossaryFTSEnabled: Bool,
+        importOperationIdentifier: String?
+    )
+}
+
+/// Immutable behavior that every descriptor sharing an operation key must
+/// agree on. Display names are intentionally excluded so callers may rename a
+/// download without creating a second operation.
+public struct DownloadExecutionConfigurationSignature: Hashable, Sendable {
+    public let mirrorURL: URL?
+    public let localDestinationChecksum: String?
+    public let preservedLocalArtifactDirectories: [URL]
+    public let metadataCacheNamespace: String
+    public let kind: DownloadExecutionKind
+
+    public init(
+        mirrorURL: URL?,
+        localDestinationChecksum: String?,
+        preservedLocalArtifactDirectories: Set<URL>,
+        metadataCacheNamespace: String,
+        kind: DownloadExecutionKind
+    ) {
+        self.mirrorURL = mirrorURL.map(DownloadOperationKey.standardizedSourceURL)
+        self.localDestinationChecksum = Self.normalizedOptionalString(
+            localDestinationChecksum,
+            lowercased: true
+        )
+        self.preservedLocalArtifactDirectories = Array(Set(
+            preservedLocalArtifactDirectories.map {
+                $0.absoluteURL.standardizedFileURL
+            }
+        )).sorted { $0.absoluteString < $1.absoluteString }
+        self.metadataCacheNamespace = metadataCacheNamespace
+        self.kind = kind
+    }
+
+    static func normalizedOptionalString(
+        _ value: String?,
+        lowercased: Bool = false
+    ) -> String? {
+        guard let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !normalized.isEmpty else {
+            return nil
+        }
+        return lowercased ? normalized.lowercased() : normalized
+    }
+}
+
+public struct DownloadOperationConfigurationConflictError: LocalizedError, Sendable {
+    public let operationKey: DownloadOperationKey
+    public let admittedConfiguration: DownloadExecutionConfigurationSignature
+    public let proposedConfiguration: DownloadExecutionConfigurationSignature
+
+    public init(
+        operationKey: DownloadOperationKey,
+        admittedConfiguration: DownloadExecutionConfigurationSignature,
+        proposedConfiguration: DownloadExecutionConfigurationSignature
+    ) {
+        self.operationKey = operationKey
+        self.admittedConfiguration = admittedConfiguration
+        self.proposedConfiguration = proposedConfiguration
+    }
+
+    public var errorDescription: String? {
+        "A download is already registered for this source and destination with incompatible settings."
+    }
+}
+
 public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked Sendable {
     public static var groupIdentifier: String? = nil
     public let objectWillChange = ObservableObjectPublisher()
@@ -319,8 +438,18 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     private let downloadObservationLock = NSLock()
     private var downloadObservationGeneration = UUID()
     
-    public var id: String {
-        return url.absoluteString
+    public var id: DownloadOperationKey {
+        DownloadOperationKey(sourceURL: url, destinationURL: localDestination)
+    }
+
+    public var executionConfigurationSignature: DownloadExecutionConfigurationSignature {
+        DownloadExecutionConfigurationSignature(
+            mirrorURL: mirrorURL,
+            localDestinationChecksum: localDestinationChecksum,
+            preservedLocalArtifactDirectories: preservedLocalArtifactDirectories,
+            metadataCacheNamespace: metadataStore.metadataCacheNamespace,
+            kind: .download
+        )
     }
 
     private var shouldLogReaderOptimizationDiagnostics: Bool {
@@ -449,13 +578,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     }
     
     public static func == (lhs: Downloadable, rhs: Downloadable) -> Bool {
-        return lhs.url == rhs.url
-            && lhs.mirrorURL == rhs.mirrorURL
-            && lhs.name == rhs.name
-            && lhs.localDestination == rhs.localDestination
-            && lhs.localDestinationChecksum == rhs.localDestinationChecksum
-            && lhs.preservedLocalArtifactDirectories
-                == rhs.preservedLocalArtifactDirectories
+        lhs.id == rhs.id
     }
     
     public var localDestinationFilename: String {
@@ -518,13 +641,6 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         }
         return url.pathExtension == "br"
             && FileManager.default.fileExists(atPath: compressedFileURL.path)
-    }
-
-    var installedArtifactReceiptStorageKey: String {
-        [
-            standardizedArtifactSourceURL(url).absoluteString,
-            localDestination.standardizedFileURL.absoluteString
-        ].joined(separator: "\u{0}")
     }
 
     func validInstalledArtifactReceipt() -> InstalledArtifactReceipt? {
@@ -911,7 +1027,12 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         destination: URL
     ) async -> URLResourceDownloadTask {
         let observationGeneration = beginDownloadObservation()
-        let task = URLResourceDownloadTask(session: session, url: url, destination: destination)
+        let task = URLResourceDownloadTask(
+            session: session,
+            url: url,
+            destination: destination,
+            operationKey: id
+        )
         
         task.publisher.receive(on: DispatchQueue.main).sink(
             receiveCompletion: { _ in
@@ -1357,6 +1478,11 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
         let receipt: InstalledArtifactReceipt
         let successfulDownloadMetadata: SuccessfulDownloadMetadata?
     }
+    private enum DownloadAdmission {
+        case owner(Downloadable)
+        case compatibleReplay(owner: Downloadable)
+        case rejected
+    }
 
     nonisolated(unsafe) public static var shared: DownloadController = {
         let controller = DownloadController()
@@ -1412,16 +1538,19 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     
     private var observation: NSKeyValueObservation?
     private var cancellables = Set<AnyCancellable>()
-    private var downloadStatusCancellables = [String: Set<AnyCancellable>]()
-    private var processingTasks = [String: ProcessingTaskRecord]()
-    private var checksumRecoveryTasks = [String: ProcessingTaskRecord]()
-    private var downloadTasks = [String: ProcessingTaskRecord]()
-    private var downloadAttemptIDs = [String: UUID]()
+    private var downloadStatusCancellables = [DownloadOperationKey: Set<AnyCancellable>]()
+    private var processingTasks = [DownloadOperationKey: ProcessingTaskRecord]()
+    private var checksumRecoveryTasks = [DownloadOperationKey: ProcessingTaskRecord]()
+    private var downloadTasks = [DownloadOperationKey: ProcessingTaskRecord]()
+    private var downloadAttemptIDs = [DownloadOperationKey: UUID]()
     private var activeTransferStagingURLs = Set<URL>()
-    private var checksumRecoveriesReadyForProcessing = Set<String>()
-    private var checksumRedownloadAttempted = Set<String>()
-    private var completionMetadataRetryDownloadIDs = Set<String>()
-    private var pendingInstalledArtifactReceipts = [String: PendingInstalledArtifactReceipt]()
+    private var checksumRecoveriesReadyForProcessing = Set<DownloadOperationKey>()
+    private var checksumRedownloadAttempted = Set<DownloadOperationKey>()
+    private var completionMetadataRetryDownloadIDs = Set<DownloadOperationKey>()
+    private var pendingInstalledArtifactReceipts = [
+        DownloadOperationKey: PendingInstalledArtifactReceipt
+    ]()
+    private var admittedDownloads = [DownloadOperationKey: Downloadable]()
     private let session: URLSession
     private let attemptExecutor: DownloadAttemptExecutor?
     private let retryPolicyProvider: @Sendable () -> DownloadRetryPolicy
@@ -1782,11 +1911,21 @@ public extension DownloadController {
     
     @DownloadActor
     func delete(download: Downloadable) async throws -> Downloadable {
+        switch await admit(download) {
+        case .owner:
+            break
+        case .compatibleReplay(let owner):
+            _ = try await delete(download: owner)
+            await mirrorTerminalState(from: owner, to: download)
+            return download
+        case .rejected:
+            return download
+        }
         // Fence any delegate/retry completion that arrives after deletion.
         downloadAttemptIDs[download.id] = nil
         completionMetadataRetryDownloadIDs.remove(download.id)
         pendingInstalledArtifactReceipts[
-            download.installedArtifactReceiptStorageKey
+            download.id
         ] = nil
         download.invalidateDownloadObservation()
         let downloadRecord = downloadTasks[download.id]
@@ -1794,7 +1933,7 @@ public extension DownloadController {
         let recoveryRecord = checksumRecoveryTasks[download.id]
         processingRecord?.task.cancel()
         recoveryRecord?.task.cancel()
-        await cancelInProgressDownloads(matchingDownloadURL: download.url)
+        await cancelInProgressDownload(download)
         await downloadRecord?.task.value
         await processingRecord?.task.value
         await recoveryRecord?.task.value
@@ -1822,15 +1961,18 @@ public extension DownloadController {
             preservingActiveTransfers: false
         )
         await MainActor.run {
-            assuredDownloads = assuredDownloads.filter { $0.url != download.url }
-            finishedDownloads = finishedDownloads.filter { $0.url != download.url }
-            failedDownloads = failedDownloads.filter { $0.url != download.url }
-            activeDownloads = activeDownloads.filter { $0.url != download.url }
+            assuredDownloads = assuredDownloads.filter { $0.id != download.id }
+            finishedDownloads = finishedDownloads.filter { $0.id != download.id }
+            failedDownloads = failedDownloads.filter { $0.id != download.id }
+            activeDownloads = activeDownloads.filter { $0.id != download.id }
             download.isActive = false
             download.isFinishedProcessing = false
             download.isFinishedDownloading = false
             download.isFailed = false
             download.downloadProgress = .uninitiated
+        }
+        if admittedDownloads[download.id] === download {
+            admittedDownloads[download.id] = nil
         }
         return download
     }
@@ -1845,6 +1987,31 @@ public extension DownloadController {
         _ = try await delete(download: download)
     }
     
+    @MainActor
+    func isDownloaded(_ download: Downloadable) -> Bool {
+        finishedDownloads.contains(download)
+    }
+
+    @MainActor
+    func isDownloading(_ download: Downloadable) -> Bool {
+        activeDownloads.contains(download)
+    }
+
+    @MainActor
+    func isFailed(_ download: Downloadable) -> Bool {
+        failedDownloads.contains(download)
+    }
+
+    @MainActor
+    func downloadable(for operationKey: DownloadOperationKey) -> Downloadable? {
+        finishedDownloads.first(where: { $0.id == operationKey })
+            ?? activeDownloads.first(where: { $0.id == operationKey })
+            ?? failedDownloads.first(where: { $0.id == operationKey })
+            ?? assuredDownloads.first(where: { $0.id == operationKey })
+    }
+
+    /// Source-wide compatibility query. Prefer the descriptor/key overload
+    /// when more than one destination may use the same source URL.
     @MainActor
     func isDownloaded(url: URL) -> Bool {
         return finishedDownloads.map { $0.url }.contains(url)
@@ -1868,6 +2035,104 @@ public extension DownloadController {
 
 extension DownloadController {
     @DownloadActor
+    private func admit(_ proposedDownload: Downloadable) async -> DownloadAdmission {
+        guard let admittedDownload = admittedDownloads[proposedDownload.id] else {
+            admittedDownloads[proposedDownload.id] = proposedDownload
+            return .owner(proposedDownload)
+        }
+        guard admittedDownload !== proposedDownload else {
+            return .owner(admittedDownload)
+        }
+        guard admittedDownload.executionConfigurationSignature
+                == proposedDownload.executionConfigurationSignature else {
+            let error = DownloadOperationConfigurationConflictError(
+                operationKey: proposedDownload.id,
+                admittedConfiguration: admittedDownload.executionConfigurationSignature,
+                proposedConfiguration: proposedDownload.executionConfigurationSignature
+            )
+            await markRejectedDownload(proposedDownload, error: error)
+            return .rejected
+        }
+        return .compatibleReplay(owner: admittedDownload)
+    }
+
+    @DownloadActor
+    private func markRejectedDownload(
+        _ download: Downloadable,
+        error: DownloadOperationConfigurationConflictError
+    ) async {
+        await MainActor.run {
+            if let importable = download as? ImportableDownloadable {
+                importable.lastImportError = error
+                importable.importProgress = nil
+                importable.importStatusText = "Download configuration conflict"
+            }
+            download.isFailed = true
+            download.isActive = false
+            download.isFinishedDownloading = false
+            download.isFinishedProcessing = false
+            download.downloadProgress = .completed(
+                destinationLocation: nil,
+                etag: nil,
+                error: error
+            )
+        }
+    }
+
+    @DownloadActor
+    private func joinCompatibleReplay(
+        _ replay: Downloadable,
+        owner: Downloadable
+    ) async {
+        while !Task.isCancelled {
+            let isTerminal = await MainActor.run {
+                replay.downloadProgress = owner.downloadProgress
+                replay.isFailed = owner.isFailed
+                replay.isActive = owner.isActive
+                replay.isFinishedDownloading = owner.isFinishedDownloading
+                replay.isFinishedProcessing = owner.isFinishedProcessing
+                replay.fileSize = owner.fileSize
+                if let replayImportable = replay as? ImportableDownloadable,
+                   let ownerImportable = owner as? ImportableDownloadable {
+                    replayImportable.lastImportError = ownerImportable.lastImportError
+                    replayImportable.importProgress = ownerImportable.importProgress
+                    replayImportable.importStatusText = ownerImportable.importStatusText
+                }
+                return owner.isFailed || owner.isFinishedProcessing
+            }
+            if isTerminal {
+                return
+            }
+            guard admittedDownloads[owner.id] === owner else {
+                await mirrorTerminalState(from: owner, to: replay)
+                return
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    @DownloadActor
+    private func mirrorTerminalState(
+        from owner: Downloadable,
+        to replay: Downloadable
+    ) async {
+        await MainActor.run {
+            replay.downloadProgress = owner.downloadProgress
+            replay.isFailed = owner.isFailed
+            replay.isActive = owner.isActive
+            replay.isFinishedDownloading = owner.isFinishedDownloading
+            replay.isFinishedProcessing = owner.isFinishedProcessing
+            replay.fileSize = owner.fileSize
+            if let replayImportable = replay as? ImportableDownloadable,
+               let ownerImportable = owner as? ImportableDownloadable {
+                replayImportable.lastImportError = ownerImportable.lastImportError
+                replayImportable.importProgress = ownerImportable.importProgress
+                replayImportable.importStatusText = ownerImportable.importStatusText
+            }
+        }
+    }
+
+    @DownloadActor
     private func hasProcessableArtifactOrPendingReceipt(
         for download: Downloadable
     ) -> Bool {
@@ -1875,7 +2140,7 @@ extension DownloadController {
             return true
         }
         guard let pendingReceipt = pendingInstalledArtifactReceipts[
-            download.installedArtifactReceiptStorageKey
+            download.id
         ] else {
             return false
         }
@@ -1883,7 +2148,7 @@ extension DownloadController {
     }
 
     @DownloadActor
-    private func clearDownloadStatusObservers(forDownloadID downloadID: String) {
+    private func clearDownloadStatusObservers(forDownloadID downloadID: DownloadOperationKey) {
         guard let cancellables = downloadStatusCancellables.removeValue(forKey: downloadID) else {
             return
         }
@@ -1991,7 +2256,16 @@ extension DownloadController {
     @MainActor
     public func ensureDownloaded(download: Downloadable, deletingOrphansIn: [DownloadDirectory] = [], excludingFromDeletion: Set<Downloadable> = Set()) async {
         await download.waitForDownloadMetadata()
-        if assuredDownloads.contains(where: { $0.url == download.url }) && !failedDownloads.contains(where: { $0.url == download.url }) {
+        switch await admit(download) {
+        case .owner:
+            break
+        case .compatibleReplay(let owner):
+            await joinCompatibleReplay(download, owner: owner)
+            return
+        case .rejected:
+            return
+        }
+        if assuredDownloads.contains(download) && !failedDownloads.contains(download) {
             let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
             let importedWithoutRetainedSource = isImported
                 && (download as? ImportableDownloadable)?.deleteAfterImport == true
@@ -2066,6 +2340,15 @@ extension DownloadController {
         remoteModifiedAt: Date? = nil,
         updatesRemoteModifiedAt: Bool = false
     ) async {
+        switch await admit(download) {
+        case .owner:
+            break
+        case .compatibleReplay(let owner):
+            await joinCompatibleReplay(download, owner: owner)
+            return
+        case .rejected:
+            return
+        }
         guard !Task.isCancelled,
               downloadAttemptIDs[download.id] == nil,
               downloadTasks[download.id] == nil else { return }
@@ -2207,7 +2490,7 @@ extension DownloadController {
         }
 
         let allTasks = await session.allTasks
-        if allTasks.first(where: { $0.taskDescription == download.url.absoluteString }) != nil {
+        if allTasks.first(where: { $0.taskDescription == download.id.taskDescription }) != nil {
             // Task exists.
             return nil
         }
@@ -2334,25 +2617,59 @@ extension DownloadController {
     }
     
     @MainActor
-    public func cancelInProgressDownloads(matchingDownloadURL downloadURL: URL? = nil) async {
+    public func cancelInProgressDownload(_ download: Downloadable) async {
+        switch await admit(download) {
+        case .owner, .compatibleReplay:
+            break
+        case .rejected:
+            return
+        }
         let allTasks = await session.allTasks
-        let matchingTasks = allTasks.filter { task in
-            guard let downloadURL else { return true }
-            return task.taskDescription == downloadURL.absoluteString
+        let matchingTasks = allTasks.filter {
+            $0.taskDescription == download.id.taskDescription
         }
         for task in matchingTasks {
             task.cancel()
         }
-        await cancelOwnedDownloadWork(matchingDownloadURL: downloadURL)
+        await cancelOwnedDownloadWork(matching: download.id)
+    }
+
+    /// Cancels every operation whose canonical source URL matches `sourceURL`,
+    /// regardless of destination. Prefer exact descriptor cancellation.
+    @MainActor
+    public func cancelInProgressDownloads(matchingSourceURL sourceURL: URL) async {
+        let standardizedSourceURL = DownloadOperationKey.standardizedSourceURL(sourceURL)
+        let allTasks = await session.allTasks
+        for task in allTasks where task.taskDescription == standardizedSourceURL.absoluteString
+            || DownloadOperationKey(
+                taskDescription: task.taskDescription ?? ""
+            )?.sourceURL == standardizedSourceURL {
+            task.cancel()
+        }
+        await cancelOwnedDownloadWork(matchingSourceURL: standardizedSourceURL)
+    }
+
+    @MainActor
+    public func cancelAllInProgressDownloads() async {
+        for task in await session.allTasks {
+            task.cancel()
+        }
+        await cancelOwnedDownloadWork()
     }
 
     @DownloadActor
-    private func cancelOwnedDownloadWork(matchingDownloadURL downloadURL: URL?) {
-        let matchingID = downloadURL?.absoluteString
-        let records = downloadTasks.filter { matchingID == nil || $0.key == matchingID }
+    private func cancelOwnedDownloadWork(
+        matching operationKey: DownloadOperationKey? = nil,
+        matchingSourceURL sourceURL: URL? = nil
+    ) {
+        let matches: (DownloadOperationKey) -> Bool = { key in
+            (operationKey == nil || key == operationKey)
+                && (sourceURL == nil || key.sourceURL == sourceURL)
+        }
+        let records = downloadTasks.filter { matches($0.key) }
             .map(\.value)
-            + processingTasks.filter { matchingID == nil || $0.key == matchingID }.map(\.value)
-            + checksumRecoveryTasks.filter { matchingID == nil || $0.key == matchingID }.map(\.value)
+            + processingTasks.filter { matches($0.key) }.map(\.value)
+            + checksumRecoveryTasks.filter { matches($0.key) }.map(\.value)
         records.forEach { $0.task.cancel() }
         // Each owner removes only its candidates and publishes its terminal
         // cancellation. Ownership remains until it drains. Cancellation itself
@@ -2364,10 +2681,16 @@ extension DownloadController {
     func cancelInProgressDownloads(inApp: Bool = false, inDownloadExtension: Bool = false) async throws {
         if inApp {
             let allTasks = await session.allTasks
-            for task in allTasks.filter({ task in assuredDownloads.contains(where: { $0.url.absoluteString == (task.taskDescription ?? "") }) }) {
+            let assuredDownloadIDs = Set(assuredDownloads.map(\.id))
+            for task in allTasks.filter({ task in
+                guard let taskDescription = task.taskDescription,
+                      let key = DownloadOperationKey(taskDescription: taskDescription)
+                else { return false }
+                return assuredDownloadIDs.contains(key)
+            }) {
                 task.cancel()
             }
-            await cancelOwnedDownloadWork(matchingDownloadURL: nil)
+            await cancelOwnedDownloadWork()
         }
         if inDownloadExtension {
             if Bundle.main.object(forInfoDictionaryKey: "BAInitialDownloadRestrictions") != nil {
@@ -2437,14 +2760,17 @@ extension DownloadController {
     }
 
     @DownloadActor
-    private func clearProcessingTask(forDownloadID downloadID: String, processingTaskID: UUID) {
+    private func clearProcessingTask(
+        forDownloadID downloadID: DownloadOperationKey,
+        processingTaskID: UUID
+    ) {
         guard processingTasks[downloadID]?.id == processingTaskID else { return }
         processingTasks[downloadID] = nil
     }
 
     @DownloadActor
     private func clearChecksumRecoveryTask(
-        forDownloadID downloadID: String,
+        forDownloadID downloadID: DownloadOperationKey,
         taskID: UUID
     ) {
         guard checksumRecoveryTasks[downloadID]?.id == taskID else { return }
@@ -2495,7 +2821,7 @@ extension DownloadController {
                 at: download.checksumVerificationMarkerURL
             )
             pendingInstalledArtifactReceipts[
-                download.installedArtifactReceiptStorageKey
+                download.id
             ] = nil
             try download.removeInstalledArtifactReceipt()
         }
@@ -2540,6 +2866,15 @@ extension DownloadController {
         updatesRemoteModifiedAt: Bool = false,
         recordSuccessfulDownload: Bool = true
     ) async {
+        switch await admit(download) {
+        case .owner:
+            break
+        case .compatibleReplay(let owner):
+            await joinCompatibleReplay(download, owner: owner)
+            return
+        case .rejected:
+            return
+        }
 
         if let currentDownload = downloadTasks[download.id]?.task {
             await currentDownload.value
@@ -2633,6 +2968,15 @@ extension DownloadController {
         remoteModifiedAt: Date? = nil,
         updatesRemoteModifiedAt: Bool = false
     ) async {
+        switch await admit(download) {
+        case .owner:
+            break
+        case .compatibleReplay(let owner):
+            await joinCompatibleReplay(download, owner: owner)
+            return
+        case .rejected:
+            return
+        }
         if let currentDownload = downloadTasks[download.id]?.task {
             // The in-flight replacement owns checksum validation and recovery.
             await currentDownload.value
@@ -2755,7 +3099,7 @@ extension DownloadController {
                 at: download.localDestination
             )
             pendingInstalledArtifactReceipts[
-                download.installedArtifactReceiptStorageKey
+                download.id
             ] = nil
             try? download.removeInstalledArtifactReceipt()
         }
@@ -2813,7 +3157,7 @@ extension DownloadController {
         } else if completionMetadataRetryDownloadIDs.contains(download.id) {
             do {
                 try Task.checkCancellation()
-                let receiptKey = download.installedArtifactReceiptStorageKey
+                let receiptKey = download.id
                 let importDeletedSource = if let importable = download as? ImportableDownloadable,
                                              importable.deleteAfterImport {
                     await importable.isImported()
@@ -2872,7 +3216,7 @@ extension DownloadController {
                     if !(error is DownloadMetadataPersistenceError) {
                         completionMetadataRetryDownloadIDs.remove(download.id)
                         pendingInstalledArtifactReceipts[
-                            download.installedArtifactReceiptStorageKey
+                            download.id
                         ] = nil
                     }
                     await publishCompletionMetadataFailure(error, for: download)
@@ -3166,7 +3510,7 @@ extension DownloadController {
                 try? FileManager.default.removeItem(at: download.localDestination)
             }
 
-            let receiptKey = download.installedArtifactReceiptStorageKey
+            let receiptKey = download.id
             if let importable = download as? ImportableDownloadable,
                importable.deleteAfterImport {
                 pendingInstalledArtifactReceipts[receiptKey] = nil
@@ -3234,7 +3578,7 @@ extension DownloadController {
             }
             completionMetadataRetryDownloadIDs.remove(download.id)
             pendingInstalledArtifactReceipts[
-                download.installedArtifactReceiptStorageKey
+                download.id
             ] = nil
             await publishSuccessfulCompletion(download)
             checksumRedownloadAttempted.remove(download.id)
@@ -3336,7 +3680,7 @@ extension DownloadController {
             }
             if shouldDeleteLocal && !preservesInstalledDestination {
                 pendingInstalledArtifactReceipts[
-                    download.installedArtifactReceiptStorageKey
+                    download.id
                 ] = nil
                 try? download.removeInstalledArtifactReceipt()
             }

@@ -81,7 +81,284 @@ private actor DownloadAttemptReleaseGate {
     }
 }
 
+private actor DownloadOperationInvocationCounter {
+    private var count = 0
+
+    func record() {
+        count += 1
+    }
+
+    func value() -> Int {
+        count
+    }
+}
+
 final class DownloadRetryIntegrationTests: XCTestCase {
+    func testCompatibleSameKeyReplayJoinsActiveOwnerWithoutDuplicateAttempt() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-compatible-replay-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = URL(string: "https://download-replay.test/shared")!
+        let destination = directory.appendingPathComponent("payload.bin")
+        let owner = Downloadable(
+            url: sourceURL,
+            name: "Original name",
+            localDestination: destination
+        )
+        let replay = Downloadable(
+            url: sourceURL,
+            name: "Renamed while active",
+            localDestination: destination
+        )
+        let gate = DownloadAttemptReleaseGate()
+        let counter = DownloadOperationInvocationCounter()
+        let started = expectation(description: "Owner transfer started")
+        let payload = Data("joined-payload".utf8)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            await counter.record()
+            started.fulfill()
+            await gate.wait()
+            let candidate = download.uncompressedTransferStagingURL(operationID: UUID())
+            try payload.write(to: candidate)
+            return DownloadTransferResult(
+                destinationLocation: candidate,
+                etag: nil,
+                lastModified: nil
+            )
+        })
+
+        let ownerOperation = Task { await controller.download(owner) }
+        await fulfillment(of: [started], timeout: 2)
+        let replayOperation = Task { await controller.download(replay) }
+        await gate.release()
+        await ownerOperation.value
+        await replayOperation.value
+
+        let attemptCount = await counter.value()
+        XCTAssertEqual(attemptCount, 1)
+        let states = await MainActor.run {
+            (
+                owner.isFinishedProcessing,
+                owner.isFailed,
+                replay.isFinishedProcessing,
+                replay.isFailed
+            )
+        }
+        XCTAssertTrue(states.0)
+        XCTAssertFalse(states.1)
+        XCTAssertTrue(states.2)
+        XCTAssertFalse(states.3)
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+    }
+
+    func testIncompatibleBaseConfigurationsRejectWithoutAffectingOwner() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-configuration-conflict-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = URL(string: "https://download-conflict.test/shared")!
+        let destination = directory.appendingPathComponent("payload.bin")
+        let preservedDirectory = directory.appendingPathComponent("preserved", isDirectory: true)
+        let mirrorURL = URL(string: "https://mirror-a.test/shared")!
+        let metadataStore = UserDefaultsDownloadableMetadataStore(
+            metadataCacheNamespace: "configuration-a"
+        )
+        let owner = Downloadable(
+            url: sourceURL,
+            mirrorURL: mirrorURL,
+            name: "Owner",
+            localDestination: destination,
+            preservedLocalArtifactDirectories: [preservedDirectory],
+            metadataStore: metadataStore
+        )
+        let gate = DownloadAttemptReleaseGate()
+        let counter = DownloadOperationInvocationCounter()
+        let started = expectation(description: "Owner transfer started")
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            await counter.record()
+            started.fulfill()
+            await gate.wait()
+            let candidate = download.uncompressedTransferStagingURL(operationID: UUID())
+            try Data("owner".utf8).write(to: candidate)
+            return DownloadTransferResult(
+                destinationLocation: candidate,
+                etag: nil,
+                lastModified: nil
+            )
+        })
+        let conflicts = [
+            Downloadable(
+                url: sourceURL,
+                mirrorURL: URL(string: "https://mirror-b.test/shared")!,
+                name: "Mirror conflict",
+                localDestination: destination,
+                preservedLocalArtifactDirectories: [preservedDirectory],
+                metadataStore: metadataStore
+            ),
+            Downloadable(
+                url: sourceURL,
+                mirrorURL: mirrorURL,
+                name: "Checksum conflict",
+                localDestination: destination,
+                localDestinationChecksum: "ABCD",
+                preservedLocalArtifactDirectories: [preservedDirectory],
+                metadataStore: metadataStore
+            ),
+            Downloadable(
+                url: sourceURL,
+                mirrorURL: mirrorURL,
+                name: "Preserved directory conflict",
+                localDestination: destination,
+                preservedLocalArtifactDirectories: [directory.appendingPathComponent("other")],
+                metadataStore: metadataStore
+            ),
+            Downloadable(
+                url: sourceURL,
+                mirrorURL: mirrorURL,
+                name: "Metadata conflict",
+                localDestination: destination,
+                preservedLocalArtifactDirectories: [preservedDirectory],
+                metadataStore: UserDefaultsDownloadableMetadataStore(
+                    metadataCacheNamespace: "configuration-b"
+                )
+            )
+        ]
+
+        let ownerOperation = Task { await controller.download(owner) }
+        await fulfillment(of: [started], timeout: 2)
+        for conflict in conflicts {
+            await controller.download(conflict)
+            let completed = try await conflict.awaitCompletionOrFailure()
+            XCTAssertFalse(completed)
+            let error = await MainActor.run { () -> Error? in
+                guard case .completed(_, _, let error) = conflict.downloadProgress else {
+                    return nil
+                }
+                return error
+            }
+            XCTAssertTrue(error is DownloadOperationConfigurationConflictError)
+        }
+        let ownerFailedBeforeRelease = await MainActor.run { owner.isFailed }
+        XCTAssertFalse(ownerFailedBeforeRelease)
+        let attemptCount = await counter.value()
+        XCTAssertEqual(attemptCount, 1)
+        await gate.release()
+        await ownerOperation.value
+        let ownerCompleted = await MainActor.run {
+            owner.isFinishedProcessing && !owner.isFailed
+        }
+        XCTAssertTrue(ownerCompleted)
+    }
+
+    func testIncompatibleImportConfigurationRejectsWithoutRunningSecondImport() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-import-configuration-conflict-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = URL(string: "https://download-import-conflict.test/shared")!
+        let destination = directory.appendingPathComponent("payload.bin")
+        let gate = DownloadAttemptReleaseGate()
+        let importStarted = expectation(description: "Owner import started")
+        let importCounter = DownloadOperationInvocationCounter()
+        let owner = ImportableDownloadable(
+            url: sourceURL,
+            name: "Owner import",
+            localDestination: destination,
+            deleteAfterImport: false,
+            glossaryFTSEnabled: false,
+            importOperationIdentifier: "ledger-a",
+            isImported: { false },
+            importHandler: { _, _ in
+                await importCounter.record()
+                importStarted.fulfill()
+                await gate.wait()
+            }
+        )
+        let conflicts = [
+            ImportableDownloadable(
+                url: sourceURL,
+                name: "Delete flag conflict",
+                localDestination: destination,
+                deleteAfterImport: true,
+                glossaryFTSEnabled: false,
+                importOperationIdentifier: "ledger-a",
+                isImported: { false },
+                importHandler: { _, _ in XCTFail("Rejected import ran") }
+            ),
+            ImportableDownloadable(
+                url: sourceURL,
+                name: "FTS flag conflict",
+                localDestination: destination,
+                deleteAfterImport: false,
+                glossaryFTSEnabled: true,
+                importOperationIdentifier: "ledger-a",
+                isImported: { false },
+                importHandler: { _, _ in XCTFail("Rejected import ran") }
+            ),
+            ImportableDownloadable(
+                url: sourceURL,
+                name: "Ledger conflict",
+                localDestination: destination,
+                deleteAfterImport: false,
+                glossaryFTSEnabled: false,
+                importOperationIdentifier: "ledger-b",
+                isImported: { false },
+                importHandler: { _, _ in XCTFail("Rejected import ran") }
+            )
+        ]
+        try Data("payload".utf8).write(to: destination)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let ownerOperation = Task { await controller.finishDownload(owner) }
+        await fulfillment(of: [importStarted], timeout: 2)
+
+        for conflict in conflicts {
+            await controller.finishDownload(conflict)
+            let completed = try await conflict.awaitCompletionOrFailure()
+            XCTAssertFalse(completed)
+            let wasRejected = await MainActor.run {
+                conflict.isFailed
+                    && conflict.lastImportError is DownloadOperationConfigurationConflictError
+            }
+            XCTAssertTrue(wasRejected)
+        }
+        let baseConflict = Downloadable(
+            url: sourceURL,
+            name: "Base kind conflict",
+            localDestination: destination
+        )
+        await controller.finishDownload(baseConflict)
+        let baseConflictCompleted = try await baseConflict.awaitCompletionOrFailure()
+        XCTAssertFalse(baseConflictCompleted)
+        let baseConflictError = await MainActor.run { () -> Error? in
+            guard case .completed(_, _, let error) = baseConflict.downloadProgress else {
+                return nil
+            }
+            return error
+        }
+        XCTAssertTrue(baseConflictError is DownloadOperationConfigurationConflictError)
+        let importCount = await importCounter.value()
+        XCTAssertEqual(importCount, 1)
+        let ownerFailedBeforeRelease = await MainActor.run { owner.isFailed }
+        XCTAssertFalse(ownerFailedBeforeRelease)
+        await gate.release()
+        await ownerOperation.value
+        let ownerCompleted = await MainActor.run {
+            owner.isFinishedProcessing && !owner.isFailed
+        }
+        XCTAssertTrue(ownerCompleted)
+    }
+
     func testReplacementWaitsForStandaloneImportAndInstallsItsOwnCandidate() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "download-processing-replacement-\(UUID().uuidString)", isDirectory: true
@@ -143,11 +420,11 @@ final class DownloadRetryIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let selected = Downloadable(
-            url: URL(string: "https://download-staging.test/selected")!, name: "Selected",
+            url: URL(string: "https://download-staging.test/shared")!, name: "Selected",
             localDestination: directory.appendingPathComponent("payload.bin")
         )
         let retained = Downloadable(
-            url: URL(string: "https://download-staging.test/retained")!, name: "Retained",
+            url: URL(string: "https://download-staging.test/shared")!, name: "Retained",
             localDestination: directory.appendingPathComponent("payload.json")
         )
         let selectedCandidate = selected.uncompressedTransferStagingURL(operationID: UUID())
@@ -166,6 +443,76 @@ final class DownloadRetryIntegrationTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: selectedCandidate.path))
         XCTAssertEqual(try Data(contentsOf: retainedCandidate), payload)
         XCTAssertEqual(try Data(contentsOf: retainedCompressedCandidate), payload)
+    }
+
+    func testSameSourceDifferentDestinationsCompleteIndependentlyInReverseOrder() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-operation-identity-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let sourceURL = URL(string: "https://download-identity.test/shared")!
+        let first = Downloadable(
+            url: sourceURL,
+            name: "First destination",
+            localDestination: directory.appendingPathComponent("first.bin")
+        )
+        let second = Downloadable(
+            url: sourceURL,
+            name: "Second destination",
+            localDestination: directory.appendingPathComponent("second.bin")
+        )
+        let firstGate = DownloadAttemptReleaseGate()
+        let secondGate = DownloadAttemptReleaseGate()
+        let bothStarted = expectation(description: "Both destination variants started")
+        bothStarted.expectedFulfillmentCount = 2
+        let firstPayload = Data("first-payload".utf8)
+        let secondPayload = Data("second-payload".utf8)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            bothStarted.fulfill()
+            if download.id == first.id {
+                await firstGate.wait()
+            } else {
+                await secondGate.wait()
+            }
+            try Task.checkCancellation()
+            let candidate = download.uncompressedTransferStagingURL(operationID: UUID())
+            try (download.id == first.id ? firstPayload : secondPayload).write(to: candidate)
+            return DownloadTransferResult(
+                destinationLocation: candidate,
+                etag: nil,
+                lastModified: nil
+            )
+        })
+
+        let firstOperation = Task { await controller.download(first) }
+        let secondOperation = Task { await controller.download(second) }
+        await fulfillment(of: [bothStarted], timeout: 2)
+        await secondGate.release()
+        await secondOperation.value
+
+        XCTAssertEqual(try Data(contentsOf: second.localDestination), secondPayload)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: first.localDestination.path))
+        await firstGate.release()
+        await firstOperation.value
+        XCTAssertEqual(try Data(contentsOf: first.localDestination), firstPayload)
+        let finished = await MainActor.run {
+            controller.finishedDownloads
+        }
+        XCTAssertTrue(finished.contains(first))
+        XCTAssertTrue(finished.contains(second))
+
+        _ = try await controller.delete(download: first)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: first.localDestination.path))
+        XCTAssertEqual(try Data(contentsOf: second.localDestination), secondPayload)
+        let remainingFinished = await MainActor.run {
+            controller.finishedDownloads
+        }
+        XCTAssertFalse(remainingFinished.contains(first))
+        XCTAssertTrue(remainingFinished.contains(second))
     }
 
     func testScopedBackoffCancellationPreservesAnotherLogicalDownload() async throws {
@@ -223,7 +570,7 @@ final class DownloadRetryIntegrationTests: XCTestCase {
         }
 
         await fulfillment(of: [enteredBackoff, retainedStarted], timeout: 2)
-        await controller.cancelInProgressDownloads(matchingDownloadURL: cancelledDownload.url)
+        await controller.cancelInProgressDownload(cancelledDownload)
         await retainedGate.release()
         await fulfillment(of: [cancelledCompleted, retainedCompleted], timeout: 2)
         cancelledOperation.cancel()
@@ -291,7 +638,7 @@ final class DownloadRetryIntegrationTests: XCTestCase {
         let sessionTasks = await session.allTasks
         XCTAssertTrue(sessionTasks.isEmpty)
         let cancellation = Task {
-            await controller.cancelInProgressDownloads(matchingDownloadURL: download.url)
+            await controller.cancelInProgressDownload(download)
         }
         await fulfillment(of: [completed], timeout: 2)
         // Ensure a failed assertion cannot leave the long backoff running.
@@ -337,7 +684,7 @@ final class DownloadRetryIntegrationTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
 
-        await controller.cancelInProgressDownloads(matchingDownloadURL: selectedURL)
+        await controller.cancelInProgressDownloads(matchingSourceURL: selectedURL)
 
         for _ in 0..<50 where selectedTask.state == .running {
             try? await Task.sleep(nanoseconds: 1_000_000)

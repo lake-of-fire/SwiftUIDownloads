@@ -54,7 +54,7 @@ public struct DownloadProgress: View {
         if download.isFailed {
             return true
         }
-        if downloadController.failedDownloads.contains(where: { $0.url == download.url }) {
+        if downloadController.failedDownloads.contains(download) {
             return true
         }
         switch download.downloadProgress {
@@ -285,7 +285,12 @@ public struct DownloadProgressView: View {
     }
 
     public var body: some View {
-        InnerDownloadProgressView(size: size, url: downloadable.url, fractionCompleted: downloadable.fractionCompleted, downloadURLs: $downloadURLs)
+        InnerDownloadProgressView(
+            size: size,
+            downloadable: downloadable,
+            fractionCompleted: downloadable.fractionCompleted,
+            downloadURLs: $downloadURLs
+        )
     }
 }
 
@@ -306,7 +311,7 @@ public struct DownloadButton: View {
     
     @ViewBuilder private var button: some View {
         Button(action: {
-            downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.url.absoluteString])))
+            downloadURLs = Array(Set(downloadURLs).union(Set([downloadable.id.taskDescription])))
             if let downloadAction = downloadAction {
                 Task {
                     await downloadAction(downloadable)
@@ -353,8 +358,8 @@ struct CancelDownloadButton: View {
     public var body: some View {
         Button(role: .cancel, action: {
             Task { @MainActor in
-                downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString])))
-                await DownloadController.shared.cancelInProgressDownloads(matchingDownloadURL: downloadable.url)
+                downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.id.taskDescription])))
+                await DownloadController.shared.cancelInProgressDownload(downloadable)
             }
         }) {
             Text("Cancel")
@@ -391,15 +396,15 @@ public struct FailureMessagesButton: View {
 
 struct InnerDownloadProgressView: View {
     let size: CGFloat // Size parameter for circle, path, and stop image
-    let url: URL
+    let downloadable: Downloadable
     let fractionCompleted: Double
     @Binding var downloadURLs: [String]
 
     public var body: some View {
         Button(action: {
             Task {
-                downloadURLs = Array(Set(downloadURLs).subtracting(Set([url.absoluteString])))
-                await DownloadController.shared.cancelInProgressDownloads(matchingDownloadURL: url)
+                downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.id.taskDescription])))
+                await DownloadController.shared.cancelInProgressDownload(downloadable)
             }
         }) {
             ZStack {
@@ -544,7 +549,9 @@ public struct DownloadControls: View {
     private var modelDeleteButton: some View {
         Button {
             Task { @MainActor in
-                downloadURLs = Array(Set(downloadURLs).subtracting(Set([downloadable.url.absoluteString]))).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                downloadURLs = Array(
+                    Set(downloadURLs).subtracting(Set([downloadable.id.taskDescription]))
+                ).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                 _ = try? await downloadController.delete(download: downloadable)
             }
         } label: {

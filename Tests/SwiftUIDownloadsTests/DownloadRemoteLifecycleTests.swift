@@ -324,6 +324,109 @@ private struct ValidatorMetadataStore: DownloadableMetadataStore {
 
 final class DownloadRemoteLifecycleTests: XCTestCase {
 
+    func testDownloadableIdentityUsesStandardizedSourceAndDestination() {
+        let sourceURL = URL(string: "https://identity.test/catalog/../dictionary.zip")!
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("identity", isDirectory: true)
+            .appendingPathComponent("../dictionary.zip")
+        let renamed = Downloadable(
+            url: sourceURL.standardized,
+            name: "Renamed dictionary",
+            localDestination: destination.standardizedFileURL
+        )
+        let original = Downloadable(
+            url: sourceURL,
+            name: "Original dictionary",
+            localDestination: destination
+        )
+        let otherDestination = Downloadable(
+            url: sourceURL,
+            name: "Original dictionary",
+            localDestination: destination.appendingPathExtension("other")
+        )
+
+        XCTAssertEqual(original.id, renamed.id)
+        XCTAssertEqual(Set([original, renamed]).count, 1)
+        XCTAssertNotEqual(original.id, otherDestination.id)
+        XCTAssertEqual(Set([original, otherDestination]).count, 2)
+        XCTAssertEqual(
+            DownloadOperationKey(taskDescription: original.id.taskDescription),
+            original.id
+        )
+    }
+
+    func testExecutionConfigurationNormalizesEquivalentInputs() {
+        let sourceURL = URL(string: "https://identity.test/dictionary.zip")!
+        let destination = URL(fileURLWithPath: "/tmp/configuration/dictionary.zip")
+        let first = Downloadable(
+            url: sourceURL,
+            mirrorURL: URL(string: "https://mirror.test/catalog/../dictionary.zip")!,
+            name: "First",
+            localDestination: destination,
+            localDestinationChecksum: " ABCD ",
+            preservedLocalArtifactDirectories: [
+                URL(fileURLWithPath: "/tmp/generated/one/../two"),
+                URL(fileURLWithPath: "/tmp/generated/three")
+            ],
+            metadataStore: UserDefaultsDownloadableMetadataStore(
+                metadataCacheNamespace: "shared-namespace"
+            )
+        )
+        let second = Downloadable(
+            url: sourceURL,
+            mirrorURL: URL(string: "https://mirror.test/dictionary.zip")!,
+            name: "Second",
+            localDestination: destination,
+            localDestinationChecksum: "abcd",
+            preservedLocalArtifactDirectories: [
+                URL(fileURLWithPath: "/tmp/generated/three"),
+                URL(fileURLWithPath: "/tmp/generated/two")
+            ],
+            metadataStore: UserDefaultsDownloadableMetadataStore(
+                metadataCacheNamespace: "shared-namespace"
+            )
+        )
+
+        XCTAssertEqual(first.executionConfigurationSignature, second.executionConfigurationSignature)
+    }
+
+    @MainActor
+    func testExactDescriptorCancellationLeavesSameSourceOtherDestinationRunning() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingDownloadURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let started = expectation(description: "Both destination variants started")
+        started.expectedFulfillmentCount = 2
+        HangingDownloadURLProtocol.didStart = { started.fulfill() }
+        defer { HangingDownloadURLProtocol.didStart = nil }
+        let sourceURL = URL(string: "https://cancellation.test/shared-source")!
+        let firstDownload = Downloadable(
+            url: sourceURL,
+            name: "First",
+            localDestination: URL(fileURLWithPath: "/tmp/first/shared-source")
+        )
+        let secondDownload = Downloadable(
+            url: sourceURL,
+            name: "Second",
+            localDestination: URL(fileURLWithPath: "/tmp/second/shared-source")
+        )
+        let firstTask = session.dataTask(with: sourceURL)
+        let secondTask = session.dataTask(with: sourceURL)
+        firstTask.taskDescription = firstDownload.id.taskDescription
+        secondTask.taskDescription = secondDownload.id.taskDescription
+        firstTask.resume()
+        secondTask.resume()
+        await fulfillment(of: [started], timeout: 2)
+
+        await controller.cancelInProgressDownload(firstDownload)
+
+        XCTAssertNotEqual(firstTask.state, .running)
+        XCTAssertEqual(secondTask.state, .running)
+        await controller.cancelAllInProgressDownloads()
+    }
+
     @MainActor
     func testFilteredCancellationLeavesOtherSessionTransfersRunning() async throws {
         let configuration = URLSessionConfiguration.ephemeral
@@ -345,10 +448,10 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         second.resume()
         await fulfillment(of: [started], timeout: 2)
 
-        await controller.cancelInProgressDownloads(matchingDownloadURL: firstURL)
+        await controller.cancelInProgressDownloads(matchingSourceURL: firstURL)
         XCTAssertNotEqual(first.state, .running)
         XCTAssertEqual(second.state, .running)
-        await controller.cancelInProgressDownloads()
+        await controller.cancelAllInProgressDownloads()
         XCTAssertNotEqual(second.state, .running)
     }
 

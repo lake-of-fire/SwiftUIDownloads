@@ -37,7 +37,11 @@ final class URLResourceDownloadTaskIdentityTests: XCTestCase {
         let owned = URLResourceDownloadTask(
             session: session,
             url: URL(string: "https://swiftui-downloads-identity.test/owned")!,
-            destination: destination
+            destination: destination,
+            operationKey: DownloadOperationKey(
+                sourceURL: URL(string: "https://swiftui-downloads-identity.test/owned")!,
+                destinationURL: destination
+            )
         )
         let completion = expectation(description: "owned terminal completion")
         var terminalErrors: [Error?] = []
