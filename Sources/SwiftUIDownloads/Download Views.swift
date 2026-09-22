@@ -493,10 +493,12 @@ public struct HidingDownloadButton: View {
     
     @MainActor
     private func refreshDownloadable() async {
-        let existsOnDisk = await downloadable.existsLocally()
+        let hasAdmissibleArtifact = await Task.detached(priority: .utility) {
+            downloadable.isReadyForImmediateLocalRead()
+        }.value
         // A retained payload can be useful for diagnosis/retry after a
         // processing failure, but it is not a successful downloaded state.
-        let isUsableDownload = existsOnDisk && !downloadable.isFailed
+        let isUsableDownload = hasAdmissibleArtifact && !downloadable.isFailed
         downloadExistedOnDisk = isUsableDownload
         downloadable.isFinishedDownloading = isUsableDownload
     }

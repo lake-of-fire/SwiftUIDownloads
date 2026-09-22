@@ -1,6 +1,16 @@
 import XCTest
 @testable import SwiftUIDownloads
 
+private final class ScopedCancellationURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {}
+    override func stopLoading() {}
+}
+
 private actor RetryAttemptExecutorStub {
     private var attemptDates: [Date] = []
     private var remainingFailures: Int
@@ -309,7 +319,9 @@ final class DownloadRetryIntegrationTests: XCTestCase {
     }
 
     func testScopedCancellationDoesNotCancelAnotherSessionTask() async {
-        let session = URLSession(configuration: .ephemeral)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ScopedCancellationURLProtocol.self]
+        let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
         let selectedURL = URL(string: "https://download-scope.test/selected")!
         let otherURL = URL(string: "https://download-scope.test/other")!
@@ -318,11 +330,21 @@ final class DownloadRetryIntegrationTests: XCTestCase {
         let otherTask = session.dataTask(with: otherURL)
         otherTask.taskDescription = otherURL.absoluteString
         let controller = DownloadController(session: session)
+        selectedTask.resume()
+        otherTask.resume()
+        for _ in 0..<50
+            where selectedTask.state != .running || otherTask.state != .running {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
 
         await controller.cancelInProgressDownloads(matchingDownloadURL: selectedURL)
 
-        XCTAssertNotEqual(selectedTask.state, .suspended)
-        XCTAssertEqual(otherTask.state, .suspended)
+        for _ in 0..<50 where selectedTask.state == .running {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+
+        XCTAssertNotEqual(selectedTask.state, .running)
+        XCTAssertEqual(otherTask.state, .running)
     }
 
     func testDownloadRetriesAfterRetryAfterThenSucceeds() async throws {

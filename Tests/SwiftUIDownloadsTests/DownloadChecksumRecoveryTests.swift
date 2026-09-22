@@ -177,7 +177,8 @@ private actor SequencedCompressedAttemptExecutor {
     private let cancelAfterAttempt: Int?
 
     init(payloads: [Data], cancelAfterAttempt: Int? = nil) throws {
-        self.cancelAfterAttempt = cancelAfterAttempt        compressedPayloads = try payloads.map { payload in
+        self.cancelAfterAttempt = cancelAfterAttempt
+        compressedPayloads = try payloads.map { payload in
             guard let compressed = (payload as NSData).brotliCompressed() else {
                 throw CocoaError(.fileWriteUnknown)
             }
@@ -205,7 +206,8 @@ private actor SequencedCompressedAttemptExecutor {
 
         if attemptCount == cancelAfterAttempt {
             withUnsafeCurrentTask { $0?.cancel() }
-        }        return DownloadTransferResult(
+        }
+        return DownloadTransferResult(
             destinationLocation: candidateURL,
             etag: "compressed-candidate-\(attemptCount)",
             lastModified: nil
@@ -1063,6 +1065,11 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         let destination = directory.appendingPathComponent("payload.bin")
         let payload = Data("verified".utf8)
         try payload.write(to: destination, options: .atomic)
+        let fixedModificationDate = Date(timeIntervalSince1970: 1_000_000)
+        try FileManager.default.setAttributes(
+            [.modificationDate: fixedModificationDate],
+            ofItemAtPath: destination.path
+        )
         let download = Downloadable(
             url: URL(string: "https://download-marker.test/\(UUID().uuidString)")!,
             name: "Exact marker identity",
@@ -1165,7 +1172,8 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
     }
 
 
-    func testOrphanCleanupPreservesDeclaredGeneratedDirectoryAndDescendants() async throws {        let parentName = "swiftui-downloads-generated-artifacts-\(UUID().uuidString)"
+    func testOrphanCleanupPreservesDeclaredGeneratedDirectoryAndDescendants() async throws {
+        let parentName = "swiftui-downloads-generated-artifacts-\(UUID().uuidString)"
         let directory = DownloadDirectory.appSupport(
             parentDirectoryName: parentName,
             groupIdentifier: nil
@@ -1175,7 +1183,8 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directoryURL) }
 
-        let destinationURL = directoryURL.appendingPathComponent("payload.bin")        let generatedDirectoryURL = directoryURL.appendingPathComponent(
+        let destinationURL = directoryURL.appendingPathComponent("payload.bin")
+        let generatedDirectoryURL = directoryURL.appendingPathComponent(
             ".runtime-snapshots",
             isDirectory: true
         )
@@ -1189,7 +1198,8 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
 
         let declaredPathAlias = generatedDirectoryURL
             .deletingLastPathComponent()
-            .appendingPathComponent(".runtime-snapshots/../.runtime-snapshots")        let download = Downloadable(
+            .appendingPathComponent(".runtime-snapshots/../.runtime-snapshots")
+        let download = Downloadable(
             url: URL(string: "https://swiftui-downloads.test/generated.bin")!,
             name: "Generated Artifacts",
             localDestination: destinationURL,

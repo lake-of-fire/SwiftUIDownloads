@@ -79,6 +79,57 @@ private func sha1Checksum(for fileURL: URL) throws -> String {
     return hasher.finalize().map { String(format: "%02x", $0) }.joined()
 }
 
+private func sha256Checksum(for fileURL: URL) throws -> String {
+    let fileHandle = try FileHandle(forReadingFrom: fileURL)
+    defer { try? fileHandle.close() }
+
+    var hasher = SHA256()
+    while autoreleasepool(invoking: {
+        guard !Task.isCancelled else { return false }
+        let data = fileHandle.readData(ofLength: 64 * 1024)
+        guard !data.isEmpty else { return false }
+        hasher.update(data: data)
+        return true
+    }) {}
+
+    try Task.checkCancellation()
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+}
+
+private func standardizedArtifactSourceURL(_ url: URL) -> URL {
+    url.isFileURL ? url.standardizedFileURL : url.standardized
+}
+
+private func installedArtifactReceipt(
+    _ receipt: InstalledArtifactReceipt,
+    matches identity: ChecksumVerificationFileIdentity
+) -> Bool {
+    receipt.byteCount == identity.fileSize
+        && receipt.modificationTimeIntervalSince1970
+            == identity.modificationTimeIntervalSince1970
+        && receipt.fileSystemNumber == identity.fileSystemNumber
+        && receipt.fileSystemFileNumber == identity.fileSystemFileNumber
+}
+
+private enum InstalledArtifactReceiptValidationError: LocalizedError {
+    case missingOrInvalid(URL)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingOrInvalid(let url):
+            return "The installed download at \(url.path) has no valid acquisition receipt."
+        }
+    }
+}
+
+private struct InstalledArtifactReceiptPersistenceVerificationError: LocalizedError {
+    let destination: URL
+
+    var errorDescription: String? {
+        "The installed-artifact receipt was not retained for \(destination.path)."
+    }
+}
+
 public enum DownloadableChecksumVerificationError: LocalizedError, Equatable {
     case emptyFile(URL)
     case fileChangedDuringVerification(URL)
@@ -240,7 +291,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     /// Generated artifacts which belong to this download but are not the
     /// downloaded payload itself. Orphan cleanup preserves these directories
 
-    /// and their descendants when they are contained by its cleanup root.    public let preservedLocalArtifactDirectories: Set<URL>
+    /// and their descendants when they are contained by its cleanup root.
+    public let preservedLocalArtifactDirectories: Set<URL>
     var isFromBackgroundAssetsDownloader: Bool? = nil
     public let metadataStore: any DownloadableMetadataStore
     private let downloadMetadataCache: DownloadMetadataCache
@@ -447,9 +499,142 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
 
     public func isReadyForImmediateLocalRead() -> Bool {
         if localDestinationChecksum == nil {
-            return FileManager.default.fileExists(atPath: localDestination.path)
+            return validInstalledArtifactReceipt() != nil
         }
         return hasVerifiedLocalDestinationChecksumMarker()
+    }
+
+    func hasAdmissibleInstalledArtifact() -> Bool {
+        if localDestinationChecksum != nil {
+            return hasVerifiedLocalDestinationChecksumMarker()
+        }
+        return validInstalledArtifactReceipt() != nil
+    }
+
+    func hasProcessableLocalArtifact() -> Bool {
+        if FileManager.default.fileExists(atPath: localDestination.path) {
+            return localDestinationChecksum != nil
+                || validInstalledArtifactReceipt() != nil
+        }
+        return url.pathExtension == "br"
+            && FileManager.default.fileExists(atPath: compressedFileURL.path)
+    }
+
+    var installedArtifactReceiptStorageKey: String {
+        [
+            standardizedArtifactSourceURL(url).absoluteString,
+            localDestination.standardizedFileURL.absoluteString
+        ].joined(separator: "\u{0}")
+    }
+
+    func validInstalledArtifactReceipt() -> InstalledArtifactReceipt? {
+        let receipt: InstalledArtifactReceipt
+        do {
+            guard let storedReceipt = try metadataStore.installedArtifactReceipt(
+                sourceURL: url,
+                destinationURL: localDestination
+            ) else {
+                return nil
+            }
+            receipt = storedReceipt
+        } catch {
+            try? removeInstalledArtifactReceipt()
+            return nil
+        }
+
+        guard installedArtifactMatches(receipt) else {
+            if !Task.isCancelled {
+                try? removeInstalledArtifactReceipt()
+            }
+            return nil
+        }
+        return receipt
+    }
+
+    func installedArtifactMatches(_ receipt: InstalledArtifactReceipt) -> Bool {
+        let standardizedSourceURL = standardizedArtifactSourceURL(url)
+        let standardizedDestinationURL = localDestination.standardizedFileURL
+        guard receipt.schemaVersion == InstalledArtifactReceipt.currentSchemaVersion,
+              receipt.requestedSourceURL == standardizedSourceURL,
+              receipt.destinationURL == standardizedDestinationURL,
+              let attributes = try? FileManager.default.attributesOfItem(
+                atPath: localDestination.path
+              ),
+              let initialIdentity = checksumVerificationFileIdentity(
+                from: attributes
+              ),
+              installedArtifactReceipt(receipt, matches: initialIdentity),
+              let digest = try? sha256Checksum(for: localDestination),
+              digest == receipt.sha256Digest,
+              let currentAttributes = try? FileManager.default.attributesOfItem(
+                atPath: localDestination.path
+              ),
+              checksumVerificationFileIdentity(from: currentAttributes)
+                == initialIdentity else {
+            return false
+        }
+        return true
+    }
+
+    func makeInstalledArtifactReceipt(
+        finalResponseURL: URL?
+    ) throws -> InstalledArtifactReceipt {
+        let attributes = try FileManager.default.attributesOfItem(
+            atPath: localDestination.path
+        )
+        guard let identity = checksumVerificationFileIdentity(from: attributes) else {
+            throw DownloadableChecksumVerificationError.emptyFile(localDestination)
+        }
+        let digest = try sha256Checksum(for: localDestination)
+        try requireFileIdentity(identity, at: localDestination)
+        return InstalledArtifactReceipt(
+            requestedSourceURL: standardizedArtifactSourceURL(url),
+            finalResponseURL: finalResponseURL.map(standardizedArtifactSourceURL),
+            destinationURL: localDestination.standardizedFileURL,
+            sha256Digest: digest,
+            byteCount: identity.fileSize,
+            modificationTimeIntervalSince1970: identity.modificationTimeIntervalSince1970,
+            fileSystemNumber: identity.fileSystemNumber,
+            fileSystemFileNumber: identity.fileSystemFileNumber
+        )
+    }
+
+    func persistInstalledArtifactReceipt(
+        _ receipt: InstalledArtifactReceipt
+    ) throws {
+        do {
+            try metadataStore.saveInstalledArtifactReceipt(
+                receipt,
+                sourceURL: url,
+                destinationURL: localDestination
+            )
+            guard try metadataStore.installedArtifactReceipt(
+                sourceURL: url,
+                destinationURL: localDestination
+            ) == receipt else {
+                throw InstalledArtifactReceiptPersistenceVerificationError(
+                    destination: localDestination
+                )
+            }
+        } catch {
+            throw DownloadMetadataPersistenceError(error)
+        }
+        let attributes = try FileManager.default.attributesOfItem(
+            atPath: localDestination.path
+        )
+        guard let identity = checksumVerificationFileIdentity(from: attributes),
+              installedArtifactReceipt(receipt, matches: identity) else {
+            try? removeInstalledArtifactReceipt()
+            throw DownloadableChecksumVerificationError
+                .fileChangedDuringVerification(localDestination)
+        }
+    }
+
+    func removeInstalledArtifactReceipt() throws {
+        try metadataStore.removeInstalledArtifactReceipt(
+            sourceURL: url,
+            destinationURL: localDestination
+        )
     }
 
     public func ensureVerifiedLocalDestinationChecksum() throws {
@@ -784,7 +969,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     func uncompressedTransferStagingURL(operationID: UUID) -> URL {
         let pathExtension = localDestination.pathExtension
 
-        let baseName = localDestination.lastPathComponent        let suffix = pathExtension.isEmpty ? "" : ".\(pathExtension)"
+        let baseName = localDestination.lastPathComponent
+        let suffix = pathExtension.isEmpty ? "" : ".\(pathExtension)"
         return localDestination.deletingLastPathComponent()
             .appendingPathComponent(
                 "\(baseName).downloading.\(operationID.uuidString)\(suffix)"
@@ -1045,22 +1231,38 @@ struct DownloadTransferResult: Sendable {
     let destinationLocation: URL
     let etag: String?
     let lastModified: Date?
+    let finalResponseURL: URL?
+
+    init(
+        destinationLocation: URL,
+        etag: String?,
+        lastModified: Date?,
+        finalResponseURL: URL? = nil
+    ) {
+        self.destinationLocation = destinationLocation
+        self.etag = etag
+        self.lastModified = lastModified
+        self.finalResponseURL = finalResponseURL
+    }
 }
 
 private final class DownloadAttemptTerminalWaiter: @unchecked Sendable {
     private let lock = NSLock()
     private let url: URL
     private let lastModified: @Sendable () -> Date?
+    private let finalResponseURL: @Sendable () -> URL?
     private var continuation: CheckedContinuation<DownloadTransferResult, Error>?
     private var cancellable: AnyCancellable?
 
     init(
         url: URL,
         lastModified: @escaping @Sendable () -> Date?,
+        finalResponseURL: @escaping @Sendable () -> URL?,
         continuation: CheckedContinuation<DownloadTransferResult, Error>
     ) {
         self.url = url
         self.lastModified = lastModified
+        self.finalResponseURL = finalResponseURL
         self.continuation = continuation
     }
 
@@ -1089,7 +1291,8 @@ private final class DownloadAttemptTerminalWaiter: @unchecked Sendable {
                     finish(.success(DownloadTransferResult(
                         destinationLocation: destinationLocation,
                         etag: etag,
-                        lastModified: lastModified()
+                        lastModified: lastModified(),
+                        finalResponseURL: finalResponseURL()
                     )))
                 } else {
                     finish(.failure(
@@ -1135,6 +1338,16 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     private struct ProcessingTaskRecord {
         let id: UUID
         let task: Task<Void, Never>
+    }
+    private struct SuccessfulDownloadMetadata: Sendable {
+        let downloadedAt: Date
+        let etag: String?
+        let remoteModifiedAt: Date?
+        let checkedAt: Date?
+    }
+    private struct PendingInstalledArtifactReceipt: Sendable {
+        let receipt: InstalledArtifactReceipt
+        let successfulDownloadMetadata: SuccessfulDownloadMetadata?
     }
 
     nonisolated(unsafe) public static var shared: DownloadController = {
@@ -1200,6 +1413,7 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     private var checksumRecoveriesReadyForProcessing = Set<String>()
     private var checksumRedownloadAttempted = Set<String>()
     private var completionMetadataRetryDownloadIDs = Set<String>()
+    private var pendingInstalledArtifactReceipts = [String: PendingInstalledArtifactReceipt]()
     private let session: URLSession
     private let attemptExecutor: DownloadAttemptExecutor?
     private let retryPolicyProvider: @Sendable () -> DownloadRetryPolicy
@@ -1262,7 +1476,8 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     /// the time this work reaches the main actor.
     @MainActor
     private func refreshPublishedDownloadState() {
-        let currentActiveDownloads = Set(activeDownloads.filter {            $0.isActive
+        let currentActiveDownloads = Set(activeDownloads.filter {
+            $0.isActive
                 && !$0.isFailed
                 && !$0.isFinishedDownloading
                 && !$0.isFinishedProcessing
@@ -1281,7 +1496,8 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
         if finishedDownloads != currentFinishedDownloads {
             finishedDownloads = currentFinishedDownloads
         }
-        let pending = !currentActiveDownloads.isEmpty || !currentFailedDownloads.isEmpty        if isPending != pending {
+        let pending = !currentActiveDownloads.isEmpty || !currentFailedDownloads.isEmpty
+        if isPending != pending {
             isPending = pending
         } else {
             objectWillChange.send()
@@ -1529,6 +1745,14 @@ public extension DownloadController {
                 try FileManager.default.removeItemIfPresent(at: orphanDir)
             }
         }
+
+        for download in retainedDownloads
+            where download.localDestinationChecksum == nil
+                && !FileManager.default.fileExists(
+                    atPath: download.localDestination.path
+                ) {
+            try? download.removeInstalledArtifactReceipt()
+        }
     }
 
     private func preservedArtifactDirectories(
@@ -1553,6 +1777,9 @@ public extension DownloadController {
         // Fence any delegate/retry completion that arrives after deletion.
         downloadAttemptIDs[download.id] = nil
         completionMetadataRetryDownloadIDs.remove(download.id)
+        pendingInstalledArtifactReceipts[
+            download.installedArtifactReceiptStorageKey
+        ] = nil
         download.invalidateDownloadObservation()
         let downloadRecord = downloadTasks[download.id]
         let processingRecord = processingTasks[download.id]
@@ -1632,6 +1859,21 @@ public extension DownloadController {
 }
 
 extension DownloadController {
+    @DownloadActor
+    private func hasProcessableArtifactOrPendingReceipt(
+        for download: Downloadable
+    ) -> Bool {
+        if download.hasProcessableLocalArtifact() {
+            return true
+        }
+        guard let pendingReceipt = pendingInstalledArtifactReceipts[
+            download.installedArtifactReceiptStorageKey
+        ] else {
+            return false
+        }
+        return download.installedArtifactMatches(pendingReceipt.receipt)
+    }
+
     @DownloadActor
     private func clearDownloadStatusObservers(forDownloadID downloadID: String) {
         guard let cancellables = downloadStatusCancellables.removeValue(forKey: downloadID) else {
@@ -1719,6 +1961,7 @@ extension DownloadController {
                     let waiter = DownloadAttemptTerminalWaiter(
                         url: download.url,
                         lastModified: { task.responseLastModified },
+                        finalResponseURL: { task.finalResponseURL },
                         continuation: continuation
                     )
                     waiter.subscribe(to: task.publisher)
@@ -1742,8 +1985,10 @@ extension DownloadController {
         await download.waitForDownloadMetadata()
         if assuredDownloads.contains(where: { $0.url == download.url }) && !failedDownloads.contains(where: { $0.url == download.url }) {
             let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
-            let localExists = await download.existsLocally()
-            if localExists || isImported {
+            let importedWithoutRetainedSource = isImported
+                && (download as? ImportableDownloadable)?.deleteAfterImport == true
+            if download.hasAdmissibleInstalledArtifact()
+                || importedWithoutRetainedSource {
                 return
             }
         }
@@ -1753,9 +1998,13 @@ extension DownloadController {
         } catch { }
         
         let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
-        let localExists = await download.existsLocally()
-            if localExists || isImported {
-                if isImported {
+        let importedWithoutRetainedSource = isImported
+            && (download as? ImportableDownloadable)?.deleteAfterImport == true
+        let hasProcessableLocalArtifact = await hasProcessableArtifactOrPendingReceipt(
+            for: download
+        )
+            if hasProcessableLocalArtifact || importedWithoutRetainedSource {
+                if importedWithoutRetainedSource {
                     await markDownloadAsProcessed(download)
                 } else {
                     // Validate/process an already-installed artifact before
@@ -1835,6 +2084,7 @@ extension DownloadController {
                     download,
                     etag: transferResult.etag,
                     remoteModifiedAt: transferResult.lastModified,
+                    finalResponseURL: transferResult.finalResponseURL,
                     updatesRemoteModifiedAt: updatesRemoteModifiedAt,
                     transferredFileURL: transferResult.destinationLocation,
                     expectedDownloadAttemptID: downloadAttemptID
@@ -1897,7 +2147,8 @@ extension DownloadController {
                     return DownloadTransferResult(
                         destinationLocation: download.localDestination,
                         etag: etag,
-                        lastModified: remoteModifiedAt
+                        lastModified: remoteModifiedAt,
+                        finalResponseURL: download.url
                     )
                 }
                 try FileManager.default.createDirectory(
@@ -1924,7 +2175,8 @@ extension DownloadController {
                 return DownloadTransferResult(
                     destinationLocation: transferDestination,
                     etag: etag,
-                    lastModified: remoteModifiedAt
+                    lastModified: remoteModifiedAt,
+                    finalResponseURL: download.url
                 )
             } catch {
                 await MainActor.run { [weak self] in
@@ -2138,10 +2390,23 @@ extension DownloadController {
                 )
             }
             let hasRecoverableFile = await download.existsLocally()
+            let hasProcessableLocalArtifact = await hasProcessableArtifactOrPendingReceipt(
+                for: download
+            )
             let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
+            let importedWithoutRetainedSource = isImported
+                && (download as? ImportableDownloadable)?.deleteAfterImport == true
 
             if state.isFinishedProcessing {
-                if hasRecoverableFile || isImported {
+                if completionMetadataRetryDownloadIDs.contains(download.id),
+                   hasProcessableLocalArtifact || importedWithoutRetainedSource {
+                    await finishDownload(
+                        download,
+                        recordSuccessfulDownload: false
+                    )
+                    continue
+                }
+                if hasProcessableLocalArtifact || importedWithoutRetainedSource {
                     continue
                 }
                 await self.download(download)
@@ -2152,8 +2417,11 @@ extension DownloadController {
                 continue
             }
 
-            if hasRecoverableFile {
-                await finishDownload(download)
+            if hasProcessableLocalArtifact {
+                await finishDownload(
+                    download,
+                    recordSuccessfulDownload: false
+                )
             } else {
                 await self.download(download)
             }
@@ -2218,6 +2486,10 @@ extension DownloadController {
             try FileManager.default.removeItemIfPresent(
                 at: download.checksumVerificationMarkerURL
             )
+            pendingInstalledArtifactReceipts[
+                download.installedArtifactReceiptStorageKey
+            ] = nil
+            try download.removeInstalledArtifactReceipt()
         }
         try FileManager.default.removeItemIfPresent(
             at: download.compressedFileURL
@@ -2230,8 +2502,8 @@ extension DownloadController {
         let stagingPrefix = download.localDestination.lastPathComponent
             + ".decompressing."
         let transferStagingPrefix = download.localDestination
-
-            .lastPathComponent + ".downloading."        let children = try FileManager.default.contentsOfDirectory(
+            .lastPathComponent + ".downloading."
+        let children = try FileManager.default.contentsOfDirectory(
             at: directory,
             includingPropertiesForKeys: nil
         )
@@ -2256,6 +2528,7 @@ extension DownloadController {
         _ download: Downloadable,
         etag: String? = nil,
         remoteModifiedAt: Date? = nil,
+        finalResponseURL: URL? = nil,
         updatesRemoteModifiedAt: Bool = false,
         recordSuccessfulDownload: Bool = true
     ) async {
@@ -2263,10 +2536,12 @@ extension DownloadController {
         if let currentDownload = downloadTasks[download.id]?.task {
             await currentDownload.value
             return
-        }        await finishDownloadedFile(
+        }
+        await finishDownloadedFile(
             download,
             etag: etag,
             remoteModifiedAt: remoteModifiedAt,
+            finalResponseURL: finalResponseURL,
             updatesRemoteModifiedAt: updatesRemoteModifiedAt,
             recordSuccessfulDownload: recordSuccessfulDownload,
             transferredFileURL: nil
@@ -2278,6 +2553,7 @@ extension DownloadController {
         _ download: Downloadable,
         etag: String? = nil,
         remoteModifiedAt: Date? = nil,
+        finalResponseURL: URL? = nil,
         updatesRemoteModifiedAt: Bool = false,
         recordSuccessfulDownload: Bool = true,
         transferredFileURL: URL?,
@@ -2324,6 +2600,7 @@ extension DownloadController {
                 download,
                 etag: etag,
                 remoteModifiedAt: remoteModifiedAt,
+                finalResponseURL: finalResponseURL,
                 updatesRemoteModifiedAt: updatesRemoteModifiedAt,
                 recordSuccessfulDownload: recordSuccessfulDownload,
                 transferredFileURL: transferredFileURL,
@@ -2424,6 +2701,7 @@ extension DownloadController {
                     download,
                     etag: transferResult.etag,
                     remoteModifiedAt: transferResult.lastModified,
+                    finalResponseURL: transferResult.finalResponseURL,
                     updatesRemoteModifiedAt: updatesRemoteModifiedAt,
                     transferredFileURL: transferResult.destinationLocation
                 )
@@ -2468,6 +2746,10 @@ extension DownloadController {
             try? FileManager.default.removeItemIfPresent(
                 at: download.localDestination
             )
+            pendingInstalledArtifactReceipts[
+                download.installedArtifactReceiptStorageKey
+            ] = nil
+            try? download.removeInstalledArtifactReceipt()
         }
         try? FileManager.default.removeItemIfPresent(
             at: download.compressedFileURL
@@ -2508,6 +2790,7 @@ extension DownloadController {
         _ download: Downloadable,
         etag: String? = nil,
         remoteModifiedAt: Date? = nil,
+        finalResponseURL: URL? = nil,
         updatesRemoteModifiedAt: Bool = false,
         recordSuccessfulDownload: Bool,
         transferredFileURL: URL? = nil,
@@ -2521,14 +2804,48 @@ extension DownloadController {
             completionMetadataRetryDownloadIDs.remove(download.id)
         } else if completionMetadataRetryDownloadIDs.contains(download.id) {
             do {
+                try Task.checkCancellation()
+                let receiptKey = download.installedArtifactReceiptStorageKey
+                let importDeletedSource = if let importable = download as? ImportableDownloadable,
+                                             importable.deleteAfterImport {
+                    await importable.isImported()
+                } else {
+                    false
+                }
+                if !importDeletedSource {
+                    if let pendingReceipt = pendingInstalledArtifactReceipts[receiptKey] {
+                        guard download.installedArtifactMatches(pendingReceipt.receipt) else {
+                            throw InstalledArtifactReceiptValidationError
+                                .missingOrInvalid(download.localDestination)
+                        }
+                        try download.persistInstalledArtifactReceipt(
+                            pendingReceipt.receipt
+                        )
+                    } else if download.validInstalledArtifactReceipt() == nil {
+                        throw InstalledArtifactReceiptValidationError
+                            .missingOrInvalid(download.localDestination)
+                    }
+                }
                 let metadata = download.cachedDownloadMetadata
+                let successfulMetadata = pendingInstalledArtifactReceipts[
+                    receiptKey
+                ]?.successfulDownloadMetadata
                 await MainActor.run {
-                    // Identical assignments deliberately ask the cache to
-                    // retry all dirty fields after its prior save failure.
-                    download.lastDownloadedETag = metadata.lastDownloadedETag
-                    download.lastCheckedETagAt = metadata.lastCheckedETagAt
-                    download.lastDownloaded = metadata.lastDownloadedAt
-                    download.lastModifiedAt = metadata.lastModifiedAt
+                    if let successfulMetadata {
+                        download.lastDownloadedETag = successfulMetadata.etag
+                        download.lastDownloaded = successfulMetadata.downloadedAt
+                        download.lastModifiedAt = successfulMetadata.remoteModifiedAt
+                        if let checkedAt = successfulMetadata.checkedAt {
+                            download.lastCheckedETagAt = checkedAt
+                        }
+                    } else {
+                        // Identical assignments deliberately ask the cache to
+                        // retry all dirty fields after its prior save failure.
+                        download.lastDownloadedETag = metadata.lastDownloadedETag
+                        download.lastCheckedETagAt = metadata.lastCheckedETagAt
+                        download.lastDownloaded = metadata.lastDownloadedAt
+                        download.lastModifiedAt = metadata.lastModifiedAt
+                    }
                 }
                 try await download.waitForDownloadMetadataPersistence()
                 try Task.checkCancellation()
@@ -2536,6 +2853,7 @@ extension DownloadController {
                     throw CancellationError()
                 }
                 completionMetadataRetryDownloadIDs.remove(download.id)
+                pendingInstalledArtifactReceipts[receiptKey] = nil
                 await publishSuccessfulCompletion(download)
                 checksumRedownloadAttempted.remove(download.id)
                 clearDownloadStatusObservers(forDownloadID: download.id)
@@ -2543,11 +2861,55 @@ extension DownloadController {
                 if error is CancellationError || (error as? URLError)?.code == .cancelled {
                     await markDownloadCancelled(download, error: error)
                 } else {
+                    if !(error is DownloadMetadataPersistenceError) {
+                        completionMetadataRetryDownloadIDs.remove(download.id)
+                        pendingInstalledArtifactReceipts[
+                            download.installedArtifactReceiptStorageKey
+                        ] = nil
+                    }
                     await publishCompletionMetadataFailure(error, for: download)
                 }
             }
             clearProcessingTask(forDownloadID: download.id, processingTaskID: processingTaskID)
             return
+        }
+        let existingInstalledArtifactReceipt = transferredFileURL == nil
+            ? download.validInstalledArtifactReceipt()
+            : nil
+        if !recordSuccessfulDownload,
+           download.localDestinationChecksum == nil,
+           let existingInstalledArtifactReceipt {
+            let importIsComplete = if let importable = download as? ImportableDownloadable {
+                await importable.isImported()
+            } else {
+                true
+            }
+            if importIsComplete,
+               download.installedArtifactMatches(
+                existingInstalledArtifactReceipt
+               ),
+               !Task.isCancelled,
+               processingTasks[download.id]?.id == processingTaskID {
+                try? FileManager.default.removeItemIfPresent(
+                    at: download.compressedFileURL
+                )
+                await MainActor.run {
+                    download.fileSize = existingInstalledArtifactReceipt.byteCount
+                }
+                await publishSuccessfulCompletion(download)
+                checksumRedownloadAttempted.remove(download.id)
+                clearDownloadStatusObservers(forDownloadID: download.id)
+                clearProcessingTask(
+                    forDownloadID: download.id,
+                    processingTaskID: processingTaskID
+                )
+                return
+            }
+            // A completed installed receipt supersedes any leftover transfer
+            // archive, but the importer must rerun if its derived state is gone.
+            try? FileManager.default.removeItemIfPresent(
+                at: download.compressedFileURL
+            )
         }
         let transferredCompressedFileURL = transferredFileURL.flatMap { url in
             download.url.pathExtension == "br"
@@ -2602,10 +2964,26 @@ extension DownloadController {
             try Task.checkCancellation()
             let alreadyFinished = await MainActor.run { download.isFinishedProcessing }
             if alreadyFinished, transferredFileURL == nil, compressedCandidateURL == nil {
-                clearDownloadStatusObservers(forDownloadID: download.id)
-                return
+                let isImported = await (download as? ImportableDownloadable)?
+                    .isImported() ?? false
+                let importedWithoutRetainedSource = isImported
+                    && (download as? ImportableDownloadable)?
+                        .deleteAfterImport == true
+                if download.hasAdmissibleInstalledArtifact()
+                    || importedWithoutRetainedSource {
+                    clearDownloadStatusObservers(forDownloadID: download.id)
+                    return
+                }
             }
             finishStartedWithCompressedFile = compressedCandidateURL != nil
+            if transferredFileURL == nil,
+               compressedCandidateURL == nil,
+               !recordSuccessfulDownload,
+               download.localDestinationChecksum == nil,
+               download.validInstalledArtifactReceipt() == nil {
+                throw InstalledArtifactReceiptValidationError
+                    .missingOrInvalid(download.localDestination)
+            }
             if let importable = download as? ImportableDownloadable,
                compressedCandidateURL != nil {
                 await { @MainActor in
@@ -2779,8 +3157,36 @@ extension DownloadController {
                       importable.deleteAfterImport {
                 try? FileManager.default.removeItem(at: download.localDestination)
             }
+
+            let receiptKey = download.installedArtifactReceiptStorageKey
+            if let importable = download as? ImportableDownloadable,
+               importable.deleteAfterImport {
+                pendingInstalledArtifactReceipts[receiptKey] = nil
+                try? download.removeInstalledArtifactReceipt()
+            } else {
+                let receipt = try download.makeInstalledArtifactReceipt(
+                    finalResponseURL: finalResponseURL
+                        ?? existingInstalledArtifactReceipt?.finalResponseURL
+                )
+                let successfulMetadata = recordSuccessfulDownload
+                    ? SuccessfulDownloadMetadata(
+                        downloadedAt: Date(),
+                        etag: etag,
+                        remoteModifiedAt: remoteModifiedAt,
+                        checkedAt: updatesRemoteModifiedAt ? Date() : nil
+                    )
+                    : nil
+                pendingInstalledArtifactReceipts[receiptKey] =
+                    PendingInstalledArtifactReceipt(
+                        receipt: receipt,
+                        successfulDownloadMetadata: successfulMetadata
+                    )
+                try download.persistInstalledArtifactReceipt(receipt)
+            }
 //              print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
-            
+            let successfulMetadata = pendingInstalledArtifactReceipts[
+                receiptKey
+            ]?.successfulDownloadMetadata
             await MainActor.run {
                 download.fileSize = UInt64(fileSize)
 
@@ -2790,18 +3196,23 @@ extension DownloadController {
                 // usable destination and must not make that older artifact
                 // look like the just-downloaded remote version after relaunch.
                 if recordSuccessfulDownload {
-                    download.lastDownloaded = Date()
+                    download.lastDownloaded = successfulMetadata?.downloadedAt
+                        ?? Date()
                     // Validators describe the installed GET bytes. Assigning
                     // nil is intentional: a successful response that omits a
                     // validator invalidates the older artifact's value.
-                    download.lastDownloadedETag = etag
+                    download.lastDownloadedETag = successfulMetadata?.etag
+                        ?? etag
                     // This server validator describes the replacement bytes,
                     // so publish it only after expansion, verification, and
                     // import have all succeeded. Clearing a stale prior value
                     // when the successful response omitted Last-Modified makes
                     // later checks fall back to the install timestamp.
-                    download.lastModifiedAt = remoteModifiedAt
-                    if updatesRemoteModifiedAt {
+                    download.lastModifiedAt = successfulMetadata?
+                        .remoteModifiedAt ?? remoteModifiedAt
+                    if let checkedAt = successfulMetadata?.checkedAt {
+                        download.lastCheckedETagAt = checkedAt
+                    } else if updatesRemoteModifiedAt {
                         download.lastCheckedETagAt = Date()
                     }
                 }
@@ -2812,9 +3223,11 @@ extension DownloadController {
                 guard processingTasks[download.id]?.id == processingTaskID else {
                     throw CancellationError()
                 }
-                self?.refreshPublishedDownloadState()
             }
             completionMetadataRetryDownloadIDs.remove(download.id)
+            pendingInstalledArtifactReceipts[
+                download.installedArtifactReceiptStorageKey
+            ] = nil
             await publishSuccessfulCompletion(download)
             checksumRedownloadAttempted.remove(download.id)
             clearDownloadStatusObservers(forDownloadID: download.id)
@@ -2849,6 +3262,7 @@ extension DownloadController {
                         download,
                         etag: transferResult.etag,
                         remoteModifiedAt: transferResult.lastModified,
+                        finalResponseURL: transferResult.finalResponseURL,
                         updatesRemoteModifiedAt: updatesRemoteModifiedAt,
                         recordSuccessfulDownload: true,
                         transferredFileURL: transferResult.destinationLocation,
@@ -2877,11 +3291,19 @@ extension DownloadController {
                     )
                 }
 
-                await markDownloadCancelled(download, error: error)                return
+                await markDownloadCancelled(download, error: error)
+                return
             }
             let preservesInstalledDestination =
                 stagedUncompressedFileURL != nil
                 || finishStartedWithCompressedFile
+            let shouldDeleteLocal = (
+                error is DownloadLocalFileInspectionError
+                    || error is DownloadCompressedPayloadValidationError
+            )
+                ? false
+                : (download as? ImportableDownloadable)?.deleteAfterImport
+                    ?? true
             await MainActor.run { [weak self] in
                 if let importable = download as? ImportableDownloadable {
                     importable.lastImportError = error
@@ -2894,13 +3316,6 @@ extension DownloadController {
                 download.isActive = false
                 download.isFinishedDownloading = false
                 download.isFinishedProcessing = true
-                let shouldDeleteLocal = (
-                    error is DownloadLocalFileInspectionError
-                        || error is DownloadCompressedPayloadValidationError
-                )
-                    ? false
-                    : (download as? ImportableDownloadable)?.deleteAfterImport
-                        ?? true
                 try? FileManager.default.removeItem(at: download.compressedFileURL)
                 if shouldDeleteLocal && !preservesInstalledDestination {
                     try? FileManager.default.removeItem(at: download.localDestination)
@@ -2910,6 +3325,12 @@ extension DownloadController {
                         at: download.checksumVerificationMarkerURL
                     )
                 }
+            }
+            if shouldDeleteLocal && !preservesInstalledDestination {
+                pendingInstalledArtifactReceipts[
+                    download.installedArtifactReceiptStorageKey
+                ] = nil
+                try? download.removeInstalledArtifactReceipt()
             }
             clearDownloadStatusObservers(forDownloadID: download.id)
         }

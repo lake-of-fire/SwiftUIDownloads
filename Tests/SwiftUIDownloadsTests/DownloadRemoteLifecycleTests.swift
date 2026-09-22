@@ -350,8 +350,9 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         XCTAssertEqual(second.state, .running)
         await controller.cancelInProgressDownloads()
         XCTAssertNotEqual(second.state, .running)
+    }
 
-func testMissingInstalledETagRequiresGETBeforePublishingRemoteETag() async throws {
+    func testMissingInstalledETagRequiresGETBeforePublishingRemoteETag() async throws {
         try await assertMissingInstalledETagRequiresGET(loadFailureCount: 0)
     }
 
@@ -359,7 +360,7 @@ func testMissingInstalledETagRequiresGETBeforePublishingRemoteETag() async throw
         try await assertMissingInstalledETagRequiresGET(loadFailureCount: 1)
     }
 
-    func testKnownEqualETagDoesNotReplaceInstalledArtifact() async throws {
+    func testKnownEqualETagWithoutInstalledReceiptForcesGET() async throws {
         let temporaryDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "swiftui-downloads-known-validator-\(UUID().uuidString)",
@@ -401,10 +402,201 @@ func testMissingInstalledETagRequiresGETBeforePublishingRemoteETag() async throw
         await controller.ensureDownloaded(download: download)
 
         let replacementCount = await attemptExecutor.count()
+        XCTAssertEqual(replacementCount, 1)
+        XCTAssertEqual(
+            try Data(contentsOf: destination),
+            Data("replacement-payload".utf8)
+        )
+        let installedETag = await MainActor.run { download.lastDownloadedETag }
+        XCTAssertEqual(installedETag, "unexpected-replacement")
+    }
+
+    func testKnownEqualETagWithMatchingInstalledReceiptSkipsGET() async throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-known-receipt-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let localA = Data("installed-a".utf8)
+        let destination = temporaryDirectory.appendingPathComponent("payload.bin")
+        try localA.write(to: destination)
+        let metadataBacking = ValidatorMetadataBacking(loadFailureCount: 0)
+        let url = URL(
+            string: "https://swiftui-downloads-known-receipt.test/payload.bin"
+        )!
+        let metadataStore = ValidatorMetadataStore(backing: metadataBacking)
+        let download = Downloadable(
+            url: url,
+            name: "Known Installed Receipt",
+            localDestination: destination,
+            metadataStore: metadataStore
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let attemptExecutor = SuccessfulRemoteAttemptExecutor(
+            etag: "unexpected-replacement"
+        )
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(download: download, session: session)
+            }
+        )
+
+        await controller.finishDownload(download, etag: "remote-b")
+        XCTAssertNotNil(
+            try metadataStore.installedArtifactReceipt(
+                sourceURL: url,
+                destinationURL: destination
+            )
+        )
+
+        await controller.ensureDownloaded(download: download)
+
+        let replacementCount = await attemptExecutor.count()
         XCTAssertEqual(replacementCount, 0)
         XCTAssertEqual(try Data(contentsOf: destination), localA)
         let installedETag = await MainActor.run { download.lastDownloadedETag }
         XCTAssertEqual(installedETag, "remote-b")    }
+
+    func testForeignReplacementInvalidatesReceiptAndForcesGET() async throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-foreign-replacement-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let destination = temporaryDirectory.appendingPathComponent("payload.bin")
+        try Data("installed-a".utf8).write(to: destination)
+        let metadataBacking = ValidatorMetadataBacking(loadFailureCount: 0)
+        let url = URL(
+            string: "https://swiftui-downloads-foreign-replacement.test/payload.bin"
+        )!
+        let metadataStore = ValidatorMetadataStore(backing: metadataBacking)
+        let originalDownload = Downloadable(
+            url: url,
+            name: "Original artifact",
+            localDestination: destination,
+            metadataStore: metadataStore
+        )
+        let setupSession = URLSession(configuration: .ephemeral)
+        let setupController = DownloadController(session: setupSession)
+        await setupController.finishDownload(originalDownload, etag: "remote-b")
+        setupSession.invalidateAndCancel()
+
+        try Data("foreign occupant".utf8).write(to: destination, options: .atomic)
+
+        let replacementDownload = Downloadable(
+            url: url,
+            name: "Replacement artifact",
+            localDestination: destination,
+            metadataStore: metadataStore
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let remoteB = Data("remote-b".utf8)
+        let attemptExecutor = SuccessfulRemoteAttemptExecutor(
+            etag: "remote-b",
+            payload: remoteB
+        )
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(download: download, session: session)
+            }
+        )
+
+        await controller.ensureDownloaded(download: replacementDownload)
+
+        let replacementCount = await attemptExecutor.count()
+        XCTAssertEqual(replacementCount, 1)
+        XCTAssertEqual(try Data(contentsOf: destination), remoteB)
+        XCTAssertNotNil(
+            try metadataStore.installedArtifactReceipt(
+                sourceURL: url,
+                destinationURL: destination
+            )
+        )
+    }
+
+    func testReceiptForSameSourceDoesNotAuthorizeDifferentDestination() async throws {
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-destination-receipt-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+        let url = URL(
+            string: "https://swiftui-downloads-destination-receipt.test/payload.bin"
+        )!
+        let firstDestination = temporaryDirectory.appendingPathComponent("first.bin")
+        let secondDestination = temporaryDirectory.appendingPathComponent("second.bin")
+        let installedBytes = Data("installed-a".utf8)
+        try installedBytes.write(to: firstDestination)
+        try installedBytes.write(to: secondDestination)
+        let metadataStore = ValidatorMetadataStore(
+            backing: ValidatorMetadataBacking(loadFailureCount: 0)
+        )
+        let firstDownload = Downloadable(
+            url: url,
+            name: "First destination",
+            localDestination: firstDestination,
+            metadataStore: metadataStore
+        )
+        let setupSession = URLSession(configuration: .ephemeral)
+        let setupController = DownloadController(session: setupSession)
+        await setupController.finishDownload(firstDownload, etag: "remote-b")
+        setupSession.invalidateAndCancel()
+
+        let secondDownload = Downloadable(
+            url: url,
+            name: "Second destination",
+            localDestination: secondDestination,
+            metadataStore: metadataStore
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let remoteB = Data("remote-b".utf8)
+        let attemptExecutor = SuccessfulRemoteAttemptExecutor(
+            etag: "remote-b",
+            payload: remoteB
+        )
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(download: download, session: session)
+            }
+        )
+
+        await controller.ensureDownloaded(download: secondDownload)
+
+        let replacementCount = await attemptExecutor.count()
+        XCTAssertEqual(replacementCount, 1)
+        XCTAssertEqual(try Data(contentsOf: secondDestination), remoteB)
+        XCTAssertEqual(try Data(contentsOf: firstDestination), installedBytes)
+    }
 
     func testProductionGETHandsResponseValidatorsToInstalledArtifact()
     async throws {
@@ -447,6 +639,20 @@ func testMissingInstalledETagRequiresGETBeforePublishingRemoteETag() async throw
             validators.1,
             Date(timeIntervalSince1970: 1_924_992_000)
         )
+        let receipt = try XCTUnwrap(
+            download.metadataStore.installedArtifactReceipt(
+                sourceURL: download.url,
+                destinationURL: destination
+            )
+        )
+        XCTAssertEqual(receipt.requestedSourceURL, download.url)
+        XCTAssertEqual(receipt.finalResponseURL, download.url)
+        XCTAssertEqual(receipt.destinationURL, destination.standardizedFileURL)
+        XCTAssertEqual(
+            receipt.byteCount,
+            UInt64(Data("get-response-payload".utf8).count)
+        )
+        XCTAssertTrue(download.isReadyForImmediateLocalRead())
     }
 
     func testSuccessfulLastModifiedReplacementAdvancesInstalledBaseline()

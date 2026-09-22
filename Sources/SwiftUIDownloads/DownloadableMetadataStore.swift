@@ -1,4 +1,56 @@
 import Foundation
+import CryptoKit
+
+public struct InstalledArtifactReceipt: Codable, Equatable, Sendable {
+    public static let currentSchemaVersion = 1
+
+    public let schemaVersion: Int
+    public let requestedSourceURL: URL
+    public let finalResponseURL: URL?
+    public let destinationURL: URL
+    public let sha256Digest: String
+    public let byteCount: UInt64
+    public let modificationTimeIntervalSince1970: TimeInterval
+    public let fileSystemNumber: UInt64?
+    public let fileSystemFileNumber: UInt64?
+
+    public init(
+        schemaVersion: Int = InstalledArtifactReceipt.currentSchemaVersion,
+        requestedSourceURL: URL,
+        finalResponseURL: URL? = nil,
+        destinationURL: URL,
+        sha256Digest: String,
+        byteCount: UInt64,
+        modificationTimeIntervalSince1970: TimeInterval,
+        fileSystemNumber: UInt64?,
+        fileSystemFileNumber: UInt64?
+    ) {
+        self.schemaVersion = schemaVersion
+        self.requestedSourceURL = requestedSourceURL
+        self.finalResponseURL = finalResponseURL
+        self.destinationURL = destinationURL
+        self.sha256Digest = sha256Digest
+        self.byteCount = byteCount
+        self.modificationTimeIntervalSince1970 = modificationTimeIntervalSince1970
+        self.fileSystemNumber = fileSystemNumber
+        self.fileSystemFileNumber = fileSystemFileNumber
+    }
+}
+
+private func standardizedReceiptSourceURL(_ url: URL) -> URL {
+    url.isFileURL ? url.standardizedFileURL : url.standardized
+}
+
+private func installedArtifactReceiptKey(sourceURL: URL, destinationURL: URL) -> String {
+    let identity = [
+        standardizedReceiptSourceURL(sourceURL).absoluteString,
+        destinationURL.standardizedFileURL.absoluteString
+    ].joined(separator: "\u{0}")
+    let digest = SHA256.hash(data: Data(identity.utf8))
+        .map { String(format: "%02x", $0) }
+        .joined()
+    return "installedArtifactReceipt:v1:\(digest)"
+}
 
 public struct DownloadMetadata: Equatable, Sendable {
     public var lastDownloadedETag: String?
@@ -52,6 +104,19 @@ public protocol DownloadableMetadataStore: Sendable {
     func setLastModifiedAt(_ date: Date?, for url: URL)
     func loadMetadata(for url: URL) throws -> DownloadMetadata
     func saveMetadata(_ metadata: DownloadMetadata, fields: DownloadMetadataFields, for url: URL) throws
+    func installedArtifactReceipt(
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws -> InstalledArtifactReceipt?
+    func saveInstalledArtifactReceipt(
+        _ receipt: InstalledArtifactReceipt,
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws
+    func removeInstalledArtifactReceipt(
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws
 }
 
 public extension DownloadableMetadataStore {
@@ -81,6 +146,48 @@ public extension DownloadableMetadataStore {
         if fields.contains(.lastModifiedAt) {
             setLastModifiedAt(metadata.lastModifiedAt, for: url)
         }
+    }
+
+    func installedArtifactReceipt(
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws -> InstalledArtifactReceipt? {
+        guard let data = UserDefaults.standard.data(
+            forKey: installedArtifactReceiptKey(
+                sourceURL: sourceURL,
+                destinationURL: destinationURL
+            )
+        ) else {
+            return nil
+        }
+        return try JSONDecoder().decode(InstalledArtifactReceipt.self, from: data)
+    }
+
+    func saveInstalledArtifactReceipt(
+        _ receipt: InstalledArtifactReceipt,
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws {
+        let data = try JSONEncoder().encode(receipt)
+        UserDefaults.standard.set(
+            data,
+            forKey: installedArtifactReceiptKey(
+                sourceURL: sourceURL,
+                destinationURL: destinationURL
+            )
+        )
+    }
+
+    func removeInstalledArtifactReceipt(
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws {
+        UserDefaults.standard.removeObject(
+            forKey: installedArtifactReceiptKey(
+                sourceURL: sourceURL,
+                destinationURL: destinationURL
+            )
+        )
     }
 }
 
@@ -157,5 +264,47 @@ public struct UserDefaultsDownloadableMetadataStore: DownloadableMetadataStore, 
         } else {
             userDefaults.removeObject(forKey: key)
         }
+    }
+
+    public func installedArtifactReceipt(
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws -> InstalledArtifactReceipt? {
+        guard let data = userDefaults.data(
+            forKey: installedArtifactReceiptKey(
+                sourceURL: sourceURL,
+                destinationURL: destinationURL
+            )
+        ) else {
+            return nil
+        }
+        return try JSONDecoder().decode(InstalledArtifactReceipt.self, from: data)
+    }
+
+    public func saveInstalledArtifactReceipt(
+        _ receipt: InstalledArtifactReceipt,
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws {
+        let data = try JSONEncoder().encode(receipt)
+        userDefaults.set(
+            data,
+            forKey: installedArtifactReceiptKey(
+                sourceURL: sourceURL,
+                destinationURL: destinationURL
+            )
+        )
+    }
+
+    public func removeInstalledArtifactReceipt(
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws {
+        userDefaults.removeObject(
+            forKey: installedArtifactReceiptKey(
+                sourceURL: sourceURL,
+                destinationURL: destinationURL
+            )
+        )
     }
 }

@@ -153,11 +153,18 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol,
     private let terminalLock = NSLock()
     private var didPublishTerminalResult = false
     private var terminalLastModified: Date?
+    private var terminalResponseURL: URL?
 
     var responseLastModified: Date? {
         terminalLock.lock()
         defer { terminalLock.unlock() }
         return terminalLastModified
+    }
+
+    var finalResponseURL: URL? {
+        terminalLock.lock()
+        defer { terminalLock.unlock() }
+        return terminalResponseURL
     }
 
     public var taskIdentifier: Int {
@@ -195,6 +202,7 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol,
         destinationLocation: URL?,
         etag: String?,
         lastModified: Date?,
+        finalResponseURL: URL?,
         error: Error?
     ) {
         terminalLock.lock()
@@ -204,6 +212,7 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol,
         }
         didPublishTerminalResult = true
         terminalLastModified = lastModified
+        terminalResponseURL = finalResponseURL
         terminalLock.unlock()
 
         subject.send(.completed(
@@ -243,6 +252,7 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
                 destinationLocation: nil,
                 etag: nil,
                 lastModified: nil,
+                finalResponseURL: downloadTask.response?.url,
                 error: error
             )
         } else {
@@ -263,6 +273,7 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
                     lastModified: (downloadTask.response as? HTTPURLResponse)?
                         .value(forHTTPHeaderField: "Last-Modified")
                         .flatMap(parseHTTPDate),
+                    finalResponseURL: downloadTask.response?.url,
                     error: nil
                 )
             } catch {
@@ -270,6 +281,7 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
                     destinationLocation: nil,
                     etag: nil,
                     lastModified: nil,
+                    finalResponseURL: downloadTask.response?.url,
                     error: URLResourceDownloadInstallError
                         .destinationInstallFailed(
                             destination: destination,
@@ -315,6 +327,7 @@ extension URLResourceDownloadTask: URLSessionTaskDelegate {
                 destinationLocation: nil,
                 etag: nil,
                 lastModified: nil,
+                finalResponseURL: task.response?.url,
                 error: error
             )
         } else if let httpResponse = task.response as? HTTPURLResponse, httpResponse.statusCode < 200 || httpResponse.statusCode > 299 {
@@ -327,6 +340,7 @@ extension URLResourceDownloadTask: URLSessionTaskDelegate {
                 destinationLocation: nil,
                 etag: nil,
                 lastModified: nil,
+                finalResponseURL: task.response?.url,
                 error: error
             )
         } else {
@@ -334,6 +348,7 @@ extension URLResourceDownloadTask: URLSessionTaskDelegate {
                 destinationLocation: nil,
                 etag: nil,
                 lastModified: nil,
+                finalResponseURL: task.response?.url,
                 error: URLResourceDownloadInstallError
                     .completedWithoutDownloadedFile(url)
             )
