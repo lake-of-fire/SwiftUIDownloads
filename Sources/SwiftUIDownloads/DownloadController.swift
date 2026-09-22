@@ -880,6 +880,14 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         FileManager.default.fileExists(atPath: localDestination.path)
             || (url.pathExtension == "br" && FileManager.default.fileExists(atPath: compressedFileURL.path))
     }
+
+    /// Validates an installed artifact away from the main actor. Callers that
+    /// need to open a catalog download immediately must use this instead of
+    /// treating path presence as proof that the bytes belong to the download.
+    @DownloadActor
+    public func hasVerifiedInstalledArtifact() -> Bool {
+        isReadyForImmediateLocalRead()
+    }
     
     @DownloadActor
     public func fetchRemoteFileSize() async throws {
