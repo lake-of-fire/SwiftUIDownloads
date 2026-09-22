@@ -1209,6 +1209,19 @@ public enum DownloadDirectory {
     
     public var directoryURL: URL {
 #if DEBUG
+        do {
+            if let isolatedURL = try isolatedUITestDirectoryURL(
+                arguments: ProcessInfo.processInfo.arguments,
+                environment: ProcessInfo.processInfo.environment,
+                temporaryDirectory: FileManager.default.temporaryDirectory
+            ) {
+                return isolatedURL
+            }
+        } catch {
+            // A malformed isolated launch must never fall through to the
+            // developer's shared download data or a stale test override.
+            preconditionFailure("Invalid isolated UI-test download identity: \(error)")
+        }
         if let configuredRoot = ProcessInfo.processInfo.environment["JVIDS_MANABI_DATA_ROOT"],
            !configuredRoot.isEmpty {
             var url = URL(fileURLWithPath: configuredRoot, isDirectory: true)
@@ -1274,6 +1287,50 @@ public enum DownloadDirectory {
     }
 
 #if DEBUG
+    enum IsolatedUITestDirectoryError: Error {
+        case invalidRunID
+    }
+
+    /// Resolve inside the launched app, whose sandbox temp directory differs
+    /// from the XCTest runner's. Keep the existing Manabi isolated app-group
+    /// layout without importing the application or creating any files here.
+    func isolatedUITestDirectoryURL(
+        arguments: [String],
+        environment: [String: String],
+        temporaryDirectory: URL
+    ) throws -> URL? {
+        guard arguments.contains("--ui-test-isolated-data-root") else { return nil }
+        let parent: String?
+        let child: String?
+        let group: String?
+        let defaultDirectory: String?
+        switch self {
+        case .documents(let parentDirectoryName, let subdirectoryName, let groupIdentifier):
+            (parent, child, group) = (parentDirectoryName, subdirectoryName, groupIdentifier)
+            defaultDirectory = "swiftui-downloads"
+        case .appSupport(let parentDirectoryName, let subdirectoryName, let groupIdentifier):
+            (parent, child, group) = (parentDirectoryName, subdirectoryName, groupIdentifier)
+            defaultDirectory = nil
+        }
+        guard group != nil else { return nil }
+        guard let runID = environment["MANABI_UI_TEST_DATA_ROOT_RUN_ID"],
+              let parsed = UUID(uuidString: runID),
+              parsed.uuidString.lowercased() == runID else {
+            throw IsolatedUITestDirectoryError.invalidRunID
+        }
+        var url = temporaryDirectory
+            .appendingPathComponent("ManabiReaderUITests", isDirectory: true)
+            .appendingPathComponent(runID, isDirectory: true)
+            .appendingPathComponent("app-group", isDirectory: true)
+        if let directory = parent ?? defaultDirectory {
+            url.appendPathComponent(directory, isDirectory: true)
+        }
+        if let child {
+            url.appendPathComponent(child, isDirectory: true)
+        }
+        return url
+    }
+
     private static func testAppGroupURL(groupIdentifier: String?) -> URL? {
         guard groupIdentifier != nil else { return nil }
         if let testAppGroupPath = ProcessInfo.processInfo.environment["MANABI_TEST_APP_GROUP_DIR"],
