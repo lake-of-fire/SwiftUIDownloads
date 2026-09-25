@@ -368,8 +368,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         try await downloadMetadataCache.waitForPendingSaves()
     }
     
-    /// localDestinationChecksum is currently NOT checked.
-    // TODO: Verify localDestinationChecksum after download and decompress (was originally added for use in Cache)
+    /// A supplied destination checksum is verified before installed bytes are
+    /// published as ready and rechecked when the installed file identity changes.
     public init(
         url: URL,
         mirrorURL: URL? = nil,
@@ -1768,7 +1768,13 @@ extension DownloadController {
         if assuredDownloads.contains(where: { $0.url == download.url }) && !failedDownloads.contains(where: { $0.url == download.url }) {
             let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
             let localExists = await download.existsLocally()
-            if localExists || isImported {
+            // An assured URL is not proof that its installed bytes remain
+            // usable. An interrupted or externally replaced dictionary can
+            // leave a file at the destination after the prior success flags
+            // were published; re-enter validation/recovery in that case.
+            if isImported || (localExists
+                && download.isFinishedProcessing
+                && download.isReadyForImmediateLocalRead()) {
                 return
             }
         }
@@ -2129,10 +2135,15 @@ extension DownloadController {
             let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
 
             if state.isFinishedProcessing {
-                if hasRecoverableFile || isImported {
+                if isImported || (hasRecoverableFile
+                    && download.isReadyForImmediateLocalRead()) {
                     continue
                 }
-                await self.download(download)
+                if hasRecoverableFile {
+                    await finishDownload(download)
+                } else {
+                    await self.download(download)
+                }
                 continue
             }
 
@@ -2506,7 +2517,7 @@ extension DownloadController {
         do {
             try Task.checkCancellation()
             let alreadyFinished = await MainActor.run { download.isFinishedProcessing }
-            if alreadyFinished {
+            if alreadyFinished && download.isReadyForImmediateLocalRead() {
                 clearDownloadStatusObservers(forDownloadID: download.id)
                 return
             }
