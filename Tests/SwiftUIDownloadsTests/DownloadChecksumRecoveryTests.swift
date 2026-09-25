@@ -1425,6 +1425,121 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertEqual(attemptCount, 1)
     }
 
+    func testAlreadyAssuredJMDictStyleArtifactRecoversExternalReplacement() async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-assured-checksum-recovery-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let expectedPayload = Data("valid-jmdict-artifact".utf8)
+        let destinationURL = tempDirectory.appendingPathComponent("jmdict.realm")
+        let download = Downloadable(
+            url: URL(string: "https://swiftui-downloads-checksum.test/jmdict.realm")!,
+            name: "Japanese-English Dictionary (JMDict)",
+            localDestination: destinationURL,
+            localDestinationChecksum: sha1Hex(expectedPayload)
+        )
+        await MainActor.run { download.shouldCheckForUpdates = false }
+        let attemptExecutor = ChecksumRecoveryAttemptExecutor(
+            payload: expectedPayload
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(
+                    download: download,
+                    session: session
+                )
+            }
+        )
+
+        await controller.ensureDownloaded(download: download)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        let firstAttemptCount = await attemptExecutor.recordedAttemptCount()
+        XCTAssertEqual(firstAttemptCount, 1)
+
+        // Another process, interrupted installer, or damaged cache can replace
+        // a previously assured file without changing this controller's flags.
+        try Data("partial-jmdict-artifact".utf8).write(
+            to: destinationURL,
+            options: .atomic
+        )
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+
+        await controller.ensureDownloaded(download: download)
+        let recoveredAttemptCount = await attemptExecutor.recordedAttemptCount()
+        XCTAssertEqual(recoveredAttemptCount, 2)
+        XCTAssertEqual(try Data(contentsOf: destinationURL), expectedPayload)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        let state = await MainActor.run {
+            (download.isFinishedProcessing, download.isFailed,
+             controller.finishedDownloads.contains(download))
+        }
+        XCTAssertTrue(state.0)
+        XCTAssertFalse(state.1)
+        XCTAssertTrue(state.2)
+
+        // Foreground recovery must not trust the same stale finished flag.
+        try Data("another-partial-artifact".utf8).write(
+            to: destinationURL,
+            options: .atomic
+        )
+        await controller.resumeRecoverableDownloadsAfterForegrounding()
+        let foregroundAttemptCount = await attemptExecutor.recordedAttemptCount()
+        XCTAssertEqual(foregroundAttemptCount, 3)
+        XCTAssertEqual(try Data(contentsOf: destinationURL), expectedPayload)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+    }
+
+    func testImportedButRetainedSourceStillRevalidatesAssuredInstall() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "swiftui-downloads-retained-import-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let expectedPayload = Data("valid-retained-dictionary".utf8)
+        let destination = directory.appendingPathComponent("dictionary.realm")
+        let download = ImportableDownloadable(
+            url: URL(string: "https://swiftui-downloads-checksum.test/retained.realm")!,
+            name: "Retained dictionary",
+            localDestination: destination,
+            localDestinationChecksum: sha1Hex(expectedPayload),
+            deleteAfterImport: false,
+            isImported: { true },
+            importHandler: { _, _ in }
+        )
+        await MainActor.run { download.shouldCheckForUpdates = false }
+        let attempts = ChecksumRecoveryAttemptExecutor(payload: expectedPayload)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, session in
+            try await attempts.execute(download: download, session: session)
+        })
+
+        await controller.ensureDownloaded(download: download)
+        let firstAttemptCount = await attempts.recordedAttemptCount()
+        XCTAssertEqual(firstAttemptCount, 1)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+
+        try Data("damaged-retained-dictionary".utf8).write(to: destination, options: .atomic)
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        await controller.ensureDownloaded(download: download)
+
+        let recoveredAttemptCount = await attempts.recordedAttemptCount()
+        XCTAssertEqual(recoveredAttemptCount, 2)
+        XCTAssertEqual(try Data(contentsOf: destination), expectedPayload)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+    }
+
     func testConcurrentFinishAndDirectRecoveryUseOneDownloadAttempt() async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(

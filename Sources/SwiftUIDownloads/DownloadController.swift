@@ -550,6 +550,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     }
     
     /// The checksum, when provided, describes the expanded file before import.
+    /// Installed bytes are revalidated if their file identity changes.
     public init(
         url: URL,
         mirrorURL: URL? = nil,
@@ -1783,6 +1784,7 @@ func isRetryableDownloadError(_ error: Error) -> Bool {
     if let urlError = error as? URLError {
         switch urlError.code {
         case .timedOut,
+             .cannotParseResponse,
              .cannotFindHost,
              .cannotConnectToHost,
              .networkConnectionLost,
@@ -2326,7 +2328,11 @@ extension DownloadController {
             let isImported = await (download as? ImportableDownloadable)?.isImported() ?? false
             let importedWithoutRetainedSource = isImported
                 && (download as? ImportableDownloadable)?.deleteAfterImport == true
-            if download.hasAdmissibleInstalledArtifact()
+            // A prior assurance is not proof that installed bytes survived.
+            // Preserve the deleted-source import exception without allowing an
+            // imported artifact still on disk to bypass revalidation.
+            if (download.isFinishedProcessing
+                && download.hasAdmissibleInstalledArtifact())
                 || importedWithoutRetainedSource {
                 return
             }
@@ -2794,10 +2800,16 @@ extension DownloadController {
                     )
                     continue
                 }
-                if hasProcessableLocalArtifact || importedWithoutRetainedSource {
+                if (hasRecoverableFile
+                    && download.hasAdmissibleInstalledArtifact())
+                    || importedWithoutRetainedSource {
                     continue
                 }
-                await self.download(download)
+                if hasRecoverableFile {
+                    await finishDownload(download)
+                } else {
+                    await self.download(download)
+                }
                 continue
             }
 
