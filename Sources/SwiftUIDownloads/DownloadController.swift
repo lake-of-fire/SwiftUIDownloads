@@ -1413,6 +1413,7 @@ func isRetryableDownloadError(_ error: Error) -> Bool {
     if let urlError = error as? URLError {
         switch urlError.code {
         case .timedOut,
+             .cannotParseResponse,
              .cannotFindHost,
              .cannotConnectToHost,
              .networkConnectionLost,

@@ -71,6 +71,26 @@ final class DownloadRetrySupportTests: XCTestCase {
         XCTAssertFalse(isRetryableDownloadError(notRetryable))
     }
 
+    func testMalformedTransportResponseUsesBoundedRetryPolicy() {
+        XCTAssertTrue(isRetryableDownloadError(URLError(.cannotParseResponse)))
+        XCTAssertFalse(isRetryableDownloadError(URLError(.badURL)))
+
+        let policy = DownloadRetryPolicy(
+            maxAttempts: 3,
+            initialDelaySeconds: 0.05,
+            maxDelaySeconds: 0.2,
+            jitterFraction: 0,
+            maxServerRetryAfterSeconds: 1
+        )
+        XCTAssertEqual(
+            policy.retryDelaySeconds(
+                forAttempt: 2,
+                error: URLError(.cannotParseResponse)
+            ),
+            0.05
+        )
+    }
+
     func testRetryDelayPrefersServerRetryAfterWhenLarger() {
         let policy = DownloadRetryPolicy(
             maxAttempts: 3,
