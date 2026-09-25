@@ -66,7 +66,11 @@ final class URLResourceDownloadTaskTerminalTests: XCTestCase {
         let task = URLResourceDownloadTask(
             session: session,
             url: URL(string: "https://swiftui-downloads-terminal.test/payload")!,
-            destination: destination
+            destination: destination,
+            operationKey: DownloadOperationKey(
+                sourceURL: URL(string: "https://swiftui-downloads-terminal.test/payload")!,
+                destinationURL: destination
+            )
         )
         let completion = expectation(description: "terminal completion")
         var terminalResults: [Error?] = []
