@@ -3458,14 +3458,24 @@ extension DownloadController {
 
             if let importable = download as? ImportableDownloadable {
                 try Task.checkCancellation()
+                let importObservationGeneration = importable.beginImportObservation()
+                defer {
+                    importable.endImportObservation(importObservationGeneration)
+                }
                 await { @MainActor in
                     importable.lastImportError = nil
                     importable.importProgress = 0
                     importable.importStatusText = "Importing…"
                 }()
-                let progressHandler: ImportableDownloadable.ImportProgressHandler = { [weak importable] progress, status in
+                let progressHandler: ImportableDownloadable.ImportProgressHandler = {
+                    [weak importable] progress, status in
                     Task { @MainActor in
-                        guard let importable else { return }
+                        guard let importable,
+                              importable.importObservationIsCurrent(
+                                importObservationGeneration
+                              ) else {
+                            return
+                        }
                         if let progress {
                             importable.importProgress = min(max(progress, 0), 1)
                         }
@@ -3474,7 +3484,16 @@ extension DownloadController {
                         }
                     }
                 }
-                try await importable.importHandler(processingFileURL, progressHandler)
+                try await withTaskCancellationHandler {
+                    try await importable.importHandler(
+                        processingFileURL,
+                        progressHandler
+                    )
+                } onCancel: {
+                    importable.endImportObservation(
+                        importObservationGeneration
+                    )
+                }
                 try Task.checkCancellation()
             }
 
