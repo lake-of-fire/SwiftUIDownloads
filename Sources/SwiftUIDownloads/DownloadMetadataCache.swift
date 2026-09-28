@@ -259,11 +259,25 @@ final class DownloadMetadataCache: @unchecked Sendable {
                 }
             } catch {
                 let persistenceError = DownloadMetadataPersistenceError(error)
-                withLock {
+                let shouldRetryNewerMutation = withLock {
                     dirtyFields.formUnion(pending.1)
-                    latestSaveError = persistenceError
-                    isSaveScheduled = false
-                    saveTask = nil
+                    guard mutationRevision != pending.2 else {
+                        latestSaveError = persistenceError
+                        isSaveScheduled = false
+                        saveTask = nil
+                        return false
+                    }
+
+                    // A mutation arrived while this save was in flight. That
+                    // mutation observed an owned save task and therefore did
+                    // not create another one. Keep this task as the owner and
+                    // immediately retry the complete dirty snapshot instead of
+                    // stranding the newer value until some unrelated mutation.
+                    latestSaveError = nil
+                    return true
+                }
+                if shouldRetryNewerMutation {
+                    continue
                 }
                 throw persistenceError
             }
