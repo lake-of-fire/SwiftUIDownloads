@@ -1012,9 +1012,12 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 6)
             request.httpMethod = "HEAD"
             do {
-                let fileSize = try await UInt64(URLSession.shared.data(for: request).1.expectedContentLength)
+                let response = try await URLSession.shared.data(for: request).1
+                let expectedContentLength = response.expectedContentLength
                 await MainActor.run {
-                    self.fileSize = fileSize
+                    self.fileSize = expectedContentLength >= 0
+                        ? UInt64(expectedContentLength)
+                        : nil
                 }
             } catch {
                 throw(error)
