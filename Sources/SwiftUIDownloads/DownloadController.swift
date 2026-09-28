@@ -1008,20 +1008,24 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     
     @DownloadActor
     public func fetchRemoteFileSize() async throws {
-        if await !existsLocally() {
-            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 6)
-            request.httpMethod = "HEAD"
-            do {
-                let response = try await URLSession.shared.data(for: request).1
-                let expectedContentLength = response.expectedContentLength
-                await MainActor.run {
-                    self.fileSize = expectedContentLength >= 0
-                        ? UInt64(expectedContentLength)
-                        : nil
-                }
-            } catch {
-                throw(error)
-            }
+        try await fetchRemoteFileSize(session: .shared)
+    }
+
+    @DownloadActor
+    func fetchRemoteFileSize(session: URLSession) async throws {
+        guard await !existsLocally() else { return }
+        var request = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+            timeoutInterval: 6
+        )
+        request.httpMethod = "HEAD"
+        let response = try await session.data(for: request).1
+        let expectedContentLength = response.expectedContentLength
+        await MainActor.run {
+            self.fileSize = expectedContentLength >= 0
+                ? UInt64(expectedContentLength)
+                : nil
         }
     }
     
