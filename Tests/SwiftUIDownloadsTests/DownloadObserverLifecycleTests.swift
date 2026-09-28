@@ -42,6 +42,18 @@ private actor ImportProcessingGate {
     }
 }
 
+private actor RetainedImportProgressHandler {
+    private var handler: ImportableDownloadable.ImportProgressHandler?
+
+    func retain(_ handler: @escaping ImportableDownloadable.ImportProgressHandler) {
+        self.handler = handler
+    }
+
+    func emit(progress: Double?, status: String?) {
+        handler?(progress, status)
+    }
+}
+
 private actor SuccessfulAttemptExecutorStub {
     private let payload: Data
     private var invocationCount = 0
@@ -286,6 +298,74 @@ final class DownloadObserverLifecycleTests: XCTestCase {
 
         XCTAssertFalse(terminalState.4)
         XCTAssertFalse(terminalState.5)    }
+
+    func testLateImporterProgressCannotOverwriteTerminalState() async throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-late-import-progress-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: tempDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let payload = Data("late-progress".utf8)
+        let destination = tempDirectory.appendingPathComponent("payload.bin")
+        let retained = RetainedImportProgressHandler()
+        let download = ImportableDownloadable(
+            url: URL(string: "https://swiftui-downloads-late-progress.test/payload.bin")!,
+            name: "Late importer progress",
+            localDestination: destination,
+            deleteAfterImport: false,
+            isImported: { false },
+            importHandler: { localURL, progressHandler in
+                _ = try Data(contentsOf: localURL)
+                await retained.retain(progressHandler)
+                progressHandler(1, "Imported")
+            }
+        )
+        let attemptExecutor = SuccessfulAttemptExecutorStub(payload: payload)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(
+                    download: download,
+                    session: session
+                )
+            }
+        )
+
+        await controller.download(download)
+        XCTAssertTrue(try await download.awaitCompletionOrFailure())
+        let terminalBeforeLateCallback = await MainActor.run {
+            (
+                download.isFinishedProcessing,
+                download.importProgress,
+                download.importStatusText
+            )
+        }
+        XCTAssertTrue(terminalBeforeLateCallback.0)
+        XCTAssertNil(terminalBeforeLateCallback.1)
+        XCTAssertNil(terminalBeforeLateCallback.2)
+
+        await retained.emit(progress: 0.25, status: "Obsolete import")
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let terminalAfterLateCallback = await MainActor.run {
+            (
+                download.isFinishedProcessing,
+                download.importProgress,
+                download.importStatusText
+            )
+        }
+        XCTAssertTrue(terminalAfterLateCallback.0)
+        XCTAssertNil(terminalAfterLateCallback.1)
+        XCTAssertNil(terminalAfterLateCallback.2)
+    }
 
     func testLocalFileMissingFailureUpdatesFailedSetAndAllowsRetryWithoutHanging() async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
