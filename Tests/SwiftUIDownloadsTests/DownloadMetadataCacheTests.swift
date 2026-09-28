@@ -13,7 +13,10 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
     private let failsBulkLoad: Bool
     private let bulkLoadStarted = DispatchSemaphore(value: 0)
     private let bulkLoadMayFinish = DispatchSemaphore(value: 0)
+    private let firstSaveStarted = DispatchSemaphore(value: 0)
+    private let firstSaveMayFinish = DispatchSemaphore(value: 0)
     private let pausesBulkLoad: Bool
+    private let pausesFirstSave: Bool
     private var remainingSaveFailures: Int
     private var remainingReceiptSaveFailures: Int
     private var installedArtifactReceipts: [String: InstalledArtifactReceipt] = [:]
@@ -26,12 +29,14 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
         metadata: DownloadMetadata,
         failsBulkLoad: Bool = false,
         pausesBulkLoad: Bool = false,
+        pausesFirstSave: Bool = false,
         saveFailureCount: Int = 0,
         receiptSaveFailureCount: Int = 0
     ) {
         self.metadata = metadata
         self.failsBulkLoad = failsBulkLoad
         self.pausesBulkLoad = pausesBulkLoad
+        self.pausesFirstSave = pausesFirstSave
         self.remainingSaveFailures = saveFailureCount
         self.remainingReceiptSaveFailures = receiptSaveFailureCount
     }
@@ -55,8 +60,15 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
         fields: DownloadMetadataFields,
         for _: URL
     ) throws {
-        try withLock {
+        let shouldPause = withLock {
             saveCount += 1
+            return pausesFirstSave && saveCount == 1
+        }
+        if shouldPause {
+            firstSaveStarted.signal()
+            firstSaveMayFinish.wait()
+        }
+        try withLock {
             if remainingSaveFailures > 0 {
                 remainingSaveFailures -= 1
                 throw StoreError.requested
@@ -137,6 +149,14 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
 
     func resumeBulkLoad() {
         bulkLoadMayFinish.signal()
+    }
+
+    func waitUntilFirstSaveStarts() {
+        firstSaveStarted.wait()
+    }
+
+    func resumeFirstSave() {
+        firstSaveMayFinish.signal()
     }
 
     private func scalarRead<Value>(_ value: () -> Value) -> Value {
@@ -278,6 +298,37 @@ final class DownloadMetadataCacheTests: XCTestCase {
         download.lastModifiedAt = modifiedAt
         try await download.waitForDownloadMetadataPersistence()
 
+        XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "etag")
+        XCTAssertEqual(store.storedMetadata.lastModifiedAt, modifiedAt)
+    }
+
+    @MainActor
+    func testMutationArrivingDuringFailedSaveIsRetriedByOwningTask() async throws {
+        let store = RecordingDownloadMetadataStore(
+            metadata: DownloadMetadata(),
+            pausesFirstSave: true,
+            saveFailureCount: 1
+        )
+        let download = Downloadable(
+            url: URL(string: "https://example.com/concurrent-save-retry.zip")!,
+            name: "Concurrent save retry",
+            localDestination: URL(fileURLWithPath: "/tmp/concurrent-save-retry.zip"),
+            metadataStore: store
+        )
+        await download.waitForDownloadMetadata()
+
+        download.lastDownloadedETag = "etag"
+        await Task.detached {
+            store.waitUntilFirstSaveStarts()
+        }.value
+
+        let modifiedAt = Date(timeIntervalSince1970: 450)
+        download.lastModifiedAt = modifiedAt
+        store.resumeFirstSave()
+
+        try await download.waitForDownloadMetadataPersistence()
+
+        XCTAssertEqual(store.saveCount, 2)
         XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "etag")
         XCTAssertEqual(store.storedMetadata.lastModifiedAt, modifiedAt)
     }
