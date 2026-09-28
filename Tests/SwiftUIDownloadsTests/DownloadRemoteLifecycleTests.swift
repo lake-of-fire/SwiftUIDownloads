@@ -66,6 +66,30 @@ private final class ModifiedHEADURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+private final class UnknownLengthHEADURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Transfer-Encoding": "chunked"]
+        )!
+        client?.urlProtocol(
+            self,
+            didReceive: response,
+            cacheStoragePolicy: .notAllowed
+        )
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 private final class ETagOnlyHEADURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest {
@@ -323,6 +347,25 @@ private struct ValidatorMetadataStore: DownloadableMetadataStore {
 }
 
 final class DownloadRemoteLifecycleTests: XCTestCase {
+
+    func testRemoteFileSizeLeavesUnknownContentLengthUnset() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [UnknownLengthHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let download = Downloadable(
+            url: URL(string: "https://content-length.test/payload")!,
+            name: "Unknown length",
+            localDestination: FileManager.default.temporaryDirectory
+                .appendingPathComponent("missing-\(UUID().uuidString)")
+        )
+
+        try await download.fetchRemoteFileSize(session: session)
+
+        let fileSize = await MainActor.run { download.fileSize }
+        XCTAssertNil(fileSize)
+    }
 
     func testDownloadableIdentityUsesStandardizedSourceAndDestination() {
         let sourceURL = URL(string: "https://identity.test/catalog/../dictionary.zip")!
