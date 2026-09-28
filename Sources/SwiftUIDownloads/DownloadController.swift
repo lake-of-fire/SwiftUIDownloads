@@ -1097,19 +1097,11 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     }
 
     func uncompressedTransferStagingURL(operationID: UUID) -> URL {
-        let pathExtension = localDestination.pathExtension
-
-        let baseName = localDestination.lastPathComponent
-        let suffix = pathExtension.isEmpty ? "" : ".\(pathExtension)"
-        return localDestination.deletingLastPathComponent()
-            .appendingPathComponent(
-                "\(baseName).downloading.\(operationID.uuidString)\(suffix)"
-            )
+        stagingPaths.url(for: .transfer, operationID: operationID)
     }
 
     func compressedTransferStagingURL(operationID: UUID) -> URL {
-        uncompressedTransferStagingURL(operationID: operationID)
-            .appendingPathExtension("br")
+        stagingPaths.url(for: .compressed, operationID: operationID)
     }
 
     private func beginDownloadObservation() -> UUID {
@@ -1169,9 +1161,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
 
             // A unique output prevents a cancelled older processor from
             // deleting or replacing a newer attempt's staging file.
-            let temporaryOutputURL = localDestination.appendingPathExtension(
-                "decompressing.\(operationID.uuidString)"
-            )
+            let temporaryOutputURL = decompressionStagingURL(operationID: operationID)
             try? FileManager.default.removeItem(at: temporaryOutputURL)
             do {
                 try decompressBrotliFile(
@@ -1883,9 +1873,7 @@ public extension DownloadController {
         for download in retainedDownloads {
             if let processingTaskID = processingTasks[download.id]?.id {
                 saveFiles.insert(
-                    download.localDestination.appendingPathExtension(
-                        "decompressing.\(processingTaskID.uuidString)"
-                    )
+                    download.decompressionStagingURL(operationID: processingTaskID)
                 )
             }
         }
@@ -2565,10 +2553,10 @@ extension DownloadController {
 //                            if let baDL = download.backgroundAssetDownload(applicationGroupIdentifier: ""), try await BADownloadManager.shared.currentDownloads.contains(baDL) {
 //                                if #available(iOS 16.4, macOS 13.3, *) {
 //                                    if !baDL.isEssential {
-//                                        try BADownloadManager.shared.startForegroundDownload(baDL)
+//                                        try await BADownloadManager.shared.startForegroundDownload(baDL)
 //                                    }
 //                                } else {
-//                                    try BADownloadManager.shared.startForegroundDownload(baDL)
+//                                    try await BADownloadManager.shared.startForegroundDownload(baDL)
 //                                }
 //                                return
 //                            }
@@ -2898,32 +2886,10 @@ extension DownloadController {
             at: download.compressedFileURL
         )
 
-        let directory = download.localDestination.deletingLastPathComponent()
-        guard FileManager.default.fileExists(atPath: directory.path) else {
-            return
-        }
-        let stagingPrefix = download.localDestination.lastPathComponent
-            + ".decompressing."
-        let transferStagingPrefix = download.localDestination
-            .lastPathComponent + ".downloading."
-        let children = try FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil
+        let removed = try download.stagingPaths.removeTemporaryArtifacts(
+            preserving: preservingActiveTransfers ? activeTransferStagingURLs : []
         )
-        for child in children
-            where child.lastPathComponent.hasPrefix(stagingPrefix)
-                || child.lastPathComponent.hasPrefix(transferStagingPrefix) {
-            // A cancelled older processor must not remove a candidate owned
-            // by a newer transfer admitted while cancellation was unwinding.
-            guard !preservingActiveTransfers
-                    || !activeTransferStagingURLs.contains(child) else {
-                continue
-            }
-            if !preservingActiveTransfers {
-                activeTransferStagingURLs.remove(child)
-            }
-            try FileManager.default.removeItemIfPresent(at: child)
-        }
+        activeTransferStagingURLs.subtract(removed)
     }
     
     @DownloadActor
@@ -3927,10 +3893,6 @@ extension DownloadController {
 //            finishedDownloads.remove(downloadable)
 //            failedDownloads.remove(downloadable)
 //            activeDownloads.insert(downloadable)
-//            do {
-//                try await cancelInProgressDownloads(inApp: true)
-//            } catch {
-//            }
 //        }
 //    }
 //    
