@@ -80,7 +80,7 @@ public struct DownloadStagingPaths: Sendable {
             && !protectedURLs.contains(child.absoluteURL.standardizedFileURL) {
             do {
                 try FileManager.default.removeItem(at: child)
-                removed.append(child)
+                removed.append(directory.appendingPathComponent(child.lastPathComponent))
             } catch {
                 if Self.isMissingFile(error) { continue }
                 throw error
