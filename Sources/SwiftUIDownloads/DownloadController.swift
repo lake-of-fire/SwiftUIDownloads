@@ -3484,16 +3484,16 @@ extension DownloadController {
                         }
                     }
                 }
-                try await withTaskCancellationHandler {
+                try await withTaskCancellationHandler(operation: {
                     try await importable.importHandler(
                         processingFileURL,
                         progressHandler
                     )
-                } onCancel: {
+                }, onCancel: {
                     importable.endImportObservation(
                         importObservationGeneration
                     )
-                }
+                })
                 try Task.checkCancellation()
             }
 
