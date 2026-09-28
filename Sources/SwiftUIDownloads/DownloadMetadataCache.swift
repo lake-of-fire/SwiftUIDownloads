@@ -64,10 +64,8 @@ final class DownloadMetadataCache: @unchecked Sendable {
     private var dirtyFields: DownloadMetadataFields = []
     private var hasCompletedInitialLoad = false
     private var knownStoredFields: DownloadMetadataFields = []
-    private var hasStartedInitialLoad = false
     private var initialLoadTask: Task<Void, Never>?
     private var observationRelays: [DownloadMetadataObservationRelay] = []
-    private var isSaveScheduled = false
     private var saveTask: Task<Void, Error>?
     private var latestSaveError: DownloadMetadataPersistenceError?
     private var mutationRevision: UInt64 = 0
@@ -82,25 +80,24 @@ final class DownloadMetadataCache: @unchecked Sendable {
     }
 
     func startLoading(observationRelay: DownloadMetadataObservationRelay) {
-        let loadState = withLock {
+        let shouldNotify = withLock {
             observationRelays.removeAll { $0.owner == nil }
             observationRelays.append(observationRelay)
-            if hasCompletedInitialLoad {
-                return (shouldStart: false, shouldNotify: true)
-            }
-            guard !hasStartedInitialLoad else {
-                return (shouldStart: false, shouldNotify: false)
-            }
-            hasStartedInitialLoad = true
-            return (shouldStart: true, shouldNotify: false)
+            if hasCompletedInitialLoad { return true }
+            _ = initialLoadTaskIfNeededLocked()
+            return false
         }
-        if loadState.shouldNotify {
+        if shouldNotify {
             notifyObservers([observationRelay])
         }
-        guard loadState.shouldStart else { return }
+    }
 
-        let task = Task { @DownloadActor [weak self] in
-            guard let self else { return }
+    /// Called only while holding lock. The task cannot merge/retire its state
+    /// before the same critical section has registered its handle.
+    private func initialLoadTaskIfNeededLocked() -> Task<Void, Never>? {
+        guard !hasCompletedInitialLoad else { return nil }
+        if let initialLoadTask { return initialLoadTask }
+        let task = Task { @DownloadActor [self] in
             do {
                 mergeInitialMetadata(try store.loadMetadata(for: url))
             } catch {
@@ -108,23 +105,15 @@ final class DownloadMetadataCache: @unchecked Sendable {
             }
             notifyObservers()
         }
-        withLock {
-            initialLoadTask = task
-        }
+        initialLoadTask = task
+        return task
     }
 
     func waitForInitialLoad() async {
-        while true {
-            let state = withLock {
-                (hasCompletedInitialLoad, initialLoadTask)
-            }
-            if state.0 { return }
-            if let task = state.1 {
-                await task.value
-                return
-            }
-            await Task.yield()
-        }
+        // Loading is independent of UI observation. A write made before a
+        // relay is attached must still be able to load and persist its fields.
+        let task = withLock { initialLoadTaskIfNeededLocked() }
+        await task?.value
     }
 
     func currentMetadata() -> DownloadMetadata {
@@ -135,18 +124,16 @@ final class DownloadMetadataCache: @unchecked Sendable {
         await waitForInitialLoad()
         while true {
             let state = withLock {
-                (task: saveTask, isScheduled: isSaveScheduled, error: latestSaveError)
+                (task: saveTask, error: latestSaveError)
             }
             if let task = state.task {
-                try await task.value
+                // Re-read the current owner/error after this owner retires.
+                // A newer retry may already have superseded its failure.
+                _ = await task.result
                 continue
             }
             if let error = state.error {
                 throw error
-            }
-            if state.isScheduled {
-                await Task.yield()
-                continue
             }
             return
         }
@@ -188,31 +175,26 @@ final class DownloadMetadataCache: @unchecked Sendable {
         _ field: DownloadMetadataFields,
         mutation: (inout DownloadMetadata, _ isStoredFieldKnown: Bool) -> Bool
     ) {
-        let shouldStartSaveTask: Bool? = withLock {
+        let didMutate = withLock {
             let changed = mutation(&metadata, knownStoredFields.contains(field))
-            guard changed || (latestSaveError != nil && !dirtyFields.isEmpty) else { return nil }
+            guard changed || (latestSaveError != nil && !dirtyFields.isEmpty) else { return false }
             mutationRevision &+= 1
             dirtyFields.insert(field)
             latestSaveError = nil
             if !hasCompletedInitialLoad {
                 fieldsChangedBeforeInitialLoad.insert(field)
             }
-            guard !isSaveScheduled else { return false }
-            isSaveScheduled = true
+            if saveTask == nil {
+                // Register before releasing the lock. A fast older save can
+                // otherwise finish, let a successor start, then overwrite that
+                // successor's handle when the original setter finally resumes.
+                saveTask = Task { @DownloadActor [self] in
+                    try await savePendingChanges()
+                }
+            }
             return true
         }
-        guard let shouldStartSaveTask else { return }
-        notifyObservers()
-        guard shouldStartSaveTask else { return }
-
-        let task = Task { @DownloadActor [self] in
-            try await savePendingChanges()
-        }
-        withLock {
-            if isSaveScheduled {
-                saveTask = task
-            }
-        }
+        if didMutate { notifyObservers() }
     }
 
     private func mergeInitialMetadata(_ storedMetadata: DownloadMetadata) {
@@ -233,6 +215,7 @@ final class DownloadMetadataCache: @unchecked Sendable {
             fieldsChangedBeforeInitialLoad = []
             knownStoredFields = .all
             hasCompletedInitialLoad = true
+            initialLoadTask = nil
         }
     }
 
@@ -240,6 +223,7 @@ final class DownloadMetadataCache: @unchecked Sendable {
         withLock {
             fieldsChangedBeforeInitialLoad = []
             hasCompletedInitialLoad = true
+            initialLoadTask = nil
         }
     }
 
@@ -263,7 +247,6 @@ final class DownloadMetadataCache: @unchecked Sendable {
                     dirtyFields.formUnion(pending.1)
                     guard mutationRevision != pending.2 else {
                         latestSaveError = persistenceError
-                        isSaveScheduled = false
                         saveTask = nil
                         return false
                     }
@@ -284,7 +267,6 @@ final class DownloadMetadataCache: @unchecked Sendable {
 
             let isCurrent = withLock {
                 guard mutationRevision == pending.2 else { return false }
-                isSaveScheduled = false
                 saveTask = nil
                 return true
             }
