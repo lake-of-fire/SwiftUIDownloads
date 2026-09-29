@@ -363,6 +363,37 @@ final class DownloadFileDeliveryTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "complete-book")
     }
 
+    func testUnknownTransferProgressDoesNotBecomeFinishedAtFirstBytes() {
+        let progress = downloadTransferProgress(
+            expectedByteCount: -1,
+            receivedByteCount: 1024
+        )
+        XCTAssertEqual(progress.totalUnitCount, -1)
+        XCTAssertEqual(progress.completedUnitCount, 1024)
+        XCTAssertFalse(progress.isFinished)
+        XCTAssertEqual(progress.fractionCompleted, 0)
+    }
+
+    func testKnownTransferProgressKeepsExpectedFraction() {
+        let progress = downloadTransferProgress(
+            expectedByteCount: 4096,
+            receivedByteCount: 1024
+        )
+        XCTAssertEqual(progress.totalUnitCount, 4096)
+        XCTAssertEqual(progress.completedUnitCount, 1024)
+        XCTAssertFalse(progress.isFinished)
+        XCTAssertEqual(progress.fractionCompleted, 0.25, accuracy: 0.0001)
+    }
+
+    func testEmptyKnownTransferCanStillBeFinished() {
+        let progress = downloadTransferProgress(
+            expectedByteCount: 0,
+            receivedByteCount: 0
+        )
+        XCTAssertEqual(progress.totalUnitCount, 0)
+        XCTAssertTrue(progress.isFinished)
+    }
+
     func testRetryHeadersAndDatesKeepTheirExistingInterpretation() throws {
         let now = Date(timeIntervalSince1970: 784111777)
         XCTAssertEqual(parseRetryAfterSeconds(" 12.5 ", now: now), 12.5)
