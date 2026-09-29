@@ -65,4 +65,26 @@ final class DownloadProgressMetricsTests: XCTestCase {
             UInt64(Int64.max)
         )
     }
+
+    func testIndeterminateStatusTextOmitsUnknownTotal() {
+        let progress = Progress(totalUnitCount: -1)
+        progress.completedUnitCount = 1_500_000
+
+        let text = DownloadProgressMetrics.statusText(for: progress)
+
+        XCTAssertTrue(text.contains("1.5MB downloaded"))
+        XCTAssertFalse(text.contains(" of "))
+        XCTAssertFalse(text.contains("-"))
+    }
+
+    func testKnownStatusTextIncludesTotal() {
+        let progress = Progress(totalUnitCount: 4_000_000)
+        progress.completedUnitCount = 1_500_000
+
+        XCTAssertTrue(
+            DownloadProgressMetrics.statusText(for: progress)
+                .contains("1.5MB of 4.0MB")
+        )
+    }
+
 }
