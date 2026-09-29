@@ -13,7 +13,10 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
     private let failsBulkLoad: Bool
     private let bulkLoadStarted = DispatchSemaphore(value: 0)
     private let bulkLoadMayFinish = DispatchSemaphore(value: 0)
+    private let firstSaveStarted = DispatchSemaphore(value: 0)
+    private let firstSaveMayFinish = DispatchSemaphore(value: 0)
     private let pausesBulkLoad: Bool
+    private let pausesFirstSave: Bool
     private var remainingSaveFailures: Int
     private var remainingReceiptSaveFailures: Int
     private var installedArtifactReceipts: [String: InstalledArtifactReceipt] = [:]
@@ -26,12 +29,14 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
         metadata: DownloadMetadata,
         failsBulkLoad: Bool = false,
         pausesBulkLoad: Bool = false,
+        pausesFirstSave: Bool = false,
         saveFailureCount: Int = 0,
         receiptSaveFailureCount: Int = 0
     ) {
         self.metadata = metadata
         self.failsBulkLoad = failsBulkLoad
         self.pausesBulkLoad = pausesBulkLoad
+        self.pausesFirstSave = pausesFirstSave
         self.remainingSaveFailures = saveFailureCount
         self.remainingReceiptSaveFailures = receiptSaveFailureCount
     }
@@ -55,8 +60,15 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
         fields: DownloadMetadataFields,
         for _: URL
     ) throws {
-        try withLock {
+        let shouldPause = withLock {
             saveCount += 1
+            return pausesFirstSave && saveCount == 1
+        }
+        if shouldPause {
+            firstSaveStarted.signal()
+            firstSaveMayFinish.wait()
+        }
+        try withLock {
             if remainingSaveFailures > 0 {
                 remainingSaveFailures -= 1
                 throw StoreError.requested
@@ -131,12 +143,24 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
         withLock { metadata }
     }
 
+    func allowFutureSaves() {
+        withLock { remainingSaveFailures = 0 }
+    }
+
     func waitUntilBulkLoadStarts() {
         bulkLoadStarted.wait()
     }
 
     func resumeBulkLoad() {
         bulkLoadMayFinish.signal()
+    }
+
+    func waitUntilFirstSaveStarts() {
+        firstSaveStarted.wait()
+    }
+
+    func resumeFirstSave() {
+        firstSaveMayFinish.signal()
     }
 
     private func scalarRead<Value>(_ value: () -> Value) -> Value {
@@ -222,19 +246,20 @@ final class DownloadMetadataCacheTests: XCTestCase {
     }
 
     @MainActor
-    func testSeparateDownloadablesDoNotOverwriteEachOthersMetadataFields() async throws {
+    func testDownloadablesForSameDestinationDoNotOverwriteEachOthersMetadataFields() async throws {
         let store = RecordingDownloadMetadataStore(metadata: DownloadMetadata())
         let url = URL(string: "https://example.com/dictionary.zip")!
+        let destination = URL(fileURLWithPath: "/tmp/shared.zip")
         let first = Downloadable(
             url: url,
             name: "First",
-            localDestination: URL(fileURLWithPath: "/tmp/first.zip"),
+            localDestination: destination,
             metadataStore: store
         )
         let second = Downloadable(
             url: url,
             name: "Second",
-            localDestination: URL(fileURLWithPath: "/tmp/second.zip"),
+            localDestination: destination,
             metadataStore: store
         )
         await first.waitForDownloadMetadata()
@@ -283,6 +308,37 @@ final class DownloadMetadataCacheTests: XCTestCase {
     }
 
     @MainActor
+    func testMutationArrivingDuringFailedSaveIsRetriedByOwningTask() async throws {
+        let store = RecordingDownloadMetadataStore(
+            metadata: DownloadMetadata(),
+            pausesFirstSave: true,
+            saveFailureCount: 1
+        )
+        let download = Downloadable(
+            url: URL(string: "https://example.com/concurrent-save-retry.zip")!,
+            name: "Concurrent save retry",
+            localDestination: URL(fileURLWithPath: "/tmp/concurrent-save-retry.zip"),
+            metadataStore: store
+        )
+        await download.waitForDownloadMetadata()
+
+        download.lastDownloadedETag = "etag"
+        await Task.detached {
+            store.waitUntilFirstSaveStarts()
+        }.value
+
+        let modifiedAt = Date(timeIntervalSince1970: 450)
+        download.lastModifiedAt = modifiedAt
+        store.resumeFirstSave()
+
+        try await download.waitForDownloadMetadataPersistence()
+
+        XCTAssertEqual(store.saveCount, 2)
+        XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "etag")
+        XCTAssertEqual(store.storedMetadata.lastModifiedAt, modifiedAt)
+    }
+
+    @MainActor
     func testIdenticalAssignmentRetriesFailedSave() async throws {
         let store = RecordingDownloadMetadataStore(metadata: DownloadMetadata(), saveFailureCount: 1)
         let download = Downloadable(
@@ -318,7 +374,7 @@ final class DownloadMetadataCacheTests: XCTestCase {
         try payload.write(to: destination)
         let store = RecordingDownloadMetadataStore(
             metadata: DownloadMetadata(),
-            saveFailureCount: 1
+            saveFailureCount: 4
         )
         let importInvocations = ImportInvocationRecorder()
         let download = ImportableDownloadable(
@@ -351,12 +407,14 @@ final class DownloadMetadataCacheTests: XCTestCase {
         XCTAssertFalse(controller.finishedDownloads.contains(download))
         XCTAssertTrue(controller.failedDownloads.contains(download))
         XCTAssertNotNil(download.failureMessage)
-        XCTAssertEqual(store.saveCount, 1)
+        let failedSaveCount = store.saveCount
+        XCTAssertGreaterThanOrEqual(failedSaveCount, 1)
         XCTAssertNil(store.storedMetadata.lastDownloadedETag)
         XCTAssertNil(store.storedMetadata.lastModifiedAt)
         let initialImportCount = await importInvocations.count
         XCTAssertEqual(initialImportCount, 1)
 
+        store.allowFutureSaves()
         await controller.ensureDownloaded(download: download)
 
         XCTAssertEqual(try Data(contentsOf: destination), payload)
@@ -366,7 +424,7 @@ final class DownloadMetadataCacheTests: XCTestCase {
         XCTAssertTrue(controller.finishedDownloads.contains(download))
         XCTAssertFalse(controller.failedDownloads.contains(download))
         XCTAssertNil(download.failureMessage)
-        XCTAssertEqual(store.saveCount, 2)
+        XCTAssertEqual(store.saveCount, failedSaveCount + 1)
         XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "new-etag")
         XCTAssertEqual(store.storedMetadata.lastModifiedAt, remoteModifiedAt)
         XCTAssertNotNil(store.storedMetadata.lastDownloadedAt)
@@ -427,7 +485,8 @@ final class DownloadMetadataCacheTests: XCTestCase {
         XCTAssertFalse(download.isFailed)
         XCTAssertTrue(download.isFinishedProcessing)
         XCTAssertEqual(store.receiptSaveCount, 2)
-        XCTAssertEqual(store.saveCount, 1)
+        XCTAssertGreaterThanOrEqual(store.saveCount, 1)
+        XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "new-etag")
         XCTAssertNotNil(
             try store.installedArtifactReceipt(
                 sourceURL: download.url,
@@ -574,4 +633,135 @@ final class DownloadMetadataCacheTests: XCTestCase {
         XCTAssertNil(store.storedMetadata.lastDownloadedETag)
         XCTAssertEqual(store.saveCount, 1)
     }
+
+    @MainActor
+    func testSameSourceDifferentDestinationsKeepValidatorMetadataIndependent() async throws {
+        let suiteName = "download-metadata-destination-scope-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let source = try XCTUnwrap(
+            URL(string: "https://metadata-scope.test/shared/book.epub")
+        )
+        let destinationA = URL(fileURLWithPath: "/tmp/metadata-a/book.epub")
+        let destinationB = URL(fileURLWithPath: "/tmp/metadata-b/book.epub")
+        let namespace = "destination-scope-" + UUID().uuidString
+        let store = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults,
+            metadataCacheNamespace: namespace
+        )
+        let first = Downloadable(
+            url: source,
+            name: "First destination",
+            localDestination: destinationA,
+            metadataStore: store
+        )
+        let second = Downloadable(
+            url: source,
+            name: "Second destination",
+            localDestination: destinationB,
+            metadataStore: store
+        )
+        await first.waitForDownloadMetadata()
+        await second.waitForDownloadMetadata()
+
+        first.lastDownloadedETag = "etag-a"
+        first.lastModifiedAt = Date(timeIntervalSince1970: 100)
+        second.lastDownloadedETag = "etag-b"
+        second.lastModifiedAt = Date(timeIntervalSince1970: 200)
+        try await first.waitForDownloadMetadataPersistence()
+        try await second.waitForDownloadMetadataPersistence()
+
+        XCTAssertEqual(first.lastDownloadedETag, "etag-a")
+        XCTAssertEqual(second.lastDownloadedETag, "etag-b")
+        XCTAssertEqual(first.lastModifiedAt, Date(timeIntervalSince1970: 100))
+        XCTAssertEqual(second.lastModifiedAt, Date(timeIntervalSince1970: 200))
+    }
+
+    @MainActor
+    func testDestinationScopedValidatorMetadataSurvivesFreshCacheReload() async throws {
+        let suiteName = "download-metadata-destination-reload-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let source = try XCTUnwrap(
+            URL(string: "https://metadata-scope.test/shared/dictionary.zip")
+        )
+        let destinationA = URL(fileURLWithPath: "/tmp/reload-a/dictionary.zip")
+        let destinationB = URL(fileURLWithPath: "/tmp/reload-b/dictionary.zip")
+        let firstStore = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults,
+            metadataCacheNamespace: "writer-" + UUID().uuidString
+        )
+        let first = Downloadable(
+            url: source,
+            name: "A",
+            localDestination: destinationA,
+            metadataStore: firstStore
+        )
+        let second = Downloadable(
+            url: source,
+            name: "B",
+            localDestination: destinationB,
+            metadataStore: firstStore
+        )
+        await first.waitForDownloadMetadata()
+        await second.waitForDownloadMetadata()
+        first.lastDownloadedETag = "etag-a"
+        second.lastDownloadedETag = "etag-b"
+        try await first.waitForDownloadMetadataPersistence()
+        try await second.waitForDownloadMetadataPersistence()
+
+        let freshStore = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults,
+            metadataCacheNamespace: "reader-" + UUID().uuidString
+        )
+        let reloadedA = Downloadable(
+            url: source,
+            name: "A reload",
+            localDestination: destinationA,
+            metadataStore: freshStore
+        )
+        let reloadedB = Downloadable(
+            url: source,
+            name: "B reload",
+            localDestination: destinationB,
+            metadataStore: freshStore
+        )
+        await reloadedA.waitForDownloadMetadata()
+        await reloadedB.waitForDownloadMetadata()
+
+        XCTAssertEqual(reloadedA.lastDownloadedETag, "etag-a")
+        XCTAssertEqual(reloadedB.lastDownloadedETag, "etag-b")
+    }
+
+    @MainActor
+    func testLegacySourceOnlyValidatorIsNotGuessedOntoNewDestination() async throws {
+        let suiteName = "download-metadata-legacy-scope-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let source = try XCTUnwrap(
+            URL(string: "https://metadata-scope.test/legacy/book.epub")
+        )
+        let store = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults,
+            metadataCacheNamespace: "legacy-" + UUID().uuidString
+        )
+        // Simulate metadata written by the source-only v1 storage contract.
+        store.setLastDownloadedETag("legacy-etag", for: source)
+        store.setLastModifiedAt(Date(timeIntervalSince1970: 50), for: source)
+
+        let download = Downloadable(
+            url: source,
+            name: "Destination with unknown legacy provenance",
+            localDestination: URL(fileURLWithPath: "/tmp/legacy-scope/book.epub"),
+            metadataStore: store
+        )
+        await download.waitForDownloadMetadata()
+
+        XCTAssertNil(download.lastDownloadedETag)
+        XCTAssertNil(download.lastModifiedAt)
+    }
+
 }

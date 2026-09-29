@@ -10,6 +10,7 @@ root = pathlib.Path(__file__).resolve().parents[2]
 inputs = {
     "Sources/SwiftUIDownloads/DownloadStagingPaths.swift": "Sources/SwiftUIDownloads/DownloadStagingPaths.swift",
     "Tests/SwiftUIDownloadsTests/DownloadStagingPathsTests.swift": "Tests/SwiftUIDownloadsTests/DownloadStagingPathsTests.swift",
+    "Tests/SwiftUIDownloadsTests/DownloadStagingAliasTests.swift": "Tests/SwiftUIDownloadsTests/DownloadStagingAliasTests.swift",
 }
 subprocess.run(["swift", "--version"], check=True)
 with tempfile.TemporaryDirectory(prefix="download-staging-") as scratch:

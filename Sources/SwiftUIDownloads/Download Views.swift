@@ -22,12 +22,7 @@ public struct DownloadProgress: View {
         }
         switch download.downloadProgress {
         case .downloading(let progress):
-            var str = "\(round((Double(progress.completedUnitCount) / 1_000_000) * 10) / 10)MB of \(round((Double(progress.totalUnitCount) / 1_000_000) * 10) / 10)MB"
-//              TODO: print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
-            if let throughput = progress.throughput {
-                str += " at \(round((Double(throughput) / 1_000_000) * 10) / 10)MB/s"
-            }
-            return str
+            return DownloadProgressMetrics.statusText(for: progress)
         case .waitingForResponse:
             return "Waiting for response from server…"
         case .completed(let destinationLocation, _, let error):

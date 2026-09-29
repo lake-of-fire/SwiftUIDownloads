@@ -14,6 +14,9 @@ public final class ImportableDownloadable: Downloadable, @unchecked Sendable {
     @MainActor @Published public var lastImportError: Error?
     @MainActor @Published public var importProgress: Double?
     @MainActor @Published public var importStatusText: String?
+
+    private let importObservationLock = NSLock()
+    private var importObservationGeneration = UUID()
     
     public init(
         url: URL,
@@ -44,6 +47,26 @@ public final class ImportableDownloadable: Downloadable, @unchecked Sendable {
             preservedLocalArtifactDirectories: preservedLocalArtifactDirectories,
             metadataStore: metadataStore
         )
+    }
+
+    func beginImportObservation() -> UUID {
+        importObservationLock.lock()
+        defer { importObservationLock.unlock() }
+        importObservationGeneration = UUID()
+        return importObservationGeneration
+    }
+
+    func importObservationIsCurrent(_ generation: UUID) -> Bool {
+        importObservationLock.lock()
+        defer { importObservationLock.unlock() }
+        return importObservationGeneration == generation
+    }
+
+    func endImportObservation(_ generation: UUID) {
+        importObservationLock.lock()
+        defer { importObservationLock.unlock() }
+        guard importObservationGeneration == generation else { return }
+        importObservationGeneration = UUID()
     }
 
     public override var executionConfigurationSignature: DownloadExecutionConfigurationSignature {

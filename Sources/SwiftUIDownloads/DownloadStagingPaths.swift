@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// One contract for temporary payload names, library filtering, and cleanup.
 /// A `.part` suffix is not proof of ownership; cleanup also requires the exact
@@ -39,7 +44,9 @@ public struct DownloadStagingPaths: Sendable {
     }
 
     func ownsTemporaryArtifact(_ url: URL) -> Bool {
-        let url = url.absoluteURL.standardizedFileURL
+        guard url.isFileURL else { return false }
+        let url = Self.directoryEntryURL(url)
+        let destination = Self.directoryEntryURL(destination)
         guard url.deletingLastPathComponent() == destination.deletingLastPathComponent(),
               url != destination else { return false }
         if let owner = Self.modernOwnerID(url.lastPathComponent) {
@@ -64,12 +71,12 @@ public struct DownloadStagingPaths: Sendable {
     /// Cancellation cleanup intentionally still works in a cancelled task.
     @discardableResult
     func removeTemporaryArtifacts(preserving protectedURLs: Set<URL>) throws -> [URL] {
-        let protectedURLs = Set(protectedURLs.map { $0.absoluteURL.standardizedFileURL })
+        let protectedURLs = Set(protectedURLs.filter(\.isFileURL).map(Self.directoryEntryURL))
         let directory = destination.deletingLastPathComponent()
         let children: [URL]
         do {
             children = try FileManager.default.contentsOfDirectory(
-                at: directory, includingPropertiesForKeys: nil
+                at: directory.resolvingSymlinksInPath(), includingPropertiesForKeys: nil
             )
         } catch {
             if Self.isMissingFile(error) { return [] }
@@ -77,9 +84,19 @@ public struct DownloadStagingPaths: Sendable {
         }
         var removed: [URL] = []
         for child in children where ownsTemporaryArtifact(child)
-            && !protectedURLs.contains(child.absoluteURL.standardizedFileURL) {
+            && !protectedURLs.contains(Self.directoryEntryURL(child)) {
+            // Resolve only the parent. Resolving the leaf would turn unlinking
+            // an owned symlink into deletion of its unrelated target.
+            let entry = Self.directoryEntryURL(child)
             do {
-                try FileManager.default.removeItem(at: child)
+                let attributes = try FileManager.default.attributesOfItem(atPath: entry.path)
+                let kind = attributes[.type] as? FileAttributeType
+                guard kind == .typeRegular || kind == .typeSymbolicLink else { continue }
+                // Candidates are files, never directory trees. Even if a leaf
+                // is replaced after inspection, unlink cannot recursively walk it.
+                guard unlink(entry.path) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
                 removed.append(directory.appendingPathComponent(child.lastPathComponent))
             } catch {
                 if Self.isMissingFile(error) { continue }
@@ -87,6 +104,17 @@ public struct DownloadStagingPaths: Sendable {
             }
         }
         return removed
+    }
+
+    /// Identity of a directory entry, not the inode to which its leaf may point.
+    /// Parent aliases (including macOS /var) must use the same rule for both
+    /// ownership and active-file protection. Preserve the caller's spelling
+    /// separately when returning removed URLs.
+    static func directoryEntryURL(_ url: URL) -> URL {
+        let url = url.absoluteURL.standardizedFileURL
+        return url.deletingLastPathComponent().resolvingSymlinksInPath()
+            .appendingPathComponent(url.lastPathComponent, isDirectory: false)
+            .standardizedFileURL
     }
 
     private static func modernOwnerID(_ name: String) -> String? {
@@ -134,7 +162,7 @@ public struct DownloadStagingPaths: Sendable {
         return uuid.uuidString.lowercased() == value.lowercased()
     }
 
-    private static func isMissingFile(_ error: Error) -> Bool {
+    static func isMissingFile(_ error: Error) -> Bool {
         let error = error as NSError
         return (error.domain == NSCocoaErrorDomain
             && (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError))

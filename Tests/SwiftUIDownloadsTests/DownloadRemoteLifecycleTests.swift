@@ -66,6 +66,30 @@ private final class ModifiedHEADURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+private final class UnknownLengthHEADURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Transfer-Encoding": "chunked"]
+        )!
+        client?.urlProtocol(
+            self,
+            didReceive: response,
+            cacheStoragePolicy: .notAllowed
+        )
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 private final class ETagOnlyHEADURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest {
@@ -323,6 +347,25 @@ private struct ValidatorMetadataStore: DownloadableMetadataStore {
 }
 
 final class DownloadRemoteLifecycleTests: XCTestCase {
+
+    func testRemoteFileSizeLeavesUnknownContentLengthUnset() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [UnknownLengthHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let download = Downloadable(
+            url: URL(string: "https://content-length.test/payload")!,
+            name: "Unknown length",
+            localDestination: FileManager.default.temporaryDirectory
+                .appendingPathComponent("missing-\(UUID().uuidString)")
+        )
+
+        try await download.fetchRemoteFileSize(session: session)
+
+        let fileSize = await MainActor.run { download.fileSize }
+        XCTAssertNil(fileSize)
+    }
 
     func testDownloadableIdentityUsesStandardizedSourceAndDestination() {
         let sourceURL = URL(string: "https://identity.test/catalog/../dictionary.zip")!
@@ -1234,4 +1277,99 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         let countAfterKnownEqualCheck = await attemptExecutor.count()
         XCTAssertEqual(countAfterKnownEqualCheck, 1)
     }
+
+    func testUpdatingOneDestinationDoesNotHideUpdateFromSameSourceOtherDestination()
+    async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-validator-destination-scope-" + UUID().uuidString,
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "validator-destination-scope-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let source = try XCTUnwrap(
+            URL(string: "https://swiftui-downloads-validator-scope.test/payload.bin")
+        )
+        let destinationA = root.appendingPathComponent("a.bin")
+        let destinationB = root.appendingPathComponent("b.bin")
+        try Data("installed-a".utf8).write(to: destinationA)
+        try Data("installed-b-old".utf8).write(to: destinationB)
+
+        let store = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults,
+            metadataCacheNamespace: "shared-operation-store"
+        )
+        let first = Downloadable(
+            url: source,
+            name: "First destination",
+            localDestination: destinationA,
+            metadataStore: store
+        )
+        let second = Downloadable(
+            url: source,
+            name: "Second destination",
+            localDestination: destinationB,
+            metadataStore: store
+        )
+        let setupSession = URLSession(configuration: .ephemeral)
+        let setupController = DownloadController(session: setupSession)
+        await setupController.finishDownload(first, etag: "remote-a")
+        await setupController.finishDownload(second, etag: "remote-old")
+        // Replace A through a real transfer; finishing an already completed
+        // installed artifact is deliberately a no-op.
+        let remoteB = Data("remote-b".utf8)
+        let firstUpdate = SuccessfulRemoteAttemptExecutor(
+            etag: "remote-b",
+            payload: remoteB
+        )
+        let updateController = DownloadController(
+            session: setupSession,
+            attemptExecutor: { download, session in
+                try await firstUpdate.execute(download: download, session: session)
+            }
+        )
+        await updateController.download(first)
+        try await first.waitForDownloadMetadataPersistence()
+        try await second.waitForDownloadMetadataPersistence()
+        setupSession.invalidateAndCancel()
+
+        let validators = await MainActor.run {
+            (first.lastDownloadedETag, second.lastDownloadedETag)
+        }
+        XCTAssertEqual(validators.0, "remote-b")
+        XCTAssertEqual(validators.1, "remote-old")
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let attemptExecutor = SuccessfulRemoteAttemptExecutor(
+            etag: "remote-b",
+            payload: remoteB
+        )
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(
+                    download: download,
+                    session: session
+                )
+            }
+        )
+
+        await controller.ensureDownloaded(download: second)
+
+        let attemptCount = await attemptExecutor.count()
+        XCTAssertEqual(attemptCount, 1)
+        XCTAssertEqual(try Data(contentsOf: destinationB), remoteB)
+        XCTAssertEqual(try Data(contentsOf: destinationA), remoteB)
+        let secondETag = await MainActor.run { second.lastDownloadedETag }
+        XCTAssertEqual(secondETag, "remote-b")
+    }
+
 }
