@@ -625,4 +625,135 @@ final class DownloadMetadataCacheTests: XCTestCase {
         XCTAssertNil(store.storedMetadata.lastDownloadedETag)
         XCTAssertEqual(store.saveCount, 1)
     }
+
+    @MainActor
+    func testSameSourceDifferentDestinationsKeepValidatorMetadataIndependent() async throws {
+        let suiteName = "download-metadata-destination-scope-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let source = try XCTUnwrap(
+            URL(string: "https://metadata-scope.test/shared/book.epub")
+        )
+        let destinationA = URL(fileURLWithPath: "/tmp/metadata-a/book.epub")
+        let destinationB = URL(fileURLWithPath: "/tmp/metadata-b/book.epub")
+        let namespace = "destination-scope-" + UUID().uuidString
+        let store = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults,
+            metadataCacheNamespace: namespace
+        )
+        let first = Downloadable(
+            url: source,
+            name: "First destination",
+            localDestination: destinationA,
+            metadataStore: store
+        )
+        let second = Downloadable(
+            url: source,
+            name: "Second destination",
+            localDestination: destinationB,
+            metadataStore: store
+        )
+        await first.waitForDownloadMetadata()
+        await second.waitForDownloadMetadata()
+
+        first.lastDownloadedETag = "etag-a"
+        first.lastModifiedAt = Date(timeIntervalSince1970: 100)
+        second.lastDownloadedETag = "etag-b"
+        second.lastModifiedAt = Date(timeIntervalSince1970: 200)
+        try await first.waitForDownloadMetadataPersistence()
+        try await second.waitForDownloadMetadataPersistence()
+
+        XCTAssertEqual(first.lastDownloadedETag, "etag-a")
+        XCTAssertEqual(second.lastDownloadedETag, "etag-b")
+        XCTAssertEqual(first.lastModifiedAt, Date(timeIntervalSince1970: 100))
+        XCTAssertEqual(second.lastModifiedAt, Date(timeIntervalSince1970: 200))
+    }
+
+    @MainActor
+    func testDestinationScopedValidatorMetadataSurvivesFreshCacheReload() async throws {
+        let suiteName = "download-metadata-destination-reload-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let source = try XCTUnwrap(
+            URL(string: "https://metadata-scope.test/shared/dictionary.zip")
+        )
+        let destinationA = URL(fileURLWithPath: "/tmp/reload-a/dictionary.zip")
+        let destinationB = URL(fileURLWithPath: "/tmp/reload-b/dictionary.zip")
+        let firstStore = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults,
+            metadataCacheNamespace: "writer-" + UUID().uuidString
+        )
+        let first = Downloadable(
+            url: source,
+            name: "A",
+            localDestination: destinationA,
+            metadataStore: firstStore
+        )
+        let second = Downloadable(
+            url: source,
+            name: "B",
+            localDestination: destinationB,
+            metadataStore: firstStore
+        )
+        await first.waitForDownloadMetadata()
+        await second.waitForDownloadMetadata()
+        first.lastDownloadedETag = "etag-a"
+        second.lastDownloadedETag = "etag-b"
+        try await first.waitForDownloadMetadataPersistence()
+        try await second.waitForDownloadMetadataPersistence()
+
+        let freshStore = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults,
+            metadataCacheNamespace: "reader-" + UUID().uuidString
+        )
+        let reloadedA = Downloadable(
+            url: source,
+            name: "A reload",
+            localDestination: destinationA,
+            metadataStore: freshStore
+        )
+        let reloadedB = Downloadable(
+            url: source,
+            name: "B reload",
+            localDestination: destinationB,
+            metadataStore: freshStore
+        )
+        await reloadedA.waitForDownloadMetadata()
+        await reloadedB.waitForDownloadMetadata()
+
+        XCTAssertEqual(reloadedA.lastDownloadedETag, "etag-a")
+        XCTAssertEqual(reloadedB.lastDownloadedETag, "etag-b")
+    }
+
+    @MainActor
+    func testLegacySourceOnlyValidatorIsNotGuessedOntoNewDestination() async throws {
+        let suiteName = "download-metadata-legacy-scope-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let source = try XCTUnwrap(
+            URL(string: "https://metadata-scope.test/legacy/book.epub")
+        )
+        let store = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults,
+            metadataCacheNamespace: "legacy-" + UUID().uuidString
+        )
+        // Simulate metadata written by the source-only v1 storage contract.
+        store.setLastDownloadedETag("legacy-etag", for: source)
+        store.setLastModifiedAt(Date(timeIntervalSince1970: 50), for: source)
+
+        let download = Downloadable(
+            url: source,
+            name: "Destination with unknown legacy provenance",
+            localDestination: URL(fileURLWithPath: "/tmp/legacy-scope/book.epub"),
+            metadataStore: store
+        )
+        await download.waitForDownloadMetadata()
+
+        XCTAssertNil(download.lastDownloadedETag)
+        XCTAssertNil(download.lastModifiedAt)
+    }
+
 }
