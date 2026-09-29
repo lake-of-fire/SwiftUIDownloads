@@ -42,6 +42,16 @@ func retryAfterSeconds(from response: HTTPURLResponse, now: Date = Date()) -> Do
     return nil
 }
 
+func downloadTransferProgress(
+    expectedByteCount: Int64,
+    receivedByteCount: Int64
+) -> Progress {
+    let normalizedExpected = expectedByteCount >= 0 ? expectedByteCount : -1
+    let progress = Progress(totalUnitCount: normalizedExpected)
+    progress.completedUnitCount = max(0, receivedByteCount)
+    return progress
+}
+
 public struct URLResourceDownloadHTTPError: LocalizedError, Sendable {
     public let statusCode: Int
     public let url: URL?
