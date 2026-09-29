@@ -1277,4 +1277,88 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         let countAfterKnownEqualCheck = await attemptExecutor.count()
         XCTAssertEqual(countAfterKnownEqualCheck, 1)
     }
+
+    func testUpdatingOneDestinationDoesNotHideUpdateFromSameSourceOtherDestination()
+    async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "swiftui-downloads-validator-destination-scope-" + UUID().uuidString,
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "validator-destination-scope-" + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let source = try XCTUnwrap(
+            URL(string: "https://swiftui-downloads-validator-scope.test/payload.bin")
+        )
+        let destinationA = root.appendingPathComponent("a.bin")
+        let destinationB = root.appendingPathComponent("b.bin")
+        try Data("installed-a".utf8).write(to: destinationA)
+        try Data("installed-b-old".utf8).write(to: destinationB)
+
+        let store = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults,
+            metadataCacheNamespace: "shared-operation-store"
+        )
+        let first = Downloadable(
+            url: source,
+            name: "First destination",
+            localDestination: destinationA,
+            metadataStore: store
+        )
+        let second = Downloadable(
+            url: source,
+            name: "Second destination",
+            localDestination: destinationB,
+            metadataStore: store
+        )
+        let setupSession = URLSession(configuration: .ephemeral)
+        let setupController = DownloadController(session: setupSession)
+        await setupController.finishDownload(first, etag: "remote-a")
+        await setupController.finishDownload(second, etag: "remote-old")
+        // A later successful refresh of A must not change B's installed
+        // validator merely because both operations share the same source URL.
+        await setupController.finishDownload(first, etag: "remote-b")
+        try await first.waitForDownloadMetadataPersistence()
+        try await second.waitForDownloadMetadataPersistence()
+        setupSession.invalidateAndCancel()
+
+        let validators = await MainActor.run {
+            (first.lastDownloadedETag, second.lastDownloadedETag)
+        }
+        XCTAssertEqual(validators.0, "remote-b")
+        XCTAssertEqual(validators.1, "remote-old")
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let remoteB = Data("remote-b".utf8)
+        let attemptExecutor = SuccessfulRemoteAttemptExecutor(
+            etag: "remote-b",
+            payload: remoteB
+        )
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in
+                try await attemptExecutor.execute(
+                    download: download,
+                    session: session
+                )
+            }
+        )
+
+        await controller.ensureDownloaded(download: second)
+
+        XCTAssertEqual(await attemptExecutor.count(), 1)
+        XCTAssertEqual(try Data(contentsOf: destinationB), remoteB)
+        XCTAssertEqual(try Data(contentsOf: destinationA), Data("installed-a".utf8))
+        let secondETag = await MainActor.run { second.lastDownloadedETag }
+        XCTAssertEqual(secondETag, "remote-b")
+    }
+
 }
