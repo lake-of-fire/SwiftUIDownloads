@@ -24,7 +24,7 @@ enum DownloadProgressMetrics {
             text = completed + "MB downloaded"
         }
         if let throughput = progress.throughput, throughput >= 0 {
-            text += " at " + megabytes(throughput) + "MB/s"
+            text += " at " + megabytes(Int64(throughput)) + "MB/s"
         }
         return text
     }
