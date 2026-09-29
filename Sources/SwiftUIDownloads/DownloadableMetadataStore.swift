@@ -41,15 +41,45 @@ private func standardizedReceiptSourceURL(_ url: URL) -> URL {
     url.isFileURL ? url.standardizedFileURL : url.standardized
 }
 
-private func installedArtifactReceiptKey(sourceURL: URL, destinationURL: URL) -> String {
+private func sourceDestinationStorageDigest(
+    sourceURL: URL,
+    destinationURL: URL
+) -> String {
     let identity = [
         standardizedReceiptSourceURL(sourceURL).absoluteString,
         destinationURL.standardizedFileURL.absoluteString
     ].joined(separator: "\u{0}")
-    let digest = SHA256.hash(data: Data(identity.utf8))
+    return SHA256.hash(data: Data(identity.utf8))
         .map { String(format: "%02x", $0) }
         .joined()
-    return "installedArtifactReceipt:v1:\(digest)"
+}
+
+private func installedArtifactReceiptKey(sourceURL: URL, destinationURL: URL) -> String {
+    "installedArtifactReceipt:v1:" + sourceDestinationStorageDigest(
+        sourceURL: sourceURL,
+        destinationURL: destinationURL
+    )
+}
+
+private enum DestinationScopedMetadataField: String {
+    case lastDownloadedETag
+    case lastCheckedETagAt
+    case lastDownloadedAt
+    case lastModifiedAt
+}
+
+private func destinationScopedMetadataKey(
+    sourceURL: URL,
+    destinationURL: URL,
+    field: DestinationScopedMetadataField
+) -> String {
+    "downloadMetadata:v2:"
+        + sourceDestinationStorageDigest(
+            sourceURL: sourceURL,
+            destinationURL: destinationURL
+        )
+        + ":"
+        + field.rawValue
 }
 
 public struct DownloadMetadata: Equatable, Sendable {
@@ -104,6 +134,21 @@ public protocol DownloadableMetadataStore: Sendable {
     func setLastModifiedAt(_ date: Date?, for url: URL)
     func loadMetadata(for url: URL) throws -> DownloadMetadata
     func saveMetadata(_ metadata: DownloadMetadata, fields: DownloadMetadataFields, for url: URL) throws
+
+    /// Metadata which describes the installed artifact must follow the same
+    /// source + destination identity as DownloadOperationKey. Existing custom
+    /// stores remain source-compatible through the default implementations.
+    func loadMetadata(
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws -> DownloadMetadata
+    func saveMetadata(
+        _ metadata: DownloadMetadata,
+        fields: DownloadMetadataFields,
+        sourceURL: URL,
+        destinationURL: URL
+    ) throws
+
     func installedArtifactReceipt(
         sourceURL: URL,
         destinationURL: URL
@@ -120,6 +165,22 @@ public protocol DownloadableMetadataStore: Sendable {
 }
 
 public extension DownloadableMetadataStore {
+    func loadMetadata(
+        sourceURL: URL,
+        destinationURL _: URL
+    ) throws -> DownloadMetadata {
+        try loadMetadata(for: sourceURL)
+    }
+
+    func saveMetadata(
+        _ metadata: DownloadMetadata,
+        fields: DownloadMetadataFields,
+        sourceURL: URL,
+        destinationURL _: URL
+    ) throws {
+        try saveMetadata(metadata, fields: fields, for: sourceURL)
+    }
+
     func loadMetadata(for url: URL) throws -> DownloadMetadata {
         DownloadMetadata(
             lastDownloadedETag: lastDownloadedETag(for: url),
@@ -263,6 +324,78 @@ public struct UserDefaultsDownloadableMetadataStore: DownloadableMetadataStore, 
             userDefaults.set(date, forKey: key)
         } else {
             userDefaults.removeObject(forKey: key)
+        }
+    }
+
+    public func loadMetadata(
+        sourceURL: URL,
+        destinationURL: URL
+    ) -> DownloadMetadata {
+        DownloadMetadata(
+            lastDownloadedETag: userDefaults.object(
+                forKey: destinationScopedMetadataKey(
+                    sourceURL: sourceURL,
+                    destinationURL: destinationURL,
+                    field: .lastDownloadedETag
+                )
+            ) as? String,
+            lastCheckedETagAt: userDefaults.object(
+                forKey: destinationScopedMetadataKey(
+                    sourceURL: sourceURL,
+                    destinationURL: destinationURL,
+                    field: .lastCheckedETagAt
+                )
+            ) as? Date,
+            lastDownloadedAt: userDefaults.object(
+                forKey: destinationScopedMetadataKey(
+                    sourceURL: sourceURL,
+                    destinationURL: destinationURL,
+                    field: .lastDownloadedAt
+                )
+            ) as? Date,
+            lastModifiedAt: userDefaults.object(
+                forKey: destinationScopedMetadataKey(
+                    sourceURL: sourceURL,
+                    destinationURL: destinationURL,
+                    field: .lastModifiedAt
+                )
+            ) as? Date
+        )
+    }
+
+    public func saveMetadata(
+        _ metadata: DownloadMetadata,
+        fields: DownloadMetadataFields,
+        sourceURL: URL,
+        destinationURL: URL
+    ) {
+        func write<Value>(
+            _ value: Value?,
+            field: DestinationScopedMetadataField
+        ) {
+            let key = destinationScopedMetadataKey(
+                sourceURL: sourceURL,
+                destinationURL: destinationURL,
+                field: field
+            )
+            if let value {
+                userDefaults.set(value, forKey: key)
+            } else {
+                userDefaults.removeObject(forKey: key)
+            }
+        }
+
+        if fields.contains(.lastDownloadedETag) {
+            write(metadata.lastDownloadedETag, field: .lastDownloadedETag)
+        }
+        if fields.contains(.lastCheckedETagAt) {
+            write(metadata.lastCheckedETagAt, field: .lastCheckedETagAt)
+        }
+        if fields.contains(.lastDownloadedAt) {
+            write(metadata.lastDownloadedAt, field: .lastDownloadedAt)
+        }
+        if fields.contains(.lastModifiedAt) {
+            write(metadata.lastModifiedAt, field: .lastModifiedAt)
         }
     }
 
