@@ -19,7 +19,8 @@ public struct DownloadMetadataPersistenceError: Error, Equatable, Sendable {
 
 private struct DownloadMetadataCacheIdentity: Hashable {
     let namespace: String
-    let url: URL
+    let sourceURL: URL
+    let destinationURL: URL
 }
 
 private final class WeakDownloadMetadataCache {
@@ -36,17 +37,26 @@ private final class DownloadMetadataCacheRegistry: @unchecked Sendable {
     private let lock = NSLock()
     private var caches: [DownloadMetadataCacheIdentity: WeakDownloadMetadataCache] = [:]
 
-    func cache(store: any DownloadableMetadataStore, url: URL) -> DownloadMetadataCache {
+    func cache(
+        store: any DownloadableMetadataStore,
+        sourceURL: URL,
+        destinationURL: URL
+    ) -> DownloadMetadataCache {
         let identity = DownloadMetadataCacheIdentity(
             namespace: store.metadataCacheNamespace,
-            url: url
+            sourceURL: DownloadOperationKey.standardizedSourceURL(sourceURL),
+            destinationURL: destinationURL.absoluteURL.standardizedFileURL
         )
         lock.lock()
         defer { lock.unlock() }
         if let cache = caches[identity]?.value {
             return cache
         }
-        let cache = DownloadMetadataCache(store: store, url: url)
+        let cache = DownloadMetadataCache(
+            store: store,
+            sourceURL: sourceURL,
+            destinationURL: destinationURL
+        )
         caches[identity] = WeakDownloadMetadataCache(cache)
         if caches.count > 64 {
             caches = caches.filter { $0.value.value != nil }
@@ -57,7 +67,8 @@ private final class DownloadMetadataCacheRegistry: @unchecked Sendable {
 
 final class DownloadMetadataCache: @unchecked Sendable {
     private let store: any DownloadableMetadataStore
-    private let url: URL
+    private let sourceURL: URL
+    private let destinationURL: URL
     private let lock = NSLock()
     private var metadata = DownloadMetadata()
     private var fieldsChangedBeforeInitialLoad: DownloadMetadataFields = []
@@ -70,13 +81,26 @@ final class DownloadMetadataCache: @unchecked Sendable {
     private var latestSaveError: DownloadMetadataPersistenceError?
     private var mutationRevision: UInt64 = 0
 
-    static func shared(store: any DownloadableMetadataStore, url: URL) -> DownloadMetadataCache {
-        DownloadMetadataCacheRegistry.shared.cache(store: store, url: url)
+    static func shared(
+        store: any DownloadableMetadataStore,
+        sourceURL: URL,
+        destinationURL: URL
+    ) -> DownloadMetadataCache {
+        DownloadMetadataCacheRegistry.shared.cache(
+            store: store,
+            sourceURL: sourceURL,
+            destinationURL: destinationURL
+        )
     }
 
-    init(store: any DownloadableMetadataStore, url: URL) {
+    init(
+        store: any DownloadableMetadataStore,
+        sourceURL: URL,
+        destinationURL: URL
+    ) {
         self.store = store
-        self.url = url
+        self.sourceURL = sourceURL
+        self.destinationURL = destinationURL
     }
 
     func startLoading(observationRelay: DownloadMetadataObservationRelay) {
@@ -99,7 +123,10 @@ final class DownloadMetadataCache: @unchecked Sendable {
         if let initialLoadTask { return initialLoadTask }
         let task = Task { @DownloadActor [self] in
             do {
-                mergeInitialMetadata(try store.loadMetadata(for: url))
+                mergeInitialMetadata(try store.loadMetadata(
+                    sourceURL: sourceURL,
+                    destinationURL: destinationURL
+                ))
             } catch {
                 finishInitialLoadWithoutStoredMetadata()
             }
@@ -237,7 +264,12 @@ final class DownloadMetadataCache: @unchecked Sendable {
                 return (metadata, fields, mutationRevision)
             }
             do {
-                try store.saveMetadata(pending.0, fields: pending.1, for: url)
+                try store.saveMetadata(
+                    pending.0,
+                    fields: pending.1,
+                    sourceURL: sourceURL,
+                    destinationURL: destinationURL
+                )
                 withLock {
                     knownStoredFields.formUnion(pending.1)
                 }
