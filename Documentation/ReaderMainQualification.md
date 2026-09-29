@@ -8,6 +8,6 @@ The hotfix selection is an ancestor of canonical main. Reader main has two diver
 - local-artifact invalidation and owned transfer cancellation/fencing;
 - checksum marker v2/file identity verification and staged-transfer ownership/retry behavior.
 
-This qualification PR adds no runtime source. It runs the package's complete tests in Debug and Release on macOS and Ubuntu. A separate Reader root PR should pin canonical main only after this passes and then perform consumer compilation.
+This qualification PR adds no runtime source. It runs the package's complete tests in Debug and Release on macOS, matching the package's declared Apple-only platform support. A Linux full-package run is not a valid gate because the Brotli Objective-C dependency requires Apple Foundation headers. A separate Reader root PR should pin canonical main only after this passes and then perform consumer compilation.
 
 No Reader pin, schema, signing, rollout or CloudKit state changes.
