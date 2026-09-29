@@ -572,7 +572,11 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         self.isFromBackgroundAssetsDownloader = isFromBackgroundAssetsDownloader
         let resolvedMetadataStore = metadataStore ?? UserDefaultsDownloadableMetadataStore()
         self.metadataStore = resolvedMetadataStore
-        self.downloadMetadataCache = DownloadMetadataCache.shared(store: resolvedMetadataStore, url: url)
+        self.downloadMetadataCache = DownloadMetadataCache.shared(
+            store: resolvedMetadataStore,
+            sourceURL: url,
+            destinationURL: localDestination
+        )
         let metadataObservationRelay = DownloadMetadataObservationRelay()
         metadataObservationRelay.owner = self
         self.downloadMetadataCache.startLoading(observationRelay: metadataObservationRelay)
