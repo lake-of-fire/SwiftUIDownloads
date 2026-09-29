@@ -111,9 +111,10 @@ extension URLResourceDownloadTask: URLSessionDownloadDelegate {
     ) {
         guard session == self.session, downloadTask == self.downloadTask else { return }
         guard delivery.terminalResult == nil else { return }
-        let progress = Progress(totalUnitCount: max(0, downloadTask.countOfBytesExpectedToReceive))
-        progress.completedUnitCount = downloadTask.countOfBytesReceived
-        subject.send(.downloading(progress: progress))
+        subject.send(.downloading(progress: downloadTransferProgress(
+            expectedByteCount: downloadTask.countOfBytesExpectedToReceive,
+            receivedByteCount: downloadTask.countOfBytesReceived
+        )))
     }
 }
 
