@@ -31,7 +31,7 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol,
     private let session: URLSession
     private let url: URL
     private let destination: URL
-    private let downloadTask: URLSessionDownloadTask
+    let downloadTask: URLSessionDownloadTask
     private let delivery = DownloadFileDelivery()
 
     public typealias PublisherType = AnyPublisher<URLResourceDownloadTaskProgress, Error>

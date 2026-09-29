@@ -173,12 +173,13 @@ final class DownloadObserverLifecycleTests: XCTestCase {
 
         let firstAttempt = Task { await controller.download(download) }
         await gate.waitUntilStarted()
-        await controller.download(download)
+        let overlappingAttempt = Task { await controller.download(download) }
         let invocationCountDuringProcessing = await attemptExecutor.count()
         XCTAssertEqual(invocationCountDuringProcessing, 1)
         XCTAssertEqual(try Data(contentsOf: destination), payload)
         await gate.release()
         await firstAttempt.value
+        await overlappingAttempt.value
 
         let state = await MainActor.run {
             (
@@ -340,7 +341,8 @@ final class DownloadObserverLifecycleTests: XCTestCase {
         )
 
         await controller.download(download)
-        XCTAssertTrue(try await download.awaitCompletionOrFailure())
+        let completed = try await download.awaitCompletionOrFailure()
+        XCTAssertTrue(completed)
         let terminalBeforeLateCallback = await MainActor.run {
             (
                 download.isFinishedProcessing,

@@ -23,7 +23,6 @@ enum DownloadOrphanCleanup {
         }
     ) throws {
         try Task.checkCancellation()
-        let protectedPaths = protectionPaths(preservingFiles.union(preservingDirectories))
         var visitedRoots = Set<URL>()
 
         for requestedRoot in roots {
@@ -32,6 +31,9 @@ enum DownloadOrphanCleanup {
             // A download cleanup location must never mean the entire filesystem.
             guard root.pathComponents.count > 1 else { throw CocoaError(.fileReadInvalidFileName) }
             guard visitedRoots.insert(root).inserted else { continue }
+            let protectedPaths = protectionPaths(
+                preservingFiles.union(preservingDirectories), in: root
+            )
             var pending: [Pending] = [.visit(root, isRoot: true)]
 
             while let action = pending.popLast() {
@@ -91,14 +93,21 @@ enum DownloadOrphanCleanup {
         }
     }
 
-    private static func protectionPaths(_ urls: Set<URL>) -> Set<URL> {
+    private static func protectionPaths(_ urls: Set<URL>, in root: URL) -> Set<URL> {
         var paths = Set<URL>()
         for url in urls where url.isFileURL {
+            let resolved = DownloadStagingPaths.directoryEntryURL(
+                url.resolvingSymlinksInPath()
+            )
+            // A declared retained path cannot shield an alias whose payload
+            // escapes the selected root from cleanup.
+            guard contains(resolved, in: root)
+                || contains(root, in: resolved) else { continue }
             // Entry identity protects a link itself. Target identity is used
             // only for retention: a kept link must not be left dangling when
             // its payload is also encountered through its physical path.
             paths.insert(DownloadStagingPaths.directoryEntryURL(url))
-            paths.insert(DownloadStagingPaths.directoryEntryURL(url.resolvingSymlinksInPath()))
+            paths.insert(resolved)
             // A selected path can contain an alias which is itself inside a
             // cleanup root. Keep that entry too, not just the physical payload.
             var parent = url.absoluteURL.standardizedFileURL.deletingLastPathComponent()
@@ -106,7 +115,12 @@ enum DownloadOrphanCleanup {
                 let entry = DownloadStagingPaths.directoryEntryURL(parent)
                 let kind = try? FileManager.default.attributesOfItem(atPath: entry.path)[.type]
                     as? FileAttributeType
-                if kind == .typeSymbolicLink { paths.insert(entry) }
+                if kind == .typeSymbolicLink,
+                   contains(DownloadStagingPaths.directoryEntryURL(
+                    parent.resolvingSymlinksInPath()
+                   ), in: root) {
+                    paths.insert(entry)
+                }
                 parent.deleteLastPathComponent()
             }
         }

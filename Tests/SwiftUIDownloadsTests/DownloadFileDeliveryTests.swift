@@ -385,13 +385,13 @@ final class DownloadFileDeliveryTests: XCTestCase {
         XCTAssertEqual(progress.fractionCompleted, 0.25, accuracy: 0.0001)
     }
 
-    func testEmptyKnownTransferCanStillBeFinished() {
+    func testEmptyKnownTransferWaitsForTerminalCallback() {
         let progress = downloadTransferProgress(
             expectedByteCount: 0,
             receivedByteCount: 0
         )
         XCTAssertEqual(progress.totalUnitCount, 0)
-        XCTAssertTrue(progress.isFinished)
+        XCTAssertFalse(progress.isFinished)
     }
 
     func testRetryHeadersAndDatesKeepTheirExistingInterpretation() throws {

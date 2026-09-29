@@ -69,7 +69,13 @@ final class DownloadMetadataTaskOwnershipTests: XCTestCase, @unchecked Sendable 
     private enum TestError: Error { case requested, timedOut }
 
     private func cache(_ store: MetadataTaskStore) -> DownloadMetadataCache {
-        DownloadMetadataCache(store: store, url: URL(string: "https://metadata.test/\(UUID().uuidString)")!)
+        let identity = UUID().uuidString
+        return DownloadMetadataCache(
+            store: store,
+            sourceURL: URL(string: "https://metadata.test/\(identity)")!,
+            destinationURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("metadata-\(identity)")
+        )
     }
 
     private func waitForSaves(_ cache: DownloadMetadataCache) async throws {

@@ -1320,9 +1320,20 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         let setupController = DownloadController(session: setupSession)
         await setupController.finishDownload(first, etag: "remote-a")
         await setupController.finishDownload(second, etag: "remote-old")
-        // A later successful refresh of A must not change B's installed
-        // validator merely because both operations share the same source URL.
-        await setupController.finishDownload(first, etag: "remote-b")
+        // Replace A through a real transfer; finishing an already completed
+        // installed artifact is deliberately a no-op.
+        let remoteB = Data("remote-b".utf8)
+        let firstUpdate = SuccessfulRemoteAttemptExecutor(
+            etag: "remote-b",
+            payload: remoteB
+        )
+        let updateController = DownloadController(
+            session: setupSession,
+            attemptExecutor: { download, session in
+                try await firstUpdate.execute(download: download, session: session)
+            }
+        )
+        await updateController.download(first)
         try await first.waitForDownloadMetadataPersistence()
         try await second.waitForDownloadMetadataPersistence()
         setupSession.invalidateAndCancel()
@@ -1337,7 +1348,6 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
-        let remoteB = Data("remote-b".utf8)
         let attemptExecutor = SuccessfulRemoteAttemptExecutor(
             etag: "remote-b",
             payload: remoteB
@@ -1354,9 +1364,10 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
 
         await controller.ensureDownloaded(download: second)
 
-        XCTAssertEqual(await attemptExecutor.count(), 1)
+        let attemptCount = await attemptExecutor.count()
+        XCTAssertEqual(attemptCount, 1)
         XCTAssertEqual(try Data(contentsOf: destinationB), remoteB)
-        XCTAssertEqual(try Data(contentsOf: destinationA), Data("installed-a".utf8))
+        XCTAssertEqual(try Data(contentsOf: destinationA), remoteB)
         let secondETag = await MainActor.run { second.lastDownloadedETag }
         XCTAssertEqual(secondETag, "remote-b")
     }

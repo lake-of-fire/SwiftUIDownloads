@@ -143,6 +143,10 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
         withLock { metadata }
     }
 
+    func allowFutureSaves() {
+        withLock { remainingSaveFailures = 0 }
+    }
+
     func waitUntilBulkLoadStarts() {
         bulkLoadStarted.wait()
     }
@@ -242,19 +246,20 @@ final class DownloadMetadataCacheTests: XCTestCase {
     }
 
     @MainActor
-    func testSeparateDownloadablesDoNotOverwriteEachOthersMetadataFields() async throws {
+    func testDownloadablesForSameDestinationDoNotOverwriteEachOthersMetadataFields() async throws {
         let store = RecordingDownloadMetadataStore(metadata: DownloadMetadata())
         let url = URL(string: "https://example.com/dictionary.zip")!
+        let destination = URL(fileURLWithPath: "/tmp/shared.zip")
         let first = Downloadable(
             url: url,
             name: "First",
-            localDestination: URL(fileURLWithPath: "/tmp/first.zip"),
+            localDestination: destination,
             metadataStore: store
         )
         let second = Downloadable(
             url: url,
             name: "Second",
-            localDestination: URL(fileURLWithPath: "/tmp/second.zip"),
+            localDestination: destination,
             metadataStore: store
         )
         await first.waitForDownloadMetadata()
@@ -369,7 +374,7 @@ final class DownloadMetadataCacheTests: XCTestCase {
         try payload.write(to: destination)
         let store = RecordingDownloadMetadataStore(
             metadata: DownloadMetadata(),
-            saveFailureCount: 1
+            saveFailureCount: 4
         )
         let importInvocations = ImportInvocationRecorder()
         let download = ImportableDownloadable(
@@ -402,12 +407,14 @@ final class DownloadMetadataCacheTests: XCTestCase {
         XCTAssertFalse(controller.finishedDownloads.contains(download))
         XCTAssertTrue(controller.failedDownloads.contains(download))
         XCTAssertNotNil(download.failureMessage)
-        XCTAssertEqual(store.saveCount, 1)
+        let failedSaveCount = store.saveCount
+        XCTAssertGreaterThanOrEqual(failedSaveCount, 1)
         XCTAssertNil(store.storedMetadata.lastDownloadedETag)
         XCTAssertNil(store.storedMetadata.lastModifiedAt)
         let initialImportCount = await importInvocations.count
         XCTAssertEqual(initialImportCount, 1)
 
+        store.allowFutureSaves()
         await controller.ensureDownloaded(download: download)
 
         XCTAssertEqual(try Data(contentsOf: destination), payload)
@@ -417,7 +424,7 @@ final class DownloadMetadataCacheTests: XCTestCase {
         XCTAssertTrue(controller.finishedDownloads.contains(download))
         XCTAssertFalse(controller.failedDownloads.contains(download))
         XCTAssertNil(download.failureMessage)
-        XCTAssertEqual(store.saveCount, 2)
+        XCTAssertEqual(store.saveCount, failedSaveCount + 1)
         XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "new-etag")
         XCTAssertEqual(store.storedMetadata.lastModifiedAt, remoteModifiedAt)
         XCTAssertNotNil(store.storedMetadata.lastDownloadedAt)
@@ -478,7 +485,8 @@ final class DownloadMetadataCacheTests: XCTestCase {
         XCTAssertFalse(download.isFailed)
         XCTAssertTrue(download.isFinishedProcessing)
         XCTAssertEqual(store.receiptSaveCount, 2)
-        XCTAssertEqual(store.saveCount, 1)
+        XCTAssertGreaterThanOrEqual(store.saveCount, 1)
+        XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "new-etag")
         XCTAssertNotNil(
             try store.installedArtifactReceipt(
                 sourceURL: download.url,

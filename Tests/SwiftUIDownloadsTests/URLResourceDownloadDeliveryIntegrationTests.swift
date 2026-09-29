@@ -100,8 +100,7 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
 
     func testSuccessfulFileCallbackCannotBeReplayedToOverwriteItsDestination() async throws {
         let fixture = try fixture("complete"), recorder = DeliveryTerminalRecorder()
-        let nativeTasks = await fixture.session.allTasks
-        let native = try XCTUnwrap(nativeTasks.first { $0.taskIdentifier == fixture.task.taskIdentifier } as? URLSessionDownloadTask)
+        let native = fixture.task.downloadTask
         let done = expectation(description: "Complete download")
         let subscription = subscribe(fixture.task, recorder: recorder, completion: done)
         fixture.task.resume()
@@ -121,8 +120,7 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
 
     func testLateFileAfterFailureCannotCreateAFileOrPublishAgain() async throws {
         let fixture = try fixture("complete"), recorder = DeliveryTerminalRecorder()
-        let nativeTasks = await fixture.session.allTasks
-        let native = try XCTUnwrap(nativeTasks.first { $0.taskIdentifier == fixture.task.taskIdentifier } as? URLSessionDownloadTask)
+        let native = fixture.task.downloadTask
         let done = expectation(description: "Failure terminal")
         let subscription = subscribe(fixture.task, recorder: recorder, completion: done)
         fixture.task.urlSession(fixture.session, task: native, didCompleteWithError: URLError(.timedOut))
