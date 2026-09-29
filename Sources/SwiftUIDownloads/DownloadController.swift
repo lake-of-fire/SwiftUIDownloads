@@ -1747,7 +1747,6 @@ struct DownloadRetryPolicy: Sendable {
             maxServerRetryAfterSeconds: maxRetryAfter
         )
     }
-
     func delayBeforeRetrySeconds(forAttempt attempt: Int) -> Double {
         guard attempt > 1 else { return 0 }
         let exponent = Double(max(0, attempt - 2))
@@ -1871,98 +1870,43 @@ public extension DownloadController {
     @DownloadActor
     func deleteOrphanFiles(in locations: [DownloadDirectory], excluding: Set<Downloadable> = Set()) async throws {
         guard !locations.isEmpty else { return }
-        
-        let retainedDownloads = await assuredDownloads.union(excluding)
+        try Task.checkCancellation()
+        var retainedDownloads = await assuredDownloads.union(excluding)
+        try Task.checkCancellation()
+
+        // Direct downloads and standalone processors need not be in the
+        // assurance list. Capture actual owners after the last actor hop and
+        // keep this snapshot through the synchronous sweep, including owners
+        // which have been cancelled but have not finished unwinding.
+        let liveKeys = Set(downloadTasks.keys)
+            .union(processingTasks.keys)
+            .union(checksumRecoveryTasks.keys)
+        let liveDownloads = liveKeys.compactMap { admittedDownloads[$0] }
+        retainedDownloads.formUnion(liveDownloads)
         var saveFiles = Set(retainedDownloads.map(\.localDestination))
-            .union(Set(retainedDownloads.map(\.compressedFileURL)))
-            .union(Set(retainedDownloads.map(\.checksumVerificationMarkerURL)))
+            .union(retainedDownloads.map(\.compressedFileURL))
+            .union(retainedDownloads.map(\.checksumVerificationMarkerURL))
             .union(activeTransferStagingURLs)
+            .union(liveDownloads.map(\.url).filter(\.isFileURL))
         for download in retainedDownloads {
             if let processingTaskID = processingTasks[download.id]?.id {
-                saveFiles.insert(
-                    download.decompressionStagingURL(operationID: processingTaskID)
-                )
+                saveFiles.insert(download.decompressionStagingURL(operationID: processingTaskID))
             }
         }
-        
-        var potentialOrphanDirs = Set<URL>()
-        var seenSavedFiles = Set<URL>()
-        
-        for location in locations {
-            let dir = location.directoryURL
-            let preservedDirectories = preservedArtifactDirectories(
-                from: retainedDownloads,
-                containedBy: dir
-            )
-            let path = dir.path
-            let enumerator = FileManager.default.enumerator(atPath: path)
-            
-            while let filename = enumerator?.nextObject() as? String {
-                let fileURL = URL(fileURLWithPath: filename, relativeTo: dir).absoluteURL
-
-                if preservedDirectories.contains(fileURL.standardizedFileURL) {
-                    seenSavedFiles.insert(fileURL)
-                    enumerator?.skipDescendants()
-                    continue
-                }
-                
-                var shouldSkip = false
-                var currentPath = fileURL
-                while currentPath.path != dir.path {
-                    if currentPath.lastPathComponent.hasSuffix(".realm.management") {
-                        shouldSkip = true
-                        break
-                    }
-                    currentPath.deleteLastPathComponent()
-                }
-                if shouldSkip { continue }
-                
-                if saveFiles.contains(fileURL) || fileURL.lastPathComponent.hasSuffix(".realm.lock") || fileURL.lastPathComponent.hasSuffix(".realm.management") || fileURL.lastPathComponent.hasSuffix(".realm.note") {
-                    seenSavedFiles.insert(fileURL)
-                    continue
-                }
-                
-                var isDirectory: ObjCBool = false
-                if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDirectory), isDirectory.boolValue {
-                    potentialOrphanDirs.insert(fileURL)
-                } else {
-                    try FileManager.default.removeItemIfPresent(at: fileURL)
-                }
-            }
-        }
-        
-        for orphanDir in potentialOrphanDirs {
-            if !seenSavedFiles.contains(where: { $0.path.hasPrefix(orphanDir.path) }) {
-                try FileManager.default.removeItemIfPresent(at: orphanDir)
-            }
-        }
+        try DownloadOrphanCleanup.removeOrphans(
+            in: locations.map(\.directoryURL),
+            preservingFiles: saveFiles,
+            preservingDirectories: Set(retainedDownloads.flatMap(\.preservedLocalArtifactDirectories))
+        )
 
         for download in retainedDownloads
             where download.localDestinationChecksum == nil
-                && !FileManager.default.fileExists(
-                    atPath: download.localDestination.path
-                ) {
+                && !FileManager.default.fileExists(atPath: download.localDestination.path) {
+            try Task.checkCancellation()
             try? download.removeInstalledArtifactReceipt()
         }
     }
 
-    private func preservedArtifactDirectories(
-        from downloads: Set<Downloadable>,
-        containedBy cleanupRoot: URL
-    ) -> Set<URL> {
-        let resolvedRoot = cleanupRoot.resolvingSymlinksInPath().standardizedFileURL
-        return Set(downloads.flatMap(\.preservedLocalArtifactDirectories).compactMap {
-            let declaredDirectory = $0.standardizedFileURL
-            let resolvedDirectory = declaredDirectory.resolvingSymlinksInPath().standardizedFileURL
-            guard resolvedDirectory != resolvedRoot,
-                  resolvedDirectory.path.hasPrefix(resolvedRoot.path + "/")
-            else {
-                return nil
-            }
-            return declaredDirectory
-        })
-    }
-    
     @DownloadActor
     func delete(download: Downloadable) async throws -> Downloadable {
         switch await admit(download) {

@@ -110,7 +110,7 @@ public struct DownloadStagingPaths: Sendable {
     /// Parent aliases (including macOS /var) must use the same rule for both
     /// ownership and active-file protection. Preserve the caller's spelling
     /// separately when returning removed URLs.
-    private static func directoryEntryURL(_ url: URL) -> URL {
+    static func directoryEntryURL(_ url: URL) -> URL {
         let url = url.absoluteURL.standardizedFileURL
         return url.deletingLastPathComponent().resolvingSymlinksInPath()
             .appendingPathComponent(url.lastPathComponent, isDirectory: false)
@@ -162,7 +162,7 @@ public struct DownloadStagingPaths: Sendable {
         return uuid.uuidString.lowercased() == value.lowercased()
     }
 
-    private static func isMissingFile(_ error: Error) -> Bool {
+    static func isMissingFile(_ error: Error) -> Bool {
         let error = error as NSError
         return (error.domain == NSCocoaErrorDomain
             && (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError))
