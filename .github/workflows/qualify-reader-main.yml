@@ -1,0 +1,33 @@
+name: Qualify canonical SwiftUIDownloads for Reader
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/qualify-reader-main.yml'
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Package.swift'
+      - 'Package.resolved'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record source
+        run: |
+          git rev-parse HEAD
+          swift --version
+      - name: Debug tests
+        run: swift test -c debug
+      - name: Release tests
+        run: swift test -c release
