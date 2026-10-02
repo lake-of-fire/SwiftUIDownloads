@@ -146,7 +146,6 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
         XCTAssertEqual(recorder.results.count, 1)
         XCTAssertEqual((recorder.results.first?.error as? URLError)?.code, .cancelled)
         XCTAssertTrue(recorder.failed)
-        XCTAssertNil(fixture.task.downloadTask.delegate)
         XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
     }
 
@@ -192,6 +191,40 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
         XCTAssertNil(fixture.task.downloadTask.delegate)
         XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
         XCTAssertEqual(try String(contentsOf: late, encoding: .utf8), "must-not-replace-the-winner")
+    }
+
+    func testCancelledActivatedNativeTaskDoesNotRetainTerminalWrapper() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DeliveryScenarioURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let url = URL(string: "https://delivery.test/cancelled-activation")!
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let done = expectation(description: "Cancelled activated task terminal")
+        weak var weakTask: URLResourceDownloadTask?
+        var retainedNativeTask: URLSessionDownloadTask?
+
+        autoreleasepool {
+            let task = URLResourceDownloadTask(session: session, url: url, destination: destination,
+                operationKey: DownloadOperationKey(sourceURL: url, destinationURL: destination))
+            weakTask = task
+            retainedNativeTask = task.downloadTask
+            task.didInstallDelegate = { [weak task] in task?.cancel() }
+            let subscription = task.publisher.sink(receiveCompletion: { _ in done.fulfill() },
+                                                   receiveValue: { _ in })
+            task.resume()
+            withExtendedLifetime(subscription) {}
+        }
+
+        await fulfillment(of: [done], timeout: 5)
+        // A native callback may still be leaving its stack after publication.
+        for _ in 0..<100 where weakTask != nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertNil(weakTask)
+        XCTAssertNotNil(retainedNativeTask)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        withExtendedLifetime(retainedNativeTask) {}
     }
 
     func testCancellationWithoutResumeDoesNotRetainWrapperThroughNativeTask() throws {
