@@ -146,7 +146,73 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
         XCTAssertEqual(recorder.results.count, 1)
         XCTAssertEqual((recorder.results.first?.error as? URLError)?.code, .cancelled)
         XCTAssertTrue(recorder.failed)
+        XCTAssertNil(fixture.task.downloadTask.delegate)
         XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
+    }
+
+    func testCancellationFromWaitingForResponseDeliversOneTerminal() async throws {
+        let fixture = try fixture("complete", existing: true), recorder = DeliveryTerminalRecorder()
+        let done = expectation(description: "Cancellation during activation")
+        let terminalSubscription = subscribe(fixture.task, recorder: recorder, completion: done)
+        let cancellingSubscription = fixture.task.publisher.sink(
+            receiveCompletion: { _ in },
+            receiveValue: { [weak task = fixture.task] progress in
+                if case .waitingForResponse = progress { task?.cancel() }
+            }
+        )
+
+        fixture.task.resume()
+        await fulfillment(of: [done], timeout: 5)
+        withExtendedLifetime((terminalSubscription, cancellingSubscription)) {}
+        XCTAssertEqual(recorder.results.count, 1)
+        XCTAssertEqual((recorder.results.first?.error as? URLError)?.code, .cancelled)
+        XCTAssertTrue(recorder.failed)
+        XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
+    }
+
+    func testCancellationAfterDelegateInstallationSurvivesRepeatedResumeAndLateFile() async throws {
+        let fixture = try fixture("complete", existing: true), recorder = DeliveryTerminalRecorder()
+        let done = expectation(description: "Cancellation after delegate installation")
+        let subscription = subscribe(fixture.task, recorder: recorder, completion: done)
+        fixture.task.didInstallDelegate = { [weak task = fixture.task] in task?.cancel() }
+
+        fixture.task.resume()
+        await fulfillment(of: [done], timeout: 5)
+        fixture.task.resume()
+        fixture.task.cancel()
+        let late = fixture.root.appendingPathComponent("late.part")
+        try Data("must-not-replace-the-winner".utf8).write(to: late)
+        fixture.task.urlSession(fixture.session, downloadTask: fixture.task.downloadTask,
+                                didFinishDownloadingTo: late)
+
+        withExtendedLifetime(subscription) {}
+        XCTAssertEqual(recorder.results.count, 1)
+        XCTAssertEqual((recorder.results.first?.error as? URLError)?.code, .cancelled)
+        XCTAssertTrue(recorder.failed)
+        XCTAssertNil(fixture.task.downloadTask.delegate)
+        XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
+        XCTAssertEqual(try String(contentsOf: late, encoding: .utf8), "must-not-replace-the-winner")
+    }
+
+    func testCancellationWithoutResumeDoesNotRetainWrapperThroughNativeTask() throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DeliveryScenarioURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let url = URL(string: "https://delivery.test/never-resumed")!
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        weak var weakTask: URLResourceDownloadTask?
+
+        autoreleasepool {
+            let task = URLResourceDownloadTask(session: session, url: url, destination: destination,
+                operationKey: DownloadOperationKey(sourceURL: url, destinationURL: destination))
+            weakTask = task
+            task.cancel()
+            XCTAssertNil(task.downloadTask.delegate)
+        }
+
+        XCTAssertNil(weakTask)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
     }
 
     func testHTTPErrorKeepsTheExistingRetryAfterContract() async throws {

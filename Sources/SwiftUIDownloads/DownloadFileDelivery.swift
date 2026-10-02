@@ -57,9 +57,15 @@ final class DownloadFileDelivery: @unchecked Sendable {
         return result
     }
 
+    var isCancellationRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested
+    }
+
     /// Record intent before URLSession cancellation. Do not publish here: the
-    /// controller can cancel before attaching its terminal subscriber. A later
-    /// delegate callback will publish the cancellation exactly once.
+    /// controller can cancel before attaching its terminal subscriber. Resume
+    /// or a later delegate callback will publish the cancellation exactly once.
     func cancel() {
         lock.lock()
         cancellationRequested = true
