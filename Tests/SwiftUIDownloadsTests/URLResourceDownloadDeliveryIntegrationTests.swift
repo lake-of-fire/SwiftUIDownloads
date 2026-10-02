@@ -188,7 +188,8 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
         XCTAssertEqual(recorder.results.count, 1)
         XCTAssertEqual((recorder.results.first?.error as? URLError)?.code, .cancelled)
         XCTAssertTrue(recorder.failed)
-        XCTAssertNil(fixture.task.downloadTask.delegate)
+        // The native task may retain its proxy delegate after completion.
+        // Wrapper release is checked by the dedicated weak-owner regression below.
         XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
         XCTAssertEqual(try String(contentsOf: late, encoding: .utf8), "must-not-replace-the-winner")
     }
