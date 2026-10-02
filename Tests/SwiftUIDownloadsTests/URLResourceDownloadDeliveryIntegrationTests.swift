@@ -149,6 +149,105 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
     }
 
+    func testCancellationFromWaitingForResponseDeliversOneTerminal() async throws {
+        let fixture = try fixture("complete", existing: true), recorder = DeliveryTerminalRecorder()
+        let done = expectation(description: "Cancellation during activation")
+        let terminalSubscription = subscribe(fixture.task, recorder: recorder, completion: done)
+        let cancellingSubscription = fixture.task.publisher.sink(
+            receiveCompletion: { _ in },
+            receiveValue: { [weak task = fixture.task] progress in
+                if case .waitingForResponse = progress { task?.cancel() }
+            }
+        )
+
+        fixture.task.resume()
+        await fulfillment(of: [done], timeout: 5)
+        withExtendedLifetime((terminalSubscription, cancellingSubscription)) {}
+        XCTAssertEqual(recorder.results.count, 1)
+        XCTAssertEqual((recorder.results.first?.error as? URLError)?.code, .cancelled)
+        XCTAssertTrue(recorder.failed)
+        XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
+    }
+
+    func testCancellationAfterDelegateInstallationSurvivesRepeatedResumeAndLateFile() async throws {
+        let fixture = try fixture("complete", existing: true), recorder = DeliveryTerminalRecorder()
+        let done = expectation(description: "Cancellation after delegate installation")
+        let subscription = subscribe(fixture.task, recorder: recorder, completion: done)
+        fixture.task.didInstallDelegate = { [weak task = fixture.task] in task?.cancel() }
+
+        fixture.task.resume()
+        await fulfillment(of: [done], timeout: 5)
+        fixture.task.resume()
+        fixture.task.cancel()
+        let late = fixture.root.appendingPathComponent("late.part")
+        try Data("must-not-replace-the-winner".utf8).write(to: late)
+        fixture.task.urlSession(fixture.session, downloadTask: fixture.task.downloadTask,
+                                didFinishDownloadingTo: late)
+
+        withExtendedLifetime(subscription) {}
+        XCTAssertEqual(recorder.results.count, 1)
+        XCTAssertEqual((recorder.results.first?.error as? URLError)?.code, .cancelled)
+        XCTAssertTrue(recorder.failed)
+        XCTAssertNil(fixture.task.downloadTask.delegate)
+        XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
+        XCTAssertEqual(try String(contentsOf: late, encoding: .utf8), "must-not-replace-the-winner")
+    }
+
+    func testCancelledActivatedNativeTaskDoesNotRetainTerminalWrapper() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DeliveryScenarioURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let url = URL(string: "https://delivery.test/cancelled-activation")!
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let done = expectation(description: "Cancelled activated task terminal")
+        weak var weakTask: URLResourceDownloadTask?
+        var retainedNativeTask: URLSessionDownloadTask?
+
+        autoreleasepool {
+            let task = URLResourceDownloadTask(session: session, url: url, destination: destination,
+                operationKey: DownloadOperationKey(sourceURL: url, destinationURL: destination))
+            weakTask = task
+            retainedNativeTask = task.downloadTask
+            task.didInstallDelegate = { [weak task] in task?.cancel() }
+            let subscription = task.publisher.sink(receiveCompletion: { _ in done.fulfill() },
+                                                   receiveValue: { _ in })
+            task.resume()
+            withExtendedLifetime(subscription) {}
+        }
+
+        await fulfillment(of: [done], timeout: 5)
+        // A native callback may still be leaving its stack after publication.
+        for _ in 0..<100 where weakTask != nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertNil(weakTask)
+        XCTAssertNotNil(retainedNativeTask)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        withExtendedLifetime(retainedNativeTask) {}
+    }
+
+    func testCancellationWithoutResumeDoesNotRetainWrapperThroughNativeTask() throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DeliveryScenarioURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let url = URL(string: "https://delivery.test/never-resumed")!
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        weak var weakTask: URLResourceDownloadTask?
+
+        autoreleasepool {
+            let task = URLResourceDownloadTask(session: session, url: url, destination: destination,
+                operationKey: DownloadOperationKey(sourceURL: url, destinationURL: destination))
+            weakTask = task
+            task.cancel()
+            XCTAssertNil(task.downloadTask.delegate)
+        }
+
+        XCTAssertNil(weakTask)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+    }
+
     func testHTTPErrorKeepsTheExistingRetryAfterContract() async throws {
         let fixture = try fixture("retry"), recorder = DeliveryTerminalRecorder()
         let done = expectation(description: "HTTP retry metadata")

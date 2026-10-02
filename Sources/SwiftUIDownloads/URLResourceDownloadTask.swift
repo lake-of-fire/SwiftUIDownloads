@@ -33,6 +33,12 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol,
     private let destination: URL
     let downloadTask: URLSessionDownloadTask
     private let delivery = DownloadFileDelivery()
+    private let resumeLock = NSLock()
+    private var didResume = false
+    private var nativeDelegate: DownloadTaskDelegate?
+
+    // A deterministic seam for cancellation while activation is in progress.
+    var didInstallDelegate: (() -> Void)?
 
     public typealias PublisherType = AnyPublisher<URLResourceDownloadTaskProgress, Error>
     fileprivate let subject: PassthroughSubject<PublisherType.Output, PublisherType.Failure>
@@ -59,9 +65,28 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol,
     }
 
     public func resume() {
-        downloadTask.delegate = self
+        resumeLock.lock()
+        guard !didResume else {
+            resumeLock.unlock()
+            return
+        }
+        didResume = true
+        resumeLock.unlock()
+
         subject.send(.waitingForResponse)
+        if publishCancellationIfNeeded() { return }
+
+        let nativeDelegate = DownloadTaskDelegate(owner: self)
+        self.nativeDelegate = nativeDelegate
+        downloadTask.delegate = nativeDelegate
+        didInstallDelegate?()
+        if publishCancellationIfNeeded() { return }
+
         downloadTask.resume()
+        // cancel() may have reached a still-suspended native task between the
+        // check above and resume(). Such a task need not produce a delegate
+        // completion, so settle it through the same file-delivery owner.
+        _ = publishCancellationIfNeeded()
     }
 
     public func cancel() {
@@ -69,8 +94,20 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol,
         downloadTask.cancel()
     }
 
+    @discardableResult
+    private func publishCancellationIfNeeded() -> Bool {
+        guard delivery.isCancellationRequested else { return false }
+        publish(delivery.complete(
+            requestedURL: url,
+            response: downloadTask.response,
+            error: URLError(.cancelled)
+        ))
+        return true
+    }
+
     private func publish(_ terminal: DownloadFileDelivery.TerminalResult?) {
         guard let terminal else { return }
+        nativeDelegate?.releaseOwner()
         // The result and response metadata are committed before calling any
         // subscriber. Never invoke publishers while holding the delivery lock.
         subject.send(.completed(
@@ -83,6 +120,43 @@ public class URLResourceDownloadTask: NSObject, URLResourceDownloadTaskProtocol,
         } else {
             subject.send(completion: .finished)
         }
+    }
+}
+
+/// URLSession forbids replacing a task delegate after resume. Its retained
+/// delegate forwards weakly after the unique terminal owner releases its
+/// active-operation lease; a transfer remains alive even if its caller drops it.
+private final class DownloadTaskDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private weak var owner: URLResourceDownloadTask?
+    // Initialized before native activation and released only by the single
+    // DownloadFileDelivery terminal winner. Callbacks route through weak owner.
+    private var retainedOwner: URLResourceDownloadTask?
+
+    init(owner: URLResourceDownloadTask) {
+        self.owner = owner
+        self.retainedOwner = owner
+        super.init()
+    }
+
+    func releaseOwner() {
+        retainedOwner = nil
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        owner?.urlSession(session, downloadTask: downloadTask, didFinishDownloadingTo: location)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        owner?.urlSession(session, downloadTask: downloadTask, didWriteData: bytesWritten,
+                          totalBytesWritten: totalBytesWritten,
+                          totalBytesExpectedToWrite: totalBytesExpectedToWrite)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        owner?.urlSession(session, task: task, didCompleteWithError: error)
     }
 }
 
