@@ -181,7 +181,13 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
         var subscription: AnyCancellable? = subscribe(
             try XCTUnwrap(downloadFixture?.task), recorder: recorder, completion: done
         )
-        downloadFixture?.task.didInstallDelegate = { [weak task = downloadFixture?.task] in task?.cancel() }
+        var installedProxy: (any URLSessionTaskDelegate)?
+        downloadFixture?.task.didInstallDelegate = { [weak task = downloadFixture?.task] in
+            // Retain the actual installed proxy before cancellation. URLSession
+            // can clear its delegate property after native completion.
+            installedProxy = nativeTask.delegate
+            task?.cancel()
+        }
 
         downloadFixture?.task.resume()
         await fulfillment(of: [done], timeout: 5)
@@ -197,10 +203,10 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "previous-complete-book")
         XCTAssertEqual(try String(contentsOf: late, encoding: .utf8), "must-not-replace-the-winner")
 
-        let nativeProxy = try XCTUnwrap(nativeTask.delegate)
+        let nativeProxy = try XCTUnwrap(installedProxy)
         let nativeDownloadProxy = try XCTUnwrap(nativeProxy as? URLSessionDownloadDelegate)
-        // The native delegate remains installed after activation. Its terminal
-        // forwarding lease must release the wrapper even while nativeTask lives.
+        // Its terminal forwarding lease must release the wrapper while both
+        // nativeTask and this actual installed proxy are still retained.
         subscription?.cancel()
         subscription = nil
         downloadFixture = nil
@@ -215,8 +221,7 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
         XCTAssertEqual(recorder.results.count, 1)
         XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "previous-complete-book")
         XCTAssertEqual(try String(contentsOf: late, encoding: .utf8), "must-not-replace-the-winner")
-        XCTAssertTrue(nativeTask.delegate === nativeProxy)
-        withExtendedLifetime(nativeTask) {}
+        withExtendedLifetime((nativeTask, nativeProxy)) {}
     }
 
     func testCancelledActivatedNativeTaskDoesNotRetainTerminalWrapper() async throws {
