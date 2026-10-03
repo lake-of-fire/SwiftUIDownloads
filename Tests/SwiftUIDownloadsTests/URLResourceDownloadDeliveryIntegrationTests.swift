@@ -170,27 +170,53 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
     }
 
     func testCancellationAfterDelegateInstallationSurvivesRepeatedResumeAndLateFile() async throws {
-        let fixture = try fixture("complete", existing: true), recorder = DeliveryTerminalRecorder()
+        var downloadFixture: Fixture? = try fixture("complete", existing: true)
+        let recorder = DeliveryTerminalRecorder()
+        let root = try XCTUnwrap(downloadFixture?.root)
+        let destination = try XCTUnwrap(downloadFixture?.destination)
+        let session = try XCTUnwrap(downloadFixture?.session)
+        let nativeTask = try XCTUnwrap(downloadFixture?.task.downloadTask)
+        weak var terminalWrapper = downloadFixture?.task
         let done = expectation(description: "Cancellation after delegate installation")
-        let subscription = subscribe(fixture.task, recorder: recorder, completion: done)
-        fixture.task.didInstallDelegate = { [weak task = fixture.task] in task?.cancel() }
+        var subscription: AnyCancellable? = subscribe(
+            try XCTUnwrap(downloadFixture?.task), recorder: recorder, completion: done
+        )
+        downloadFixture?.task.didInstallDelegate = { [weak task = downloadFixture?.task] in task?.cancel() }
 
-        fixture.task.resume()
+        downloadFixture?.task.resume()
         await fulfillment(of: [done], timeout: 5)
-        fixture.task.resume()
-        fixture.task.cancel()
-        let late = fixture.root.appendingPathComponent("late.part")
+        downloadFixture?.task.resume()
+        downloadFixture?.task.cancel()
+        let late = root.appendingPathComponent("late.part")
         try Data("must-not-replace-the-winner".utf8).write(to: late)
-        fixture.task.urlSession(fixture.session, downloadTask: fixture.task.downloadTask,
-                                didFinishDownloadingTo: late)
+        downloadFixture?.task.urlSession(session, downloadTask: nativeTask, didFinishDownloadingTo: late)
 
-        withExtendedLifetime(subscription) {}
         XCTAssertEqual(recorder.results.count, 1)
         XCTAssertEqual((recorder.results.first?.error as? URLError)?.code, .cancelled)
         XCTAssertTrue(recorder.failed)
-        XCTAssertNil(fixture.task.downloadTask.delegate)
-        XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "previous-complete-book")
         XCTAssertEqual(try String(contentsOf: late, encoding: .utf8), "must-not-replace-the-winner")
+
+        let nativeProxy = try XCTUnwrap(nativeTask.delegate)
+        let nativeDownloadProxy = try XCTUnwrap(nativeProxy as? URLSessionDownloadDelegate)
+        // The native delegate remains installed after activation. Its terminal
+        // forwarding lease must release the wrapper even while nativeTask lives.
+        subscription?.cancel()
+        subscription = nil
+        downloadFixture = nil
+        for _ in 0..<100 where terminalWrapper != nil {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertNil(terminalWrapper)
+        nativeProxy.urlSession?(session, task: nativeTask, didCompleteWithError: URLError(.cancelled))
+        nativeDownloadProxy.urlSession(
+            session, downloadTask: nativeTask, didFinishDownloadingTo: late
+        )
+        XCTAssertEqual(recorder.results.count, 1)
+        XCTAssertEqual(try String(contentsOf: destination, encoding: .utf8), "previous-complete-book")
+        XCTAssertEqual(try String(contentsOf: late, encoding: .utf8), "must-not-replace-the-winner")
+        XCTAssertTrue(nativeTask.delegate === nativeProxy)
+        withExtendedLifetime(nativeTask) {}
     }
 
     func testCancelledActivatedNativeTaskDoesNotRetainTerminalWrapper() async throws {
