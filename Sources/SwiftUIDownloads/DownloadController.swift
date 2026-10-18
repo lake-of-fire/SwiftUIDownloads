@@ -1709,39 +1709,75 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
 }
 
 struct DownloadRetryPolicy: Sendable {
+    static let maximumAttempts = 10
+    static let maximumLocalBaseDelaySeconds = 60.0
+    static let maximumRetryDelaySeconds = 300.0
+
     let maxAttempts: Int
     let initialDelaySeconds: Double
     let maxDelaySeconds: Double
     let jitterFraction: Double
     let maxServerRetryAfterSeconds: Double
 
-    static var `default`: DownloadRetryPolicy {
-        let env = ProcessInfo.processInfo.environment
-        let attempts = max(1, Int(env["MANABI_DOWNLOAD_MAX_ATTEMPTS"] ?? "") ?? 3)
-        let initialDelay = max(0.05, Double(env["MANABI_DOWNLOAD_INITIAL_RETRY_DELAY_SECONDS"] ?? "") ?? 0.7)
-        let maxDelay = max(initialDelay, Double(env["MANABI_DOWNLOAD_MAX_RETRY_DELAY_SECONDS"] ?? "") ?? 6.0)
-        let jitter = min(max(Double(env["MANABI_DOWNLOAD_RETRY_JITTER_FRACTION"] ?? "") ?? 0.35, 0), 1)
-        let maxRetryAfter = max(
-            maxDelay,
-            Double(env["MANABI_DOWNLOAD_MAX_SERVER_RETRY_AFTER_SECONDS"] ?? "") ?? 120.0
+    /// Nonfinite configuration uses defaults; finite values clamp to practical
+    /// bounds. Zero delay is supported, but attempts always remain bounded.
+    init(
+        maxAttempts: Int, initialDelaySeconds: Double, maxDelaySeconds: Double,
+        jitterFraction: Double, maxServerRetryAfterSeconds: Double
+    ) {
+        self.maxAttempts = min(Self.maximumAttempts, max(1, maxAttempts))
+        self.initialDelaySeconds = Self.bounded(
+            initialDelaySeconds, fallback: 0.7, maximum: Self.maximumLocalBaseDelaySeconds
         )
-        return DownloadRetryPolicy(
-            maxAttempts: attempts,
-            initialDelaySeconds: initialDelay,
-            maxDelaySeconds: maxDelay,
-            jitterFraction: jitter,
-            maxServerRetryAfterSeconds: maxRetryAfter
+        self.maxDelaySeconds = max(self.initialDelaySeconds, Self.bounded(
+            maxDelaySeconds, fallback: 6, maximum: Self.maximumLocalBaseDelaySeconds
+        ))
+        self.jitterFraction = Self.bounded(jitterFraction, fallback: 0.35, maximum: 1)
+        self.maxServerRetryAfterSeconds = Self.bounded(
+            maxServerRetryAfterSeconds, fallback: 120, maximum: Self.maximumRetryDelaySeconds
         )
     }
 
-    func delayBeforeRetrySeconds(forAttempt attempt: Int) -> Double {
-        guard attempt > 1 else { return 0 }
-        let exponent = Double(max(0, attempt - 2))
-        let baseDelay = min(maxDelaySeconds, initialDelaySeconds * pow(2.0, exponent))
+    init(environment: [String: String]) {
+        let configured = Self(
+            maxAttempts: Int(environment["MANABI_DOWNLOAD_MAX_ATTEMPTS"] ?? "") ?? 3,
+            initialDelaySeconds: Double(environment["MANABI_DOWNLOAD_INITIAL_RETRY_DELAY_SECONDS"] ?? "") ?? 0.7,
+            maxDelaySeconds: Double(environment["MANABI_DOWNLOAD_MAX_RETRY_DELAY_SECONDS"] ?? "") ?? 6,
+            jitterFraction: Double(environment["MANABI_DOWNLOAD_RETRY_JITTER_FRACTION"] ?? "") ?? 0.35,
+            maxServerRetryAfterSeconds: Double(environment["MANABI_DOWNLOAD_MAX_SERVER_RETRY_AFTER_SECONDS"] ?? "") ?? 120
+        )
+        // Preserve environment policy's minimum delay and server-cap relationship.
+        self.init(
+            maxAttempts: configured.maxAttempts,
+            initialDelaySeconds: max(0.05, configured.initialDelaySeconds),
+            maxDelaySeconds: max(0.05, configured.maxDelaySeconds),
+            jitterFraction: configured.jitterFraction,
+            maxServerRetryAfterSeconds: max(configured.maxDelaySeconds, configured.maxServerRetryAfterSeconds)
+        )
+    }
+
+    static var `default`: DownloadRetryPolicy { Self(environment: ProcessInfo.processInfo.environment) }
+
+    private static func bounded(_ value: Double, fallback: Double, maximum: Double) -> Double {
+        value.isFinite ? min(maximum, max(0, value)) : fallback
+    }
+
+    func delayBeforeRetrySeconds(
+        forAttempt attempt: Int, jitterUnitInterval: Double = Double.random(in: 0...1)
+    ) -> Double {
+        guard attempt > 1, initialDelaySeconds > 0 else { return 0 }
+        var baseDelay = initialDelaySeconds
+        // Every positive Double saturates within 2048 doublings. Each product
+        // is at most 120 seconds; even Int.max cannot overflow or create infinity.
+        for _ in 0..<min(attempt - 2, 2048) {
+            guard baseDelay < maxDelaySeconds else { break }
+            baseDelay = min(maxDelaySeconds, baseDelay * 2)
+        }
         let jitterMagnitude = baseDelay * jitterFraction
         let lower = max(0, baseDelay - jitterMagnitude)
         let upper = baseDelay + jitterMagnitude
-        return Double.random(in: lower...upper)
+        let sample = Self.bounded(jitterUnitInterval, fallback: 0.5, maximum: 1)
+        return lower + (upper - lower) * sample
     }
 
     func retryDelaySeconds(forAttempt attempt: Int, error: Error) -> Double {
@@ -1750,6 +1786,13 @@ struct DownloadRetryPolicy: Sendable {
             .map { min($0, maxServerRetryAfterSeconds) }
         return max(localDelay, serverDelay ?? 0)
     }
+
+    func retryDelayNanoseconds(forAttempt attempt: Int, error: Error) -> UInt64 {
+        // Construction bounds all delay sources to at most five minutes, far
+        // below UInt64's conversion boundary after multiplication.
+        let seconds = min(Self.maximumRetryDelaySeconds, retryDelaySeconds(forAttempt: attempt, error: error))
+        return UInt64(seconds * 1_000_000_000)
+    }
 }
 
 func serverSuggestedRetryDelaySeconds(from error: Error) -> Double? {
@@ -1757,7 +1800,8 @@ func serverSuggestedRetryDelaySeconds(from error: Error) -> Double? {
           httpError.statusCode == 429 || httpError.statusCode == 503 else {
         return nil
     }
-    guard let retryAfterSeconds = httpError.retryAfterSeconds, retryAfterSeconds > 0 else {
+    guard let retryAfterSeconds = httpError.retryAfterSeconds,
+          retryAfterSeconds.isFinite, retryAfterSeconds > 0 else {
         return nil
     }
     return retryAfterSeconds
@@ -2571,11 +2615,10 @@ extension DownloadController {
 
                 download.invalidateDownloadObservation()
 
-                let delaySeconds = retryPolicy.retryDelaySeconds(
+                let nanoseconds = retryPolicy.retryDelayNanoseconds(
                     forAttempt: attempt + 1,
                     error: error
                 )
-                let nanoseconds = UInt64(delaySeconds * 1_000_000_000)
                 do {
                     try await retrySleeper(nanoseconds)
                     try Task.checkCancellation()

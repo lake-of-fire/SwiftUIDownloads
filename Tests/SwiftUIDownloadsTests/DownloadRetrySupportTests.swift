@@ -2,6 +2,65 @@ import XCTest
 @testable import SwiftUIDownloads
 
 final class DownloadRetrySupportTests: XCTestCase {
+    func testPolicyBoundsInvalidConfigurationAndNanosecondConversion() {
+        let invalidValues: [Double] = [.nan, .infinity, -.infinity, .greatestFiniteMagnitude, -1, 0]
+        for value in invalidValues {
+            let policy = DownloadRetryPolicy(
+                maxAttempts: .max, initialDelaySeconds: value, maxDelaySeconds: value,
+                jitterFraction: value, maxServerRetryAfterSeconds: value
+            )
+            XCTAssertEqual(policy.maxAttempts, DownloadRetryPolicy.maximumAttempts)
+            for attempt in [Int.min, 0, 1, 2, 100, Int.max] {
+                for sample in [Double.nan, -.infinity, -1, 0, 0.5, 1, .infinity] {
+                    let delay = policy.delayBeforeRetrySeconds(forAttempt: attempt, jitterUnitInterval: sample)
+                    XCTAssertTrue(delay.isFinite)
+                    XCTAssertGreaterThanOrEqual(delay, 0)
+                    XCTAssertLessThanOrEqual(delay, DownloadRetryPolicy.maximumRetryDelaySeconds)
+                }
+                XCTAssertLessThanOrEqual(
+                    policy.retryDelayNanoseconds(forAttempt: attempt, error: URLError(.timedOut)),
+                    300_000_000_000
+                )
+            }
+        }
+    }
+
+    func testPolicyNormalizesReversedBoundsAndPreservesJitterEndpoints() {
+        let policy = DownloadRetryPolicy(
+            maxAttempts: 0, initialDelaySeconds: 12, maxDelaySeconds: 2,
+            jitterFraction: 1, maxServerRetryAfterSeconds: 20
+        )
+        XCTAssertEqual(policy.maxAttempts, 1)
+        XCTAssertEqual(policy.maxDelaySeconds, 12)
+        XCTAssertEqual(policy.delayBeforeRetrySeconds(forAttempt: .max, jitterUnitInterval: 0), 0)
+        XCTAssertEqual(policy.delayBeforeRetrySeconds(forAttempt: .max, jitterUnitInterval: 1), 24)
+        XCTAssertEqual(policy.delayBeforeRetrySeconds(forAttempt: .max, jitterUnitInterval: .nan), 12)
+        let tiny = DownloadRetryPolicy(
+            maxAttempts: 3, initialDelaySeconds: .leastNonzeroMagnitude, maxDelaySeconds: 60,
+            jitterFraction: 0, maxServerRetryAfterSeconds: 120
+        )
+        XCTAssertEqual(tiny.delayBeforeRetrySeconds(forAttempt: .max), 60)
+    }
+
+    func testEnvironmentPolicyUsesFiniteDefaultsAndPracticalLimits() {
+        let policy = DownloadRetryPolicy(environment: [
+            "MANABI_DOWNLOAD_MAX_ATTEMPTS": String(Int.max),
+            "MANABI_DOWNLOAD_INITIAL_RETRY_DELAY_SECONDS": "nan",
+            "MANABI_DOWNLOAD_MAX_RETRY_DELAY_SECONDS": "inf",
+            "MANABI_DOWNLOAD_RETRY_JITTER_FRACTION": "-inf",
+            "MANABI_DOWNLOAD_MAX_SERVER_RETRY_AFTER_SECONDS": "1e300"
+        ])
+        XCTAssertEqual(policy.maxAttempts, 10)
+        XCTAssertEqual(policy.initialDelaySeconds, 0.7)
+        XCTAssertEqual(policy.maxDelaySeconds, 6)
+        XCTAssertEqual(policy.jitterFraction, 0.35)
+        XCTAssertEqual(policy.maxServerRetryAfterSeconds, 300)
+        let error = URLResourceDownloadHTTPError(
+            statusCode: 503, url: URL(string: "https://example.invalid")!, retryAfterSeconds: .infinity
+        )
+        XCTAssertNil(serverSuggestedRetryDelaySeconds(from: error))
+    }
+
     func testParseRetryAfterSeconds_numericValue() {
         let parsed = parseRetryAfterSeconds("7")
         XCTAssertEqual(parsed, 7)

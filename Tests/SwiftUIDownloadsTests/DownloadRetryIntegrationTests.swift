@@ -94,6 +94,41 @@ private actor DownloadOperationInvocationCounter {
 }
 
 final class DownloadRetryIntegrationTests: XCTestCase {
+    func testInvalidInjectedPolicyReachesSleeperWithBoundedNanoseconds() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let payload = Data("bounded retry".utf8)
+        let stub = RetryAttemptExecutorStub(
+            failuresBeforeSuccess: 1, payload: payload, retryAfterSeconds: .infinity
+        )
+        let download = Downloadable(
+            url: URL(string: "https://example.invalid/\(UUID().uuidString)")!, name: "Bounded retry",
+            localDestination: root.appendingPathComponent("payload.bin")
+        )
+        let policy = DownloadRetryPolicy(
+            maxAttempts: 2, initialDelaySeconds: .infinity, maxDelaySeconds: .greatestFiniteMagnitude,
+            jitterFraction: .nan, maxServerRetryAfterSeconds: .infinity
+        )
+        let slept = expectation(description: "bounded retry reached the real scheduling boundary")
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, session in try await stub.execute(download: download, session: session) },
+            retryPolicyProvider: { policy },
+            retrySleeper: { nanoseconds in
+                XCTAssertLessThanOrEqual(nanoseconds, 300_000_000_000)
+                slept.fulfill()
+            }
+        )
+        await controller.download(download)
+        await fulfillment(of: [slept], timeout: 5)
+        let attempts = await stub.recordedAttemptDates()
+        XCTAssertEqual(attempts.count, 2)
+        XCTAssertEqual(try Data(contentsOf: download.localDestination), payload)
+    }
+
     func testCompatibleSameKeyReplayJoinsActiveOwnerWithoutDuplicateAttempt() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "download-compatible-replay-\(UUID().uuidString)", isDirectory: true
