@@ -10,6 +10,7 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
     private let lock = NSLock()
     let metadataCacheNamespace = "RecordingDownloadMetadataStore:\(UUID().uuidString)"
     private var metadata: DownloadMetadata
+    private var snapshotIdentity: String?
     private let failsBulkLoad: Bool
     private let bulkLoadStarted = DispatchSemaphore(value: 0)
     private let bulkLoadMayFinish = DispatchSemaphore(value: 0)
@@ -24,16 +25,45 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
 
     init(
         metadata: DownloadMetadata,
+        snapshotIdentity: String? = nil,
         failsBulkLoad: Bool = false,
         pausesBulkLoad: Bool = false,
         saveFailureCount: Int = 0,
         receiptSaveFailureCount: Int = 0
     ) {
         self.metadata = metadata
+        self.snapshotIdentity = snapshotIdentity
         self.failsBulkLoad = failsBulkLoad
         self.pausesBulkLoad = pausesBulkLoad
         self.remainingSaveFailures = saveFailureCount
         self.remainingReceiptSaveFailures = receiptSaveFailureCount
+    }
+
+    func replaceSnapshot(metadata: DownloadMetadata, identity: String) {
+        withLock {
+            self.metadata = metadata
+            snapshotIdentity = identity
+        }
+    }
+
+    func loadMetadataSnapshot(sourceURL: URL, destinationURL: URL) throws -> DownloadMetadataSnapshot {
+        let loaded = try loadMetadata(for: sourceURL)
+        return withLock { DownloadMetadataSnapshot(metadata: loaded, persistenceIdentity: snapshotIdentity) }
+    }
+
+    func saveMetadata(
+        _ metadata: DownloadMetadata, fields: DownloadMetadataFields,
+        sourceURL: URL, destinationURL: URL, expectedSnapshot: DownloadMetadataSnapshot
+    ) throws {
+        try withLock {
+            if snapshotIdentity != nil {
+                guard snapshotIdentity == expectedSnapshot.persistenceIdentity,
+                      self.metadata == expectedSnapshot.metadata else {
+                    throw DownloadMetadataSnapshotError.superseded
+                }
+            }
+        }
+        try saveMetadata(metadata, fields: fields, for: sourceURL)
     }
 
     func loadMetadata(for _: URL) throws -> DownloadMetadata {
@@ -166,6 +196,38 @@ private actor ImportInvocationRecorder {
 }
 
 final class DownloadMetadataCacheTests: XCTestCase {
+    func testFailedSaveRetryCannotRebindOldFieldsToReplacementSnapshot() async throws {
+        let original = DownloadMetadata(lastDownloadedETag: "original")
+        let replacement = DownloadMetadata(lastDownloadedETag: "replacement", lastDownloadedAt: Date())
+        let store = RecordingDownloadMetadataStore(
+            metadata: original, snapshotIdentity: "generation-a", saveFailureCount: 1
+        )
+        let cache = DownloadMetadataCache(
+            store: store, sourceURL: URL(string: "https://example.invalid/retry")!,
+            destinationURL: URL(fileURLWithPath: "/tmp/generation-bound-save-retry")
+        )
+        await cache.waitForInitialLoad()
+        cache.setLastDownloadedETag("failed-old-get")
+        do {
+            try await cache.waitForPendingSaves()
+            XCTFail("first save must fail for the injected persistence error")
+        } catch is DownloadMetadataPersistenceError { }
+        store.replaceSnapshot(metadata: replacement, identity: "generation-b")
+        cache.setLastDownloadedETag("failed-old-get")
+        do {
+            try await cache.waitForPendingSaves()
+            XCTFail("dirty retry must retain generation-a ownership")
+        } catch DownloadMetadataSnapshotError.superseded { }
+        XCTAssertEqual(store.storedMetadata, replacement)
+        XCTAssertEqual(cache.currentMetadata(), replacement)
+        XCTAssertEqual(store.saveCount, 1, "superseded retry must not reach an unguarded save")
+        try await cache.waitForPendingSaves()
+        cache.setLastCheckedETagAt(Date(timeIntervalSince1970: 1_700_000_000))
+        try await cache.waitForPendingSaves()
+        XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "replacement")
+    }
+
+
     func testCommittedImportMetadataAdoptionDoesNotSaveAgain() async throws {
         let committed = DownloadMetadata(lastDownloadedETag: "installed-get", lastDownloadedAt: Date())
         let store = RecordingDownloadMetadataStore(metadata: committed)

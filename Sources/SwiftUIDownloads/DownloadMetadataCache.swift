@@ -78,7 +78,8 @@ final class DownloadMetadataCache: @unchecked Sendable {
     private var initialLoadTask: Task<Void, Never>?
     private var observationRelays: [DownloadMetadataObservationRelay] = []
     private var saveTask: Task<Void, Error>?
-    private var latestSaveError: DownloadMetadataPersistenceError?
+    private var latestSaveError: (any Error)?
+    private var persistenceSnapshot: DownloadMetadataSnapshot?
     private var mutationRevision: UInt64 = 0
 
     static func shared(
@@ -123,7 +124,7 @@ final class DownloadMetadataCache: @unchecked Sendable {
         if let initialLoadTask { return initialLoadTask }
         let task = Task { @DownloadActor [self] in
             do {
-                mergeInitialMetadata(try store.loadMetadata(
+                mergeInitialMetadata(try store.loadMetadataSnapshot(
                     sourceURL: sourceURL,
                     destinationURL: destinationURL
                 ))
@@ -160,6 +161,14 @@ final class DownloadMetadataCache: @unchecked Sendable {
                 continue
             }
             if let error = state.error {
+                if let snapshotError = error as? DownloadMetadataSnapshotError,
+                   case .superseded = snapshotError {
+                    withLock {
+                        if saveTask == nil, latestSaveError is DownloadMetadataSnapshotError {
+                            latestSaveError = nil
+                        }
+                    }
+                }
                 throw error
             }
             return
@@ -183,6 +192,7 @@ final class DownloadMetadataCache: @unchecked Sendable {
         withLock {
             if dirtyFields.isEmpty, saveTask == nil {
                 metadata = current.metadata
+                persistenceSnapshot = current
                 knownStoredFields = .all
             }
         }
@@ -203,10 +213,11 @@ final class DownloadMetadataCache: @unchecked Sendable {
         defer {
             // A stale HEAD is discarded, never merged into a newer cache owner
             // or retained as dirty data for a later save retry.
-            if let stored = try? store.loadMetadata(sourceURL: sourceURL, destinationURL: destinationURL) {
+            if let stored = try? store.loadMetadataSnapshot(sourceURL: sourceURL, destinationURL: destinationURL) {
                 withLock {
                     if dirtyFields.isEmpty, saveTask == nil {
-                        metadata = stored
+                        metadata = stored.metadata
+                        persistenceSnapshot = stored
                         knownStoredFields = .all
                     }
                 }
@@ -226,10 +237,11 @@ final class DownloadMetadataCache: @unchecked Sendable {
         catch { throw DownloadImportReceiptError.metadataNotReady }
         do { try receipt.validate() }
         catch {
-            if let stored = try? store.loadMetadata(sourceURL: sourceURL, destinationURL: destinationURL) {
+            if let stored = try? store.loadMetadataSnapshot(sourceURL: sourceURL, destinationURL: destinationURL) {
                 withLock {
                     if dirtyFields.isEmpty, saveTask == nil {
-                        metadata = stored
+                        metadata = stored.metadata
+                        persistenceSnapshot = stored
                         knownStoredFields = .all
                     }
                 }
@@ -242,6 +254,9 @@ final class DownloadMetadataCache: @unchecked Sendable {
                 throw DownloadImportReceiptError.metadataNotReady
             }
             metadata = receipt.metadata
+            persistenceSnapshot = DownloadMetadataSnapshot(
+                metadata: receipt.metadata, persistenceIdentity: receipt.generationIdentifier
+            )
             knownStoredFields = .all
             latestSaveError = nil
             mutationRevision &+= 1
@@ -307,8 +322,10 @@ final class DownloadMetadataCache: @unchecked Sendable {
         if didMutate { notifyObservers() }
     }
 
-    private func mergeInitialMetadata(_ storedMetadata: DownloadMetadata) {
+    private func mergeInitialMetadata(_ snapshot: DownloadMetadataSnapshot) {
+        let storedMetadata = snapshot.metadata
         withLock {
+            persistenceSnapshot = snapshot
             let changedFields = fieldsChangedBeforeInitialLoad
             if !changedFields.contains(.lastDownloadedETag) {
                 metadata.lastDownloadedETag = storedMetadata.lastDownloadedETag
@@ -344,18 +361,47 @@ final class DownloadMetadataCache: @unchecked Sendable {
             let pending = withLock {
                 let fields = dirtyFields
                 dirtyFields = []
-                return (metadata, fields, mutationRevision)
+                return (metadata, fields, mutationRevision, persistenceSnapshot)
             }
             do {
-                try store.saveMetadata(
-                    pending.0,
-                    fields: pending.1,
-                    sourceURL: sourceURL,
-                    destinationURL: destinationURL
-                )
+                if let snapshot = pending.3 {
+                    try store.saveMetadata(
+                        pending.0, fields: pending.1, sourceURL: sourceURL, destinationURL: destinationURL,
+                        expectedSnapshot: snapshot
+                    )
+                } else {
+                    try store.saveMetadata(
+                        pending.0, fields: pending.1, sourceURL: sourceURL, destinationURL: destinationURL
+                    )
+                }
                 withLock {
                     knownStoredFields.formUnion(pending.1)
+                    if let snapshot = pending.3 {
+                        var stored = snapshot.metadata
+                        if pending.1.contains(.lastDownloadedETag) { stored.lastDownloadedETag = pending.0.lastDownloadedETag }
+                        if pending.1.contains(.lastCheckedETagAt) { stored.lastCheckedETagAt = pending.0.lastCheckedETagAt }
+                        if pending.1.contains(.lastDownloadedAt) { stored.lastDownloadedAt = pending.0.lastDownloadedAt }
+                        if pending.1.contains(.lastModifiedAt) { stored.lastModifiedAt = pending.0.lastModifiedAt }
+                        persistenceSnapshot = DownloadMetadataSnapshot(
+                            metadata: stored, persistenceIdentity: snapshot.persistenceIdentity
+                        )
+                    }
                 }
+            } catch DownloadMetadataSnapshotError.superseded {
+                let current = try? store.loadMetadataSnapshot(sourceURL: sourceURL, destinationURL: destinationURL)
+                withLock {
+                    // Retire the old owner and every dirty mutation captured
+                    // against it. Never retry those fields against a new token.
+                    dirtyFields = []
+                    fieldsChangedBeforeInitialLoad = []
+                    persistenceSnapshot = current
+                    if let current { metadata = current.metadata; knownStoredFields = .all }
+                    latestSaveError = DownloadMetadataSnapshotError.superseded
+                    saveTask = nil
+                    mutationRevision &+= 1
+                }
+                notifyObservers()
+                throw DownloadMetadataSnapshotError.superseded
             } catch {
                 let persistenceError = DownloadMetadataPersistenceError(error)
                 let shouldRetryNewerMutation = withLock {
