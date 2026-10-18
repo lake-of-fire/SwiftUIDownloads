@@ -153,6 +153,42 @@ final class DownloadMetadataCache: @unchecked Sendable {
     }
 
     @DownloadActor
+    func remoteCheckSnapshot() async throws -> DownloadMetadataSnapshot {
+        try await waitForPendingSaves()
+        return try store.loadMetadataSnapshot(sourceURL: sourceURL, destinationURL: destinationURL)
+    }
+
+    @DownloadActor
+    func publishUnchangedRemoteCheck(
+        snapshot: DownloadMetadataSnapshot, checkedAt: Date, etag: String?, lastModifiedAt: Date?
+    ) async throws {
+        try await waitForPendingSaves()
+        var checked = snapshot.metadata
+        checked.lastCheckedETagAt = checkedAt
+        var fields: DownloadMetadataFields = [.lastCheckedETagAt]
+        if let etag { checked.lastDownloadedETag = etag; fields.insert(.lastDownloadedETag) }
+        if let lastModifiedAt { checked.lastModifiedAt = lastModifiedAt; fields.insert(.lastModifiedAt) }
+        defer {
+            // A stale HEAD is discarded, never merged into a newer cache owner
+            // or retained as dirty data for a later save retry.
+            if let stored = try? store.loadMetadata(sourceURL: sourceURL, destinationURL: destinationURL) {
+                withLock {
+                    if dirtyFields.isEmpty, saveTask == nil {
+                        metadata = stored
+                        knownStoredFields = .all
+                    }
+                }
+                notifyObservers()
+            }
+        }
+        try Task.checkCancellation()
+        try store.saveMetadata(
+            checked, fields: fields, sourceURL: sourceURL, destinationURL: destinationURL,
+            expectedSnapshot: snapshot
+        )
+    }
+
+    @DownloadActor
     func adoptCommittedImport(_ receipt: DownloadImportReceipt) async throws {
         do { try await waitForPendingSaves() }
         catch { throw DownloadImportReceiptError.metadataNotReady }

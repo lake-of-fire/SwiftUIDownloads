@@ -90,6 +90,20 @@ public struct DownloadMetadataFields: OptionSet, Sendable {
     ]
 }
 
+public struct DownloadMetadataSnapshot: Sendable {
+    public let metadata: DownloadMetadata
+    public let persistenceIdentity: String?
+
+    public init(metadata: DownloadMetadata, persistenceIdentity: String? = nil) {
+        self.metadata = metadata
+        self.persistenceIdentity = persistenceIdentity
+    }
+}
+
+public enum DownloadMetadataSnapshotError: Error, Sendable {
+    case superseded
+}
+
 public protocol DownloadableMetadataStore: Sendable {
     /// Identifies metadata storage that must share one in-memory cache.
     /// Include any store-specific partition, such as a dictionary identifier.
@@ -104,6 +118,12 @@ public protocol DownloadableMetadataStore: Sendable {
     func setLastModifiedAt(_ date: Date?, for url: URL)
     func loadMetadata(for url: URL) throws -> DownloadMetadata
     func saveMetadata(_ metadata: DownloadMetadata, fields: DownloadMetadataFields, for url: URL) throws
+    func loadMetadataSnapshot(sourceURL: URL, destinationURL: URL) throws -> DownloadMetadataSnapshot
+    func saveMetadata(
+        _ metadata: DownloadMetadata, fields: DownloadMetadataFields,
+        sourceURL: URL, destinationURL: URL, expectedSnapshot: DownloadMetadataSnapshot
+    ) throws
+
     func installedArtifactReceipt(
         sourceURL: URL,
         destinationURL: URL
@@ -120,6 +140,18 @@ public protocol DownloadableMetadataStore: Sendable {
 }
 
 public extension DownloadableMetadataStore {
+    func loadMetadataSnapshot(sourceURL: URL, destinationURL: URL) throws -> DownloadMetadataSnapshot {
+        DownloadMetadataSnapshot(metadata: try loadMetadata(sourceURL: sourceURL, destinationURL: destinationURL))
+    }
+
+    func saveMetadata(
+        _ metadata: DownloadMetadata, fields: DownloadMetadataFields,
+        sourceURL: URL, destinationURL: URL, expectedSnapshot: DownloadMetadataSnapshot
+    ) throws {
+        try saveMetadata(metadata, fields: fields, sourceURL: sourceURL, destinationURL: destinationURL)
+    }
+
+
     func loadMetadata(for url: URL) throws -> DownloadMetadata {
         DownloadMetadata(
             lastDownloadedETag: lastDownloadedETag(for: url),

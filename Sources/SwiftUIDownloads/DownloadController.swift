@@ -549,6 +549,20 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     }
 
     @DownloadActor
+    func remoteCheckSnapshot() async throws -> DownloadMetadataSnapshot {
+        try await downloadMetadataCache.remoteCheckSnapshot()
+    }
+
+    @DownloadActor
+    func publishUnchangedRemoteCheck(
+        snapshot: DownloadMetadataSnapshot, checkedAt: Date, etag: String?, lastModifiedAt: Date?
+    ) async throws {
+        try await downloadMetadataCache.publishUnchangedRemoteCheck(
+            snapshot: snapshot, checkedAt: checkedAt, etag: etag, lastModifiedAt: lastModifiedAt
+        )
+    }
+
+    @DownloadActor
     func adoptCommittedImport(_ receipt: DownloadImportReceipt) async throws {
         try await downloadMetadataCache.adoptCommittedImport(receipt)
     }
@@ -2309,22 +2323,8 @@ extension DownloadController {
             if download.shouldCheckForUpdates,
                download.lastCheckedETagAt == nil
                 || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > updateCheckInterval {
-                switch await checkRemoteModification(for: download) {
+                switch await checkRemoteModification(for: download, persistUnchanged: true) {
                 case let .available(modified, modifiedAt, etag):
-                    if !modified {
-                        download.lastCheckedETagAt = Date()
-                        // These values describe the installed artifact only
-                        // when the server says that artifact is still current.
-                        // For an update, finishDownloadBody records success;
-                        // persisting the remote validators before replacement
-                        // succeeds would suppress retry after a failed update.
-                        if let modifiedAt {
-                            download.lastModifiedAt = modifiedAt
-                        }
-                        if let etag {
-                            download.lastDownloadedETag = etag
-                        }
-                    }
                     if modified {
                     await self.download(
                         download,
@@ -3804,12 +3804,19 @@ extension DownloadController {
 
     @DownloadActor
     func checkRemoteModification(
-        for download: Downloadable
+        for download: Downloadable, persistUnchanged: Bool = false
     ) async -> RemoteModificationCheckResult {
         await download.waitForDownloadMetadata()
         var request = URLRequest(url: download.url)
         request.httpMethod = "HEAD"
         do {
+            let snapshot = try await download.remoteCheckSnapshot()
+            let localModificationDate = (try? download.localDestination.resourceValues(
+                forKeys: [.contentModificationDateKey]
+            ).contentModificationDate) ?? nil
+            let baseline = snapshot.metadata.lastModifiedAt ?? snapshot.metadata.lastDownloadedAt
+                ?? localModificationDate ?? Date(timeIntervalSince1970: 0)
+            let lastDownloadedETag = snapshot.metadata.lastDownloadedETag
             let (_, response) = try await session.data(for: request)
             guard let httpURLResponse = response as? HTTPURLResponse,
                   httpURLResponse.statusCode == 200 else {
@@ -3820,17 +3827,6 @@ extension DownloadController {
             let remoteModifiedAt = httpURLResponse
                 .value(forHTTPHeaderField: "Last-Modified")
                 .flatMap(parseHTTPDate)
-            let localModificationDate = (try? download.localDestination.resourceValues(
-                forKeys: [.contentModificationDateKey]
-            ).contentModificationDate) ?? nil
-            let metadataBaseline = await MainActor.run {
-                download.lastModifiedAt ?? download.lastDownloaded
-            }
-            let baseline = metadataBaseline ?? localModificationDate ?? Date(timeIntervalSince1970: 0)
-            let lastDownloadedETag = await MainActor.run {
-                download.lastDownloadedETag
-            }
-
             if let remoteModifiedAt, remoteModifiedAt > baseline {
                 return .available(
                     modified: true,
@@ -3860,6 +3856,11 @@ extension DownloadController {
                 }
             }
 
+            if persistUnchanged {
+                try await download.publishUnchangedRemoteCheck(
+                    snapshot: snapshot, checkedAt: Date(), etag: etag, lastModifiedAt: remoteModifiedAt
+                )
+            }
             return .available(
                 modified: false,
                 modifiedAt: remoteModifiedAt,
