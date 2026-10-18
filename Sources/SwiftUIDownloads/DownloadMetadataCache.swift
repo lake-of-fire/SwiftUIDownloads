@@ -152,6 +152,35 @@ final class DownloadMetadataCache: @unchecked Sendable {
         }
     }
 
+    @DownloadActor
+    func adoptCommittedImport(_ receipt: DownloadImportReceipt) async throws {
+        do { try await waitForPendingSaves() }
+        catch { throw DownloadImportReceiptError.metadataNotReady }
+        do { try receipt.validate() }
+        catch {
+            if let stored = try? store.loadMetadata(sourceURL: sourceURL, destinationURL: destinationURL) {
+                withLock {
+                    if dirtyFields.isEmpty, saveTask == nil {
+                        metadata = stored
+                        knownStoredFields = .all
+                    }
+                }
+                notifyObservers()
+            }
+            throw error
+        }
+        try withLock {
+            guard dirtyFields.isEmpty, saveTask == nil else {
+                throw DownloadImportReceiptError.metadataNotReady
+            }
+            metadata = receipt.metadata
+            knownStoredFields = .all
+            latestSaveError = nil
+            mutationRevision &+= 1
+        }
+        notifyObservers()
+    }
+
     func setLastDownloadedETag(_ value: String?) {
         update(.lastDownloadedETag) { metadata, isStoredFieldKnown in
             guard !isStoredFieldKnown || metadata.lastDownloadedETag != value else { return false }
@@ -290,9 +319,9 @@ final class DownloadMetadataCache: @unchecked Sendable {
         }
     }
 
-    private func withLock<Result>(_ operation: () -> Result) -> Result {
+    private func withLock<Result>(_ operation: () throws -> Result) rethrows -> Result {
         lock.lock()
         defer { lock.unlock() }
-        return operation()
+        return try operation()
     }
 }

@@ -22,12 +22,34 @@ public struct DownloadImportResponse: Sendable {
     }
 }
 
+public enum DownloadImportReceiptError: Error, Sendable {
+    case metadataNotReady
+    case superseded
+}
+
+/// A producer's committed state; validation must compare this identity rather
+/// than treating any currently imported content as completion of this request.
+public struct DownloadImportReceipt: Sendable {
+    public let generationIdentifier: String
+    public let metadata: DownloadMetadata
+    public let validate: @Sendable () throws -> Void
+
+    public init(
+        generationIdentifier: String, metadata: DownloadMetadata,
+        validate: @escaping @Sendable () throws -> Void
+    ) {
+        self.generationIdentifier = generationIdentifier
+        self.metadata = metadata
+        self.validate = validate
+    }
+}
+
 public final class ImportableDownloadable: Downloadable, @unchecked Sendable {
     public typealias ImportProgressHandler = @Sendable (_ progress: Double?, _ status: String?) -> Void
     public typealias ImportHandler = @Sendable (URL, @escaping ImportProgressHandler) async throws -> Void
     public typealias ResponseImportHandler = @Sendable (
         URL, DownloadImportResponse?, @escaping ImportProgressHandler
-    ) async throws -> Void
+    ) async throws -> DownloadImportReceipt
     public typealias ImportedCheck = @Sendable () async -> Bool
     
     public let importHandler: ImportHandler

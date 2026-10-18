@@ -166,6 +166,40 @@ private actor ImportInvocationRecorder {
 }
 
 final class DownloadMetadataCacheTests: XCTestCase {
+    func testCommittedImportMetadataAdoptionDoesNotSaveAgain() async throws {
+        let committed = DownloadMetadata(lastDownloadedETag: "installed-get", lastDownloadedAt: Date())
+        let store = RecordingDownloadMetadataStore(metadata: committed)
+        let cache = DownloadMetadataCache(
+            store: store, sourceURL: URL(string: "https://example.invalid/import")!,
+            destinationURL: URL(fileURLWithPath: "/tmp/import-receipt-test")
+        )
+        let receipt = DownloadImportReceipt(generationIdentifier: "generation-a", metadata: committed, validate: {})
+        try await cache.adoptCommittedImport(receipt)
+        XCTAssertEqual(cache.currentMetadata(), committed)
+        XCTAssertEqual(store.saveCount, 0, "committed producer metadata must not be written a second time")
+    }
+
+    func testSupersededImportReceiptReloadsCurrentMetadataWithoutSavingOldValues() async throws {
+        let current = DownloadMetadata(lastDownloadedETag: "replacement", lastDownloadedAt: Date())
+        let store = RecordingDownloadMetadataStore(metadata: current)
+        let cache = DownloadMetadataCache(
+            store: store, sourceURL: URL(string: "https://example.invalid/import")!,
+            destinationURL: URL(fileURLWithPath: "/tmp/superseded-import-receipt-test")
+        )
+        let receipt = DownloadImportReceipt(
+            generationIdentifier: "old-generation", metadata: DownloadMetadata(lastDownloadedETag: "old-get"),
+            validate: { throw DownloadImportReceiptError.superseded }
+        )
+        do {
+            try await cache.adoptCommittedImport(receipt)
+            XCTFail("superseded receipt must reject completion")
+        } catch DownloadImportReceiptError.superseded { }
+        XCTAssertEqual(cache.currentMetadata(), current)
+        XCTAssertEqual(store.saveCount, 0)
+    }
+
+    @MainActor
+
     @MainActor
     func testDownloadableHydratesMetadataWithOneBulkStoreRead() async {
         let checkedAt = Date(timeIntervalSince1970: 100)

@@ -548,6 +548,11 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         downloadMetadataCache.currentMetadata()
     }
 
+    @DownloadActor
+    func adoptCommittedImport(_ receipt: DownloadImportReceipt) async throws {
+        try await downloadMetadataCache.adoptCommittedImport(receipt)
+    }
+
     public func waitForDownloadMetadataPersistence() async throws {
         try await downloadMetadataCache.waitForPendingSaves()
     }
@@ -3315,6 +3320,7 @@ extension DownloadController {
         }
 
         var finishStartedWithCompressedFile = false
+        var committedImportReceipt: DownloadImportReceipt?
         do {
             try Task.checkCancellation()
             let alreadyFinished = await MainActor.run { download.isFinishedProcessing }
@@ -3436,11 +3442,17 @@ extension DownloadController {
                     }
                 }
                 if let responseImportHandler = importable.responseImportHandler {
+                    // Old cache mutations must drain before a producer can
+                    // install different bytes under this dictionary identity.
+                    do { try await download.waitForDownloadMetadataPersistence() }
+                    catch { throw DownloadImportReceiptError.metadataNotReady }
                     let response = recordSuccessfulDownload && !download.url.isFileURL ? DownloadImportResponse(
                         sourceURL: download.url, finalResponseURL: finalResponseURL,
                         checkedAt: Date(), etag: etag, lastModifiedAt: remoteModifiedAt
                     ) : nil
-                    try await responseImportHandler(processingFileURL, response, progressHandler)
+                    let receipt = try await responseImportHandler(processingFileURL, response, progressHandler)
+                    try await download.adoptCommittedImport(receipt)
+                    committedImportReceipt = receipt
                 } else {
                     try await importable.importHandler(processingFileURL, progressHandler)
                 }
@@ -3558,7 +3570,7 @@ extension DownloadController {
                 // failed replacement may deliberately preserve the prior
                 // usable destination and must not make that older artifact
                 // look like the just-downloaded remote version after relaunch.
-                if recordSuccessfulDownload {
+                if recordSuccessfulDownload && committedImportReceipt == nil {
                     download.lastDownloaded = successfulMetadata?.downloadedAt
                         ?? Date()
                     // Validators describe the installed GET bytes. Assigning
@@ -3580,7 +3592,7 @@ extension DownloadController {
                     }
                 }
             }
-            if recordSuccessfulDownload {
+            if recordSuccessfulDownload && committedImportReceipt == nil {
                 try await download.waitForDownloadMetadataPersistence()
                 try Task.checkCancellation()
                 guard processingTasks[download.id]?.id == processingTaskID else {
@@ -3591,6 +3603,9 @@ extension DownloadController {
             pendingInstalledArtifactReceipts[
                 download.id
             ] = nil
+            try Task.checkCancellation()
+            guard processingTasks[download.id]?.id == processingTaskID else { throw CancellationError() }
+            try committedImportReceipt?.validate()
             await publishSuccessfulCompletion(download)
             checksumRedownloadAttempted.remove(download.id)
             clearDownloadStatusObservers(forDownloadID: download.id)
