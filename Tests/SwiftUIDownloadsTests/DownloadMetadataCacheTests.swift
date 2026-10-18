@@ -196,6 +196,54 @@ private actor ImportInvocationRecorder {
 }
 
 final class DownloadMetadataCacheTests: XCTestCase {
+    func testDeletedImportRetryRequiresOriginalSnapshotAndPreservesSameOwnerRetry() async throws {
+        let original = DownloadMetadata(lastDownloadedETag: "installed-a")
+        let replacement = DownloadMetadata(lastDownloadedETag: "installed-b")
+        let store = RecordingDownloadMetadataStore(
+            metadata: original, snapshotIdentity: "generation-a", saveFailureCount: 1
+        )
+        let cache = DownloadMetadataCache(
+            store: store, sourceURL: URL(string: "https://example.invalid/deleted-import-retry")!,
+            destinationURL: URL(fileURLWithPath: "/tmp/deleted-import-retry")
+        )
+        await cache.waitForInitialLoad()
+        cache.setLastDownloadedETag("pending-a")
+        do {
+            try await cache.waitForPendingSaves()
+            XCTFail("expected first completion save failure")
+        } catch is DownloadMetadataPersistenceError { }
+        let failedOwner = try XCTUnwrap(cache.failedSaveOwner())
+        try await cache.validateDeletedImportRetryOwner(failedOwner)
+        store.replaceSnapshot(metadata: replacement, identity: "generation-b")
+        do {
+            try await cache.validateDeletedImportRetryOwner(failedOwner)
+            XCTFail("another imported generation cannot authorize retry of A's deleted archive")
+        } catch DownloadMetadataSnapshotError.superseded { }
+        XCTAssertEqual(cache.currentMetadata(), replacement)
+        do {
+            try await cache.validateDeletedImportRetryOwner(failedOwner)
+            XCTFail("reloading B must not reattribute A's captured retry receipt")
+        } catch DownloadMetadataSnapshotError.superseded { }
+        XCTAssertEqual(store.storedMetadata, replacement)
+        XCTAssertEqual(store.saveCount, 1)
+        try await cache.waitForPendingSaves()
+    }
+
+    func testDeletedImportRetryRejectsMissingPersistenceIdentity() async throws {
+        let store = RecordingDownloadMetadataStore(metadata: DownloadMetadata(lastDownloadedETag: "unknown-owner"))
+        let cache = DownloadMetadataCache(
+            store: store, sourceURL: URL(string: "https://example.invalid/unowned-retry")!,
+            destinationURL: URL(fileURLWithPath: "/tmp/unowned-retry")
+        )
+        await cache.waitForInitialLoad()
+        do {
+            try await cache.validateDeletedImportRetryOwner(nil)
+            XCTFail("missing archive and missing owner must reject retry")
+        } catch DownloadMetadataSnapshotError.superseded { }
+        XCTAssertEqual(store.saveCount, 0)
+    }
+
+
     func testFailedSaveRetryCannotRebindOldFieldsToReplacementSnapshot() async throws {
         let original = DownloadMetadata(lastDownloadedETag: "original")
         let replacement = DownloadMetadata(lastDownloadedETag: "replacement", lastDownloadedAt: Date())

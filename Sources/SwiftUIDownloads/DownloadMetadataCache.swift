@@ -80,6 +80,11 @@ final class DownloadMetadataCache: @unchecked Sendable {
     private var saveTask: Task<Void, Error>?
     private var latestSaveError: (any Error)?
     private var persistenceSnapshot: DownloadMetadataSnapshot?
+    private var failedPersistenceSnapshot: DownloadMetadataSnapshot?
+
+    func failedSaveOwner() -> DownloadMetadataSnapshot? {
+        withLock { failedPersistenceSnapshot }
+    }
     private var mutationRevision: UInt64 = 0
 
     static func shared(
@@ -173,6 +178,34 @@ final class DownloadMetadataCache: @unchecked Sendable {
             }
             return
         }
+    }
+
+    @DownloadActor
+    func validateDeletedImportRetryOwner(_ expected: DownloadMetadataSnapshot?) async throws {
+        await waitForInitialLoad()
+        try Task.checkCancellation()
+        while let task = withLock({ saveTask }) {
+            _ = await task.result
+            try Task.checkCancellation()
+        }
+        let current = try store.loadMetadataSnapshot(sourceURL: sourceURL, destinationURL: destinationURL)
+        if let expected, expected.persistenceIdentity != nil,
+           current.persistenceIdentity == expected.persistenceIdentity, current.metadata == expected.metadata {
+            return
+        }
+        withLock {
+            // A Boolean imported check cannot identify the deleted archive's
+            // owner. Revoke the old completion rather than rebinding its fields.
+            dirtyFields = []
+            fieldsChangedBeforeInitialLoad = []
+            persistenceSnapshot = current
+            metadata = current.metadata
+            knownStoredFields = .all
+            latestSaveError = nil
+            mutationRevision &+= 1
+        }
+        notifyObservers()
+        throw DownloadMetadataSnapshotError.superseded
     }
 
     @DownloadActor
@@ -405,6 +438,7 @@ final class DownloadMetadataCache: @unchecked Sendable {
             } catch {
                 let persistenceError = DownloadMetadataPersistenceError(error)
                 let shouldRetryNewerMutation = withLock {
+                    failedPersistenceSnapshot = pending.3
                     dirtyFields.formUnion(pending.1)
                     guard mutationRevision != pending.2 else {
                         latestSaveError = persistenceError

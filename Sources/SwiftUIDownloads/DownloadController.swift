@@ -549,6 +549,15 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     }
 
     @DownloadActor
+    func validateDeletedImportRetryOwner(_ snapshot: DownloadMetadataSnapshot?) async throws {
+        try await downloadMetadataCache.validateDeletedImportRetryOwner(snapshot)
+    }
+
+    func failedMetadataSaveOwner() -> DownloadMetadataSnapshot? {
+        downloadMetadataCache.failedSaveOwner()
+    }
+
+    @DownloadActor
     func remoteCheckSnapshot() async throws -> DownloadMetadataSnapshot {
         try await downloadMetadataCache.remoteCheckSnapshot()
     }
@@ -1578,6 +1587,7 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     private var checksumRecoveriesReadyForProcessing = Set<DownloadOperationKey>()
     private var checksumRedownloadAttempted = Set<DownloadOperationKey>()
     private var completionMetadataRetryDownloadIDs = Set<DownloadOperationKey>()
+    private var completionMetadataRetryOwners = [DownloadOperationKey: DownloadMetadataSnapshot]()
     private var pendingInstalledArtifactReceipts = [
         DownloadOperationKey: PendingInstalledArtifactReceipt
     ]()
@@ -1955,6 +1965,7 @@ public extension DownloadController {
         // Fence any delegate/retry completion that arrives after deletion.
         downloadAttemptIDs[download.id] = nil
         completionMetadataRetryDownloadIDs.remove(download.id)
+        completionMetadataRetryOwners[download.id] = nil
         pendingInstalledArtifactReceipts[
             download.id
         ] = nil
@@ -1985,6 +1996,7 @@ public extension DownloadController {
         }
 
         completionMetadataRetryDownloadIDs.remove(download.id)
+        completionMetadataRetryOwners[download.id] = nil
         clearDownloadStatusObservers(forDownloadID: download.id)
         try removeAllLocalArtifacts(
             for: download,
@@ -3171,17 +3183,15 @@ extension DownloadController {
             // metadata supersedes any dirty completion values retained from
             // processing the previously installed artifact.
             completionMetadataRetryDownloadIDs.remove(download.id)
+            completionMetadataRetryOwners[download.id] = nil
         } else if completionMetadataRetryDownloadIDs.contains(download.id) {
             do {
                 try Task.checkCancellation()
                 let receiptKey = download.id
-                let importDeletedSource = if let importable = download as? ImportableDownloadable,
-                                             importable.deleteAfterImport {
-                    await importable.isImported()
+                let importDeletedSource = (download as? ImportableDownloadable)?.deleteAfterImport == true
+                if importDeletedSource {
+                    try await download.validateDeletedImportRetryOwner(completionMetadataRetryOwners[download.id])
                 } else {
-                    false
-                }
-                if !importDeletedSource {
                     if let pendingReceipt = pendingInstalledArtifactReceipts[receiptKey] {
                         guard download.installedArtifactMatches(pendingReceipt.receipt) else {
                             throw InstalledArtifactReceiptValidationError
@@ -3222,6 +3232,7 @@ extension DownloadController {
                     throw CancellationError()
                 }
                 completionMetadataRetryDownloadIDs.remove(download.id)
+                completionMetadataRetryOwners[download.id] = nil
                 pendingInstalledArtifactReceipts[receiptKey] = nil
                 await publishSuccessfulCompletion(download)
                 checksumRedownloadAttempted.remove(download.id)
@@ -3232,6 +3243,7 @@ extension DownloadController {
                 } else {
                     if !(error is DownloadMetadataPersistenceError) {
                         completionMetadataRetryDownloadIDs.remove(download.id)
+                        completionMetadataRetryOwners[download.id] = nil
                         pendingInstalledArtifactReceipts[
                             download.id
                         ] = nil
@@ -3609,6 +3621,7 @@ extension DownloadController {
                 }
             }
             completionMetadataRetryDownloadIDs.remove(download.id)
+            completionMetadataRetryOwners[download.id] = nil
             pendingInstalledArtifactReceipts[
                 download.id
             ] = nil
@@ -3621,6 +3634,7 @@ extension DownloadController {
         } catch {
             if error is DownloadMetadataPersistenceError {
                 completionMetadataRetryDownloadIDs.insert(download.id)
+                completionMetadataRetryOwners[download.id] = download.failedMetadataSaveOwner()
                 if Task.isCancelled
                     || processingTasks[download.id]?.id != processingTaskID {
                     await markDownloadCancelled(download)
