@@ -343,13 +343,15 @@ public struct DownloadExecutionConfigurationSignature: Hashable, Sendable {
     public let preservedLocalArtifactDirectories: [URL]
     public let metadataCacheNamespace: String
     public let kind: DownloadExecutionKind
+    public let usesResponseImportHandler: Bool
 
     public init(
         mirrorURL: URL?,
         localDestinationChecksum: String?,
         preservedLocalArtifactDirectories: Set<URL>,
         metadataCacheNamespace: String,
-        kind: DownloadExecutionKind
+        kind: DownloadExecutionKind,
+        usesResponseImportHandler: Bool = false
     ) {
         self.mirrorURL = mirrorURL.map(DownloadOperationKey.standardizedSourceURL)
         self.localDestinationChecksum = Self.normalizedOptionalString(
@@ -363,6 +365,7 @@ public struct DownloadExecutionConfigurationSignature: Hashable, Sendable {
         )).sorted { $0.absoluteString < $1.absoluteString }
         self.metadataCacheNamespace = metadataCacheNamespace
         self.kind = kind
+        self.usesResponseImportHandler = usesResponseImportHandler
     }
 
     static func normalizedOptionalString(
@@ -3432,7 +3435,15 @@ extension DownloadController {
                         }
                     }
                 }
-                try await importable.importHandler(processingFileURL, progressHandler)
+                if let responseImportHandler = importable.responseImportHandler {
+                    let response = recordSuccessfulDownload && !download.url.isFileURL ? DownloadImportResponse(
+                        sourceURL: download.url, finalResponseURL: finalResponseURL,
+                        checkedAt: Date(), etag: etag, lastModifiedAt: remoteModifiedAt
+                    ) : nil
+                    try await responseImportHandler(processingFileURL, response, progressHandler)
+                } else {
+                    try await importable.importHandler(processingFileURL, progressHandler)
+                }
                 try Task.checkCancellation()
             }
 

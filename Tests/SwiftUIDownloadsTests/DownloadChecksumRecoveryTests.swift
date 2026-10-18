@@ -323,6 +323,43 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
             url.lastPathComponent.contains(".downloading.")        })
     }
 
+    func testResponseImportHandlerReceivesGETValidatorsForItsVerifiedBytes() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = URL(string: "https://swiftui-downloads-staged.test/response-context.bin")!
+        let destination = root.appendingPathComponent("response.bin")
+        let received = expectation(description: "response-aware import called")
+        let download = ImportableDownloadable(
+            url: source, name: "Response Import", localDestination: destination, deleteAfterImport: false,
+            responseImportHandler: { candidateURL, response, _ in
+                let response = try XCTUnwrap(response)
+                XCTAssertEqual(response.sourceURL, source)
+                XCTAssertEqual(response.etag, "corrupt-update")
+                XCTAssertNil(response.lastModifiedAt)
+                XCTAssertLessThan(abs(response.checkedAt.timeIntervalSinceNow), 30)
+                XCTAssertEqual(try Data(contentsOf: candidateURL), Data("corrupt-update".utf8))
+                received.fulfill()
+                throw TestImportError.rejectedCandidate
+            },
+            isImported: { false },
+            importHandler: { _, _ in XCTFail("legacy handler must not replace response-aware handler") }
+        )
+        let legacy = ImportableDownloadable(
+            url: source, name: "Legacy Import", localDestination: destination, deleteAfterImport: false,
+            isImported: { false }, importHandler: { _, _ in }
+        )
+        XCTAssertNotEqual(download.executionConfigurationSignature, legacy.executionConfigurationSignature)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CorruptUncompressedUpdateURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        await DownloadController(session: session).download(download)
+        await fulfillment(of: [received], timeout: 5)
+        let succeeded = try await download.awaitCompletionOrFailure()
+        XCTAssertFalse(succeeded)
+    }
+
     func testRejectedUncompressedImportPreservesInstalledDestination()
     async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
