@@ -159,6 +159,24 @@ final class DownloadMetadataCache: @unchecked Sendable {
     }
 
     @DownloadActor
+    func remoteCheckSnapshotIsCurrent(_ expected: DownloadMetadataSnapshot) async throws -> Bool {
+        try await waitForPendingSaves()
+        try Task.checkCancellation()
+        let current = try store.loadMetadataSnapshot(sourceURL: sourceURL, destinationURL: destinationURL)
+        guard current.persistenceIdentity != expected.persistenceIdentity || current.metadata != expected.metadata else {
+            return true
+        }
+        withLock {
+            if dirtyFields.isEmpty, saveTask == nil {
+                metadata = current.metadata
+                knownStoredFields = .all
+            }
+        }
+        notifyObservers()
+        return false
+    }
+
+    @DownloadActor
     func publishUnchangedRemoteCheck(
         snapshot: DownloadMetadataSnapshot, checkedAt: Date, etag: String?, lastModifiedAt: Date?
     ) async throws {

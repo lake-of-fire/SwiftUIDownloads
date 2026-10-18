@@ -554,6 +554,11 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     }
 
     @DownloadActor
+    func remoteCheckSnapshotIsCurrent(_ snapshot: DownloadMetadataSnapshot) async throws -> Bool {
+        try await downloadMetadataCache.remoteCheckSnapshotIsCurrent(snapshot)
+    }
+
+    @DownloadActor
     func publishUnchangedRemoteCheck(
         snapshot: DownloadMetadataSnapshot, checkedAt: Date, etag: String?, lastModifiedAt: Date?
     ) async throws {
@@ -3822,6 +3827,11 @@ extension DownloadController {
                   httpURLResponse.statusCode == 200 else {
                 return .unavailable
             }
+
+            // Comparison and scheduling decisions belong to the installed
+            // snapshot captured before HEAD, including comparison-only callers.
+            guard try await download.remoteCheckSnapshotIsCurrent(snapshot) else { return .unavailable }
+            try Task.checkCancellation()
 
             let etag = httpURLResponse.value(forHTTPHeaderField: "ETag")
             let remoteModifiedAt = httpURLResponse

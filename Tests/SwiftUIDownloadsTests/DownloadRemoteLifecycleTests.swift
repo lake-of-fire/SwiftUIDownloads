@@ -322,7 +322,60 @@ private struct ValidatorMetadataStore: DownloadableMetadataStore {
     }
 }
 
+private final class SnapshotChangingHEADURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var onStart: (@Sendable () -> Void)?
+    nonisolated(unsafe) static var responseETag = "old"
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        // The controller has captured its baseline and suspended for the request.
+        Self.onStart?()
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+            headerFields: ["ETag": Self.responseETag]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 final class DownloadRemoteLifecycleTests: XCTestCase {
+    func testChangedAndUnchangedHEADDecisionsRejectSupersededBaseline() async throws {
+        defer { SnapshotChangingHEADURLProtocol.onStart = nil }
+        for responseETag in ["old", "remote-update"] {
+            let backing = ValidatorMetadataBacking(
+                metadata: DownloadMetadata(lastDownloadedETag: "old", lastDownloadedAt: Date()),
+                loadFailureCount: 0
+            )
+            let download = Downloadable(
+                url: URL(string: "https://example.invalid/snapshot-\(UUID().uuidString)")!,
+                name: "Snapshot Decision", localDestination: URL(fileURLWithPath: "/tmp/unused-head-snapshot"),
+                metadataStore: ValidatorMetadataStore(backing: backing)
+            )
+            SnapshotChangingHEADURLProtocol.responseETag = responseETag
+            SnapshotChangingHEADURLProtocol.onStart = {
+                backing.update { $0.lastDownloadedETag = "replacement" }
+            }
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [SnapshotChangingHEADURLProtocol.self]
+            let session = URLSession(configuration: configuration)
+            defer { session.invalidateAndCancel() }
+            let result = await DownloadController(session: session).checkRemoteModification(for: download)
+            switch result {
+            case .unavailable: break
+            case .available: XCTFail("stale HEAD must not schedule an update or establish equality")
+            }
+            XCTAssertEqual(download.cachedDownloadMetadata.lastDownloadedETag, "replacement")
+            XCTAssertNil(try backing.load().lastCheckedETagAt)
+        }
+    }
+
+
+
 
     func testDownloadableIdentityUsesStandardizedSourceAndDestination() {
         let sourceURL = URL(string: "https://identity.test/catalog/../dictionary.zip")!
