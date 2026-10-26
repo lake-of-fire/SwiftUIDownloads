@@ -26,10 +26,11 @@ fileprivate struct ChecksumVerificationFileIdentity: Equatable, Sendable {
 private let checksumVerificationMarkerSchemaVersion = 2
 
 fileprivate func checksumVerificationFileIdentity(
-    from fileAttributes: [FileAttributeKey: Any]
+    from fileAttributes: [FileAttributeKey: Any],
+    allowingEmptyFile: Bool = false
 ) -> ChecksumVerificationFileIdentity? {
     let fileSize = (fileAttributes[.size] as? NSNumber)?.uint64Value ?? 0
-    guard fileSize > 0,
+    guard (allowingEmptyFile || fileSize > 0),
           let modificationDate = fileAttributes[.modificationDate] as? Date else {
         return nil
     }
@@ -158,6 +159,31 @@ private struct DownloadLocalFileInspectionError: LocalizedError {
     var errorDescription: String? {
         "Unable to inspect local file at \(url.path): \(underlyingError.localizedDescription)"
     }
+}
+
+private enum ChecksumRecoveryFileOwnership: Equatable {
+    case absent
+    case existing(ChecksumVerificationFileIdentity)
+}
+
+private func checksumRecoveryFileOwnership(at url: URL) throws -> ChecksumRecoveryFileOwnership {
+    let attributes: [FileAttributeKey: Any]
+    do {
+        attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    } catch {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain,
+           nsError.code == NSFileNoSuchFileError || nsError.code == NSFileReadNoSuchFileError {
+            return .absent
+        }
+        throw DownloadLocalFileInspectionError(url: url, underlyingError: error)
+    }
+    // Recovery may legitimately discard an empty corrupt file. Its physical
+    // identity still has to survive the status-publication suspension.
+    guard let identity = checksumVerificationFileIdentity(from: attributes, allowingEmptyFile: true) else {
+        throw DownloadLocalFileInspectionError(url: url, underlyingError: CocoaError(.fileReadCorruptFile))
+    }
+    return .existing(identity)
 }
 
 private enum DownloadCompressedPayloadValidationError: LocalizedError {
@@ -3125,23 +3151,42 @@ extension DownloadController {
         etag: String?,
         remoteModifiedAt: Date? = nil,
         updatesRemoteModifiedAt: Bool = false,
-        preserveInstalledDestination: Bool = false
+        preserveInstalledDestination: Bool = false,
+        originalInstalledFileIdentity: ChecksumVerificationFileIdentity? = nil
     ) async -> DownloadTransferResult? {
         checksumRedownloadAttempted.insert(download.id)
-        await MainActor.run { [weak self] in
-            if let importable = download as? ImportableDownloadable {
-                importable.lastImportError = nil
-                importable.importStatusText = "Retrying download…"
+        do {
+            let originalOwnership: ChecksumRecoveryFileOwnership?
+            if preserveInstalledDestination {
+                originalOwnership = nil
+            } else if let originalInstalledFileIdentity {
+                originalOwnership = .existing(originalInstalledFileIdentity)
+            } else {
+                originalOwnership = try checksumRecoveryFileOwnership(at: download.localDestination)
             }
-            self?.failedDownloads.remove(download)
-            self?.activeDownloads.remove(download)
-            self?.finishedDownloads.remove(download)
-            download.isFailed = false
-            download.isActive = false
-            download.isFinishedDownloading = false
-            download.isFinishedProcessing = false
+            await MainActor.run { [weak self] in
+                if let importable = download as? ImportableDownloadable {
+                    importable.lastImportError = nil
+                    importable.importStatusText = "Retrying download…"
+                }
+                self?.failedDownloads.remove(download)
+                self?.activeDownloads.remove(download)
+                self?.finishedDownloads.remove(download)
+                download.isFailed = false
+                download.isActive = false
+                download.isFinishedDownloading = false
+                download.isFinishedProcessing = false
+            }
+            guard !Task.isCancelled else { return nil }
+            if let originalOwnership,
+               try checksumRecoveryFileOwnership(at: download.localDestination) != originalOwnership {
+                throw DownloadableChecksumVerificationError.fileChangedDuringVerification(download.localDestination)
+            }
+        } catch {
+            checksumRedownloadAttempted.remove(download.id)
+            await publishProcessingFailure(error, for: download, statusText: "Import failed")
+            return nil
         }
-        guard !Task.isCancelled else { return nil }
         if !preserveInstalledDestination {
             try? FileManager.default.removeItemIfPresent(
                 at: download.localDestination
@@ -3267,7 +3312,7 @@ extension DownloadController {
                             download.id
                         ] = nil
                     }
-                    await publishCompletionMetadataFailure(error, for: download)
+                    await publishProcessingFailure(error, for: download)
                 }
             }
             return
@@ -3424,20 +3469,8 @@ extension DownloadController {
                     underlyingError: error
                 )
             }
-            guard let fileSize = resourceValues.fileSize, fileSize > 0 else {
-                if stagedUncompressedFileURL == nil,
-                   compressedCandidateURL == nil,
-                   let importable = download as? ImportableDownloadable,
-                   await importable.isImported() {
-                    await markDownloadAsProcessed(download)
-                    clearDownloadStatusObservers(forDownloadID: download.id)
-                    return
-                }
-                throw DownloadableChecksumVerificationError.emptyFile(
-                    processingFileURL
-                )
-            }
-
+            // Capture even an empty source before the asynchronous imported-state
+            // callback; that callback cannot transfer ownership of a replacement.
             try Task.checkCancellation()
             let processingAttributes: [FileAttributeKey: Any]
             do {
@@ -3447,10 +3480,30 @@ extension DownloadController {
             } catch {
                 throw DownloadLocalFileInspectionError(url: processingFileURL, underlyingError: error)
             }
-            guard let processingIdentity = checksumVerificationFileIdentity(from: processingAttributes) else {
+            guard let processingIdentity = checksumVerificationFileIdentity(from: processingAttributes, allowingEmptyFile: true) else {
                 throw DownloadableChecksumVerificationError.emptyFile(processingFileURL)
             }
             processingFileOwnership = (processingFileURL, processingIdentity)
+            guard let fileSize = resourceValues.fileSize, fileSize > 0 else {
+                if stagedUncompressedFileURL == nil,
+                   compressedCandidateURL == nil,
+                   let importable = download as? ImportableDownloadable {
+                    let alreadyImported = await importable.isImported()
+                    guard try checksumRecoveryFileOwnership(at: processingFileURL) == .existing(processingIdentity) else {
+                        throw DownloadableChecksumVerificationError.fileChangedDuringVerification(processingFileURL)
+                    }
+                    if alreadyImported {
+                        await markDownloadAsProcessed(download)
+                        clearDownloadStatusObservers(forDownloadID: download.id)
+                        return
+                    }
+                }
+                throw DownloadableChecksumVerificationError.emptyFile(
+                    processingFileURL
+                )
+            }
+
+            try Task.checkCancellation()
             let verifiesStagedCandidate = stagedUncompressedFileURL != nil
             let checksumTask = Task.detached(priority: .utility) {
                 () throws -> ChecksumVerificationFileIdentity? in
@@ -3674,7 +3727,7 @@ extension DownloadController {
                     || processingTasks[download.id]?.id != processingTaskID {
                     await markDownloadCancelled(download)
                 } else {
-                    await publishCompletionMetadataFailure(error, for: download)
+                    await publishProcessingFailure(error, for: download)
                 }
                 return
             }
@@ -3682,8 +3735,7 @@ extension DownloadController {
                 guard let ownership = processingFileOwnership,
                       ownership.url == download.localDestination else { return false }
                 do {
-                    try download.requireFileIdentity(ownership.identity, at: ownership.url)
-                    return false
+                    return try checksumRecoveryFileOwnership(at: ownership.url) != .existing(ownership.identity)
                 } catch {
                     return true
                 }
@@ -3699,7 +3751,10 @@ extension DownloadController {
                     etag: etag,
                     remoteModifiedAt: remoteModifiedAt,
                     updatesRemoteModifiedAt: updatesRemoteModifiedAt,
-                    preserveInstalledDestination: stagedUncompressedFileURL != nil
+                    preserveInstalledDestination: stagedUncompressedFileURL != nil,
+                    originalInstalledFileIdentity: processingFileOwnership.flatMap {
+                        $0.url == download.localDestination ? $0.identity : nil
+                    }
                 )
                 if !Task.isCancelled, let transferResult {
                     // This processor owns the checksum-recovery attempt from
@@ -3826,15 +3881,16 @@ extension DownloadController {
     }
 
     @DownloadActor
-    private func publishCompletionMetadataFailure(
+    private func publishProcessingFailure(
         _ error: Error,
-        for download: Downloadable
+        for download: Downloadable,
+        statusText: String = "Saving download metadata failed"
     ) async {
         await MainActor.run { [weak self] in
             if let importable = download as? ImportableDownloadable {
                 importable.lastImportError = error
                 importable.importProgress = nil
-                importable.importStatusText = "Saving download metadata failed"
+                importable.importStatusText = statusText
             }
             self?.failedDownloads.insert(download)
             self?.activeDownloads.remove(download)

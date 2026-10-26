@@ -39,6 +39,72 @@ private enum TestImportError: Error {
     case rejectedCandidate
 }
 
+private final class RetryOwnershipRequests: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts: [URL: Int] = [:]
+
+    func record(_ url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        counts[url, default: 0] += 1
+    }
+
+    func count(for url: URL) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts[url, default: 0]
+    }
+
+    func remove(_ url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        counts[url] = nil
+    }
+}
+
+private final class RetryOwnershipURLProtocol: URLProtocol {
+    static let requests = RetryOwnershipRequests()
+    static let payload = Data("valid-independent-replacement".utf8)
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else { return }
+        Self.requests.record(url)
+        let response = HTTPURLResponse(url: url, statusCode: 200,
+            httpVersion: nil, headerFields: ["ETag": "must-not-be-downloaded"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.payload)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+@MainActor
+private final class RetryReplacementWitness {
+    weak var download: ImportableDownloadable?
+    private(set) var receipt: InstalledArtifactReceipt?
+    private(set) var marker: Data?
+    private(set) var replacements = 0
+
+    func install() {
+        guard replacements == 0, let download else { return }
+        do {
+            try RetryOwnershipURLProtocol.payload.write(to: download.localDestination, options: .atomic)
+            try download.ensureVerifiedLocalDestinationChecksum()
+            let receipt = try download.makeInstalledArtifactReceipt(finalResponseURL: download.url)
+            try download.persistInstalledArtifactReceipt(receipt)
+            self.receipt = receipt
+            marker = try Data(contentsOf: download.checksumVerificationMarkerURL)
+            replacements += 1
+        } catch {
+            XCTFail("Unable to install independent replacement in actual callback: \(error)")
+        }
+    }
+}
+
 private actor RetainedImportGate {
     private var continuation: CheckedContinuation<Void, Never>?
     private var released = false
@@ -243,6 +309,178 @@ private actor AsyncCompletionFlag {
 
 final class DownloadChecksumRecoveryTests: XCTestCase {
     @MainActor
+    func testFinishChecksumRetryRejectsStatusObserverReplacementAndSettles() async throws {
+        try await exerciseChecksumRetryStatusReplacement(directRecovery: false)
+    }
+
+    @MainActor
+    func testDirectChecksumRecoveryRejectsStatusObserverReplacementAndSettles() async throws {
+        try await exerciseChecksumRetryStatusReplacement(directRecovery: true)
+    }
+
+    @MainActor
+    func testEmptySourceImportedCallbackCannotTransferOwnershipToReplacement() async throws {
+        for importedResult in [false, true] {
+            try await exerciseChecksumRetryStatusReplacement(
+                directRecovery: false, emptySourceImportedResult: importedResult)
+        }
+    }
+
+    @MainActor
+    func testUnchangedEmptyAndMissingSourcesStillPermitCleanRecovery() async throws {
+        for mode in ["finish-empty", "direct-empty", "direct-missing", "finish-imported-empty"] {
+            let alreadyImported = mode == "finish-imported-empty"
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("unchanged-recovery-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let suite = "unchanged-recovery-metadata-\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let store = UserDefaultsDownloadableMetadataStore(userDefaults: defaults)
+            let source = URL(string: "https://retry-ownership.test/\(UUID().uuidString)/payload.bin")!
+            defer { RetryOwnershipURLProtocol.requests.remove(source) }
+            let destination = directory.appendingPathComponent("payload.bin")
+            if mode != "direct-missing" { try Data().write(to: destination, options: .atomic) }
+            let imported = AsyncCompletionFlag()
+            let download = ImportableDownloadable(
+                url: source, name: "Unchanged Recovery", localDestination: destination,
+                localDestinationChecksum: sha1Hex(RetryOwnershipURLProtocol.payload),
+                deleteAfterImport: false, metadataStore: store, isImported: { alreadyImported }, importHandler: { file, _ in
+                    XCTAssertEqual(try Data(contentsOf: file), RetryOwnershipURLProtocol.payload)
+                    await imported.markCompleted()
+                })
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [RetryOwnershipURLProtocol.self]
+            let session = URLSession(configuration: configuration)
+            defer { session.invalidateAndCancel() }
+            let controller = DownloadController(session: session)
+            let exited = expectation(description: "Unchanged recovery settles: " + mode)
+            let operation = Task {
+                defer { exited.fulfill() }
+                if mode.hasPrefix("finish-") {
+                    await controller.finishDownload(download)
+                } else {
+                    await controller.recoverLocalChecksumFailure(for: download)
+                }
+            }
+            let result = await XCTWaiter.fulfillment(of: [exited], timeout: 5)
+            XCTAssertEqual(result, .completed, mode)
+            if result != .completed {
+                operation.cancel()
+                await controller.cancelInProgressDownload(download)
+                session.invalidateAndCancel()
+            }
+            await operation.value
+            XCTAssertEqual(RetryOwnershipURLProtocol.requests.count(for: source), alreadyImported ? 0 : 1, mode)
+            let importerRan = await imported.value()
+            XCTAssertEqual(importerRan, !alreadyImported, mode)
+            XCTAssertEqual(try Data(contentsOf: destination), alreadyImported ? Data() : RetryOwnershipURLProtocol.payload)
+            if !alreadyImported {
+                XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker(), mode)
+            }
+            XCTAssertTrue(download.isFinishedProcessing, mode)
+            XCTAssertTrue(download.isFinishedDownloading, mode)
+            XCTAssertFalse(download.isFailed, mode)
+        }
+    }
+
+    @MainActor
+    private func exerciseChecksumRetryStatusReplacement(
+        directRecovery: Bool, emptySourceImportedResult: Bool? = nil
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("retry-status-ownership-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suite = "retry-status-metadata-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsDownloadableMetadataStore(userDefaults: defaults)
+        let source = URL(string: "https://retry-ownership.test/\(UUID().uuidString)/payload.bin")!
+        defer { RetryOwnershipURLProtocol.requests.remove(source) }
+        let destination = directory.appendingPathComponent("payload.bin")
+        try (emptySourceImportedResult == nil ? Data("corrupt-original-source".utf8) : Data())
+            .write(to: destination, options: .atomic)
+        let imported = AsyncCompletionFlag()
+        let witness = RetryReplacementWitness()
+        let download = ImportableDownloadable(
+            url: source, name: "Retry Ownership", localDestination: destination,
+            localDestinationChecksum: sha1Hex(RetryOwnershipURLProtocol.payload),
+            deleteAfterImport: true, metadataStore: store,
+            isImported: {
+                guard let emptySourceImportedResult else { return false }
+                await witness.install()
+                return emptySourceImportedResult
+            }, importHandler: { _, _ in await imported.markCompleted() })
+        witness.download = download
+        await download.waitForDownloadMetadata()
+        let baselineDate = Date(timeIntervalSince1970: 123)
+        download.lastDownloaded = baselineDate
+        download.lastDownloadedETag = "original-etag"
+        try await download.waitForDownloadMetadataPersistence()
+
+        let subscription = download.$importStatusText.sink { status in
+            guard emptySourceImportedResult == nil, status == "Retrying download…" else { return }
+            witness.install()
+        }
+        defer { subscription.cancel() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RetryOwnershipURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let exited = expectation(description: "Checksum recovery settles after lost ownership")
+        let operation = Task {
+            defer { exited.fulfill() }
+            if directRecovery {
+                await controller.recoverLocalChecksumFailure(for: download)
+            } else {
+                await controller.finishDownload(download)
+            }
+        }
+        // No throwing setup remains while the operation owns fixture resources.
+        let result = await XCTWaiter.fulfillment(of: [exited], timeout: 5)
+        XCTAssertEqual(result, .completed)
+        if result != .completed {
+            operation.cancel()
+            await controller.cancelInProgressDownload(download)
+            session.invalidateAndCancel()
+        }
+        await operation.value
+
+        XCTAssertEqual(witness.replacements, 1, "The actual status/imported-state callback must exercise replacement")
+        XCTAssertEqual(RetryOwnershipURLProtocol.requests.count(for: source), 0)
+        let importerRan = await imported.value()
+        XCTAssertFalse(importerRan)
+        XCTAssertEqual(try Data(contentsOf: destination), RetryOwnershipURLProtocol.payload)
+        XCTAssertNotNil(witness.marker)
+        XCTAssertEqual(try Data(contentsOf: download.checksumVerificationMarkerURL), witness.marker)
+        XCTAssertNotNil(witness.receipt)
+        XCTAssertEqual(try store.installedArtifactReceipt(sourceURL: source, destinationURL: destination),
+            witness.receipt)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertTrue(download.isFailed)
+        XCTAssertFalse(download.isActive)
+        XCTAssertFalse(download.isFinishedDownloading)
+        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertFalse(controller.finishedDownloads.contains(download))
+        XCTAssertEqual(download.lastDownloaded, baselineDate)
+        XCTAssertEqual(download.lastDownloadedETag, "original-etag")
+        let persisted = store.loadMetadata(sourceURL: source, destinationURL: destination)
+        XCTAssertEqual(persisted.lastDownloadedAt, baselineDate)
+        XCTAssertEqual(persisted.lastDownloadedETag, "original-etag")
+        guard let error = download.lastImportError as? DownloadableChecksumVerificationError,
+              case .fileChangedDuringVerification = error else {
+            return XCTFail("Expected terminal ownership rejection, got \(String(describing: download.lastImportError))")
+        }
+        if download.isFailed || download.isFinishedProcessing {
+            let succeeded = try await download.awaitCompletionOrFailure()
+            XCTAssertFalse(succeeded)
+        }
+    }
+
+    @MainActor
     func testImportStatusReplacementIsRejectedBeforeImporterDispatch() async throws {
         for checksum in [false, true] {
             let directory = FileManager.default.temporaryDirectory
@@ -368,7 +606,14 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         }
         await fulfillment(of: [importStarted], timeout: 5)
         if replacesSource {
-            try replacement.write(to: destination, options: .atomic)
+            do {
+                try replacement.write(to: destination, options: .atomic)
+            } catch {
+                task.cancel()
+                await gate.release()
+                await task.value
+                throw error
+            }
         }
         if case .cancellation = outcome {
             await controller.cancelInProgressDownload(download)
