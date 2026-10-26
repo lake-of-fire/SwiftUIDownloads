@@ -309,6 +309,130 @@ private actor AsyncCompletionFlag {
 
 final class DownloadChecksumRecoveryTests: XCTestCase {
     @MainActor
+    func testCallerCancellationDuringEmptySourceImportedCallbackCannotPublishSuccess() async throws {
+        for importedResult in [false, true] {
+            try await exerciseImportedCallbackCancellation(importedResult: importedResult,
+                cancelsDescriptor: false, ensuresDerivedState: false)
+        }
+    }
+
+    @MainActor
+    func testDescriptorCancellationDuringEmptySourceImportedCallbackCannotPublishSuccess() async throws {
+        for importedResult in [false, true] {
+            try await exerciseImportedCallbackCancellation(importedResult: importedResult,
+                cancelsDescriptor: true, ensuresDerivedState: false)
+        }
+    }
+
+    @MainActor
+    func testEnsureDownloadedCallerCancellationCannotPublishCompletedDerivedState() async throws {
+        try await exerciseImportedCallbackCancellation(importedResult: true,
+            cancelsDescriptor: false, ensuresDerivedState: true)
+    }
+
+    @MainActor
+    private func exerciseImportedCallbackCancellation(
+        importedResult: Bool, cancelsDescriptor: Bool, ensuresDerivedState: Bool
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("imported-callback-cancellation-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suite = "imported-callback-cancellation-metadata-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsDownloadableMetadataStore(userDefaults: defaults)
+        let source = URL(string: "https://retry-ownership.test/\(UUID().uuidString)/payload.bin")!
+        defer { RetryOwnershipURLProtocol.requests.remove(source) }
+        let destination = directory.appendingPathComponent("payload.bin")
+        try Data().write(to: destination, options: .atomic)
+        let entered = expectation(description: "Actual imported-state callback is held")
+        let settled = expectation(description: "Cancelled imported-state operation settles")
+        let gate = RetainedImportGate()
+        let imported = AsyncCompletionFlag()
+        let download = ImportableDownloadable(
+            url: source, name: "Imported Callback Cancellation", localDestination: destination,
+            localDestinationChecksum: sha1Hex(RetryOwnershipURLProtocol.payload),
+            deleteAfterImport: true, metadataStore: store,
+            isImported: {
+                entered.fulfill()
+                await gate.wait()
+                return importedResult
+            }, importHandler: { _, _ in await imported.markCompleted() })
+        await download.waitForDownloadMetadata()
+        let baselineDate = Date(timeIntervalSince1970: 123)
+        download.lastDownloaded = baselineDate
+        download.lastDownloadedETag = "original-etag"
+        download.shouldCheckForUpdates = false
+        try await download.waitForDownloadMetadataPersistence()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RetryOwnershipURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let operation = Task {
+            defer { settled.fulfill() }
+            if ensuresDerivedState {
+                await controller.ensureDownloaded(download: download)
+            } else {
+                await controller.finishDownload(download)
+            }
+        }
+        let arrival = await XCTWaiter.fulfillment(of: [entered], timeout: 5)
+        guard arrival == .completed else {
+            operation.cancel()
+            await controller.cancelInProgressDownload(download)
+            await gate.release()
+            session.invalidateAndCancel()
+            await operation.value
+            XCTFail("The actual imported-state callback did not arrive before cancellation")
+            return
+        }
+        if cancelsDescriptor {
+            await controller.cancelInProgressDownload(download)
+        } else {
+            operation.cancel()
+        }
+        await gate.release()
+        let completion = await XCTWaiter.fulfillment(of: [settled], timeout: 5)
+        if completion != .completed {
+            operation.cancel()
+            await controller.cancelInProgressDownload(download)
+            await gate.release()
+            session.invalidateAndCancel()
+        }
+        await operation.value
+        XCTAssertEqual(completion, .completed)
+        XCTAssertEqual(RetryOwnershipURLProtocol.requests.count(for: source), 0)
+        let importerRan = await imported.value()
+        XCTAssertFalse(importerRan)
+        if ensuresDerivedState {
+            XCTAssertEqual(try Data(contentsOf: destination), Data())
+        } else {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path),
+                "Cancelled finish processing discards its owned unverified empty source")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: download.checksumVerificationMarkerURL.path))
+        XCTAssertNil(try store.installedArtifactReceipt(sourceURL: source, destinationURL: destination))
+        XCTAssertTrue(download.isFailed)
+        XCTAssertFalse(download.isActive)
+        XCTAssertFalse(download.isFinishedDownloading)
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertTrue(controller.failedDownloads.contains(download))
+        XCTAssertFalse(controller.finishedDownloads.contains(download))
+        XCTAssertEqual(download.lastDownloaded, baselineDate)
+        XCTAssertEqual(download.lastDownloadedETag, "original-etag")
+        let persisted = store.loadMetadata(sourceURL: source, destinationURL: destination)
+        XCTAssertEqual(persisted.lastDownloadedAt, baselineDate)
+        XCTAssertEqual(persisted.lastDownloadedETag, "original-etag")
+        guard case let .completed(_, _, error) = download.downloadProgress else {
+            return XCTFail("Cancellation must publish terminal error progress")
+        }
+        XCTAssertTrue(error is CancellationError,
+            "Expected cancellation progress, got \(String(describing: error))")
+    }
+
+    @MainActor
     func testFinishChecksumRetryRejectsStatusObserverReplacementAndSettles() async throws {
         try await exerciseChecksumRetryStatusReplacement(directRecovery: false)
     }

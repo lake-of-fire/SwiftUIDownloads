@@ -2343,7 +2343,12 @@ extension DownloadController {
         )
             if hasProcessableLocalArtifact || importedWithoutRetainedSource {
                 if importedWithoutRetainedSource {
-                    await markDownloadAsProcessed(download)
+                    do {
+                        try await markDownloadAsProcessed(download)
+                    } catch {
+                        await markDownloadCancelled(download, error: error)
+                        return
+                    }
                 } else {
                     // Validate/process an already-installed artifact before
                     // checking the remote version, but keep its validators
@@ -3489,11 +3494,18 @@ extension DownloadController {
                    compressedCandidateURL == nil,
                    let importable = download as? ImportableDownloadable {
                     let alreadyImported = await importable.isImported()
+                    try Task.checkCancellation()
+                    guard processingTasks[download.id]?.id == processingTaskID else {
+                        throw CancellationError()
+                    }
                     guard try checksumRecoveryFileOwnership(at: processingFileURL) == .existing(processingIdentity) else {
                         throw DownloadableChecksumVerificationError.fileChangedDuringVerification(processingFileURL)
                     }
                     if alreadyImported {
-                        await markDownloadAsProcessed(download)
+                        try await markDownloadAsProcessed(
+                            download,
+                            requiringFileOwnership: (url: processingFileURL, identity: processingIdentity)
+                        )
                         clearDownloadStatusObservers(forDownloadID: download.id)
                         return
                     }
@@ -3838,12 +3850,26 @@ extension DownloadController {
     }
 
     @DownloadActor
-    private func markDownloadAsProcessed(_ download: Downloadable) async {
+    private func markDownloadAsProcessed(
+        _ download: Downloadable,
+        requiringFileOwnership: (url: URL, identity: ChecksumVerificationFileIdentity)? = nil
+    ) async throws {
+        try Task.checkCancellation()
         if completionMetadataRetryDownloadIDs.contains(download.id) {
             await finishDownload(download, recordSuccessfulDownload: false)
             return
         }
-        await { @MainActor [weak self] in
+        try await MainActor.run { [weak self] in
+            // Imported-state callbacks and the actor hop may outlive their
+            // caller. Admit success only while that task and source still own it.
+            try Task.checkCancellation()
+            if let requiringFileOwnership,
+               try checksumRecoveryFileOwnership(at: requiringFileOwnership.url)
+                != .existing(requiringFileOwnership.identity) {
+                throw DownloadableChecksumVerificationError.fileChangedDuringVerification(
+                    requiringFileOwnership.url
+                )
+            }
             download.isFailed = false
             download.isActive = false
             download.isFinishedDownloading = true
@@ -3852,7 +3878,7 @@ extension DownloadController {
             self?.activeDownloads.remove(download)
             self?.finishedDownloads.insert(download)
             self?.refreshPublishedDownloadState()
-        }()
+        }
     }
 
     @DownloadActor
