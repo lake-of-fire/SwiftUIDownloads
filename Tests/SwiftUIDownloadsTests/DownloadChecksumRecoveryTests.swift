@@ -331,8 +331,15 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
     }
 
     @MainActor
+    func testEnsureDownloadedRetryAfterCancellationClearsTerminalErrorProgress() async throws {
+        try await exerciseImportedCallbackCancellation(importedResult: true,
+            cancelsDescriptor: false, ensuresDerivedState: true, retryAfterCancellation: true)
+    }
+
+    @MainActor
     private func exerciseImportedCallbackCancellation(
-        importedResult: Bool, cancelsDescriptor: Bool, ensuresDerivedState: Bool
+        importedResult: Bool, cancelsDescriptor: Bool, ensuresDerivedState: Bool,
+        retryAfterCancellation: Bool = false
     ) async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("imported-callback-cancellation-\(UUID().uuidString)", isDirectory: true)
@@ -350,11 +357,13 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         let settled = expectation(description: "Cancelled imported-state operation settles")
         let gate = RetainedImportGate()
         let imported = AsyncCompletionFlag()
+        let retryPhase = AsyncCompletionFlag()
         let download = ImportableDownloadable(
             url: source, name: "Imported Callback Cancellation", localDestination: destination,
             localDestinationChecksum: sha1Hex(RetryOwnershipURLProtocol.payload),
             deleteAfterImport: true, metadataStore: store,
             isImported: {
+                if await retryPhase.value() { return importedResult }
                 entered.fulfill()
                 await gate.wait()
                 return importedResult
@@ -430,6 +439,49 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         }
         XCTAssertTrue(error is CancellationError,
             "Expected cancellation progress, got \(String(describing: error))")
+        if retryAfterCancellation {
+            await retryPhase.markCompleted()
+            let retried = expectation(description: "Fresh ensure after cancellation settles")
+            let retry = Task {
+                defer { retried.fulfill() }
+                await controller.ensureDownloaded(download: download)
+            }
+            let retryCompletion = await XCTWaiter.fulfillment(of: [retried], timeout: 5)
+            if retryCompletion != .completed {
+                retry.cancel()
+                await controller.cancelInProgressDownload(download)
+                await gate.release()
+                session.invalidateAndCancel()
+            }
+            await retry.value
+            XCTAssertEqual(retryCompletion, .completed)
+            guard case let .completed(retryDestination, retryETag, retryError) = download.downloadProgress else {
+                return XCTFail("Successful derived-state retry must publish completed progress")
+            }
+            XCTAssertEqual(retryDestination, destination)
+            XCTAssertEqual(retryETag, "original-etag")
+            XCTAssertNil(retryError)
+            XCTAssertNil(download.failureMessage)
+            XCTAssertEqual(download.fractionCompleted, 1)
+            XCTAssertFalse(download.isFailed)
+            XCTAssertFalse(download.isActive)
+            XCTAssertTrue(download.isFinishedDownloading)
+            XCTAssertTrue(download.isFinishedProcessing)
+            XCTAssertFalse(controller.failedDownloads.contains(download))
+            XCTAssertFalse(controller.activeDownloads.contains(download))
+            XCTAssertTrue(controller.finishedDownloads.contains(download))
+            XCTAssertEqual(RetryOwnershipURLProtocol.requests.count(for: source), 0)
+            let importerRanAfterRetry = await imported.value()
+            XCTAssertFalse(importerRanAfterRetry)
+            XCTAssertEqual(try Data(contentsOf: destination), Data())
+            XCTAssertFalse(FileManager.default.fileExists(atPath: download.checksumVerificationMarkerURL.path))
+            XCTAssertNil(try store.installedArtifactReceipt(sourceURL: source, destinationURL: destination))
+            XCTAssertEqual(download.lastDownloaded, baselineDate)
+            XCTAssertEqual(download.lastDownloadedETag, "original-etag")
+            let persistedAfterRetry = store.loadMetadata(sourceURL: source, destinationURL: destination)
+            XCTAssertEqual(persistedAfterRetry.lastDownloadedAt, baselineDate)
+            XCTAssertEqual(persistedAfterRetry.lastDownloadedETag, "original-etag")
+        }
     }
 
     @MainActor

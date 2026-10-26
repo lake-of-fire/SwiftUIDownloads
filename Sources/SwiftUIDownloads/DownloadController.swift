@@ -3859,7 +3859,7 @@ extension DownloadController {
             await finishDownload(download, recordSuccessfulDownload: false)
             return
         }
-        try await MainActor.run { [weak self] in
+        try await MainActor.run {
             // Imported-state callbacks and the actor hop may outlive their
             // caller. Admit success only while that task and source still own it.
             try Task.checkCancellation()
@@ -3870,39 +3870,31 @@ extension DownloadController {
                     requiringFileOwnership.url
                 )
             }
-            download.isFailed = false
-            download.isActive = false
-            download.isFinishedDownloading = true
-            download.isFinishedProcessing = true
-            self?.failedDownloads.remove(download)
-            self?.activeDownloads.remove(download)
-            self?.finishedDownloads.insert(download)
-            self?.refreshPublishedDownloadState()
+            self.publishSuccessfulCompletion(download)
+            self.refreshPublishedDownloadState()
         }
     }
 
-    @DownloadActor
-    private func publishSuccessfulCompletion(_ download: Downloadable) async {
-        await MainActor.run { [weak self] in
-            self?.failedDownloads.remove(download)
-            self?.activeDownloads.remove(download)
-            self?.finishedDownloads.insert(download)
-            download.isFailed = false
-            download.isActive = false
-            download.isFinishedDownloading = true
-            download.isFinishedProcessing = true
-            // A successful retry supersedes every previous terminal error,
-            // including local-copy and standalone-finish failures.
-            download.downloadProgress = .completed(
-                destinationLocation: download.localDestination,
-                etag: download.lastDownloadedETag,
-                error: nil
-            )
-            if let importable = download as? ImportableDownloadable {
-                importable.lastImportError = nil
-                importable.importProgress = nil
-                importable.importStatusText = nil
-            }
+    @MainActor
+    private func publishSuccessfulCompletion(_ download: Downloadable) {
+        failedDownloads.remove(download)
+        activeDownloads.remove(download)
+        finishedDownloads.insert(download)
+        download.isFailed = false
+        download.isActive = false
+        download.isFinishedDownloading = true
+        download.isFinishedProcessing = true
+        // A successful retry supersedes every previous terminal error,
+        // including local-copy and standalone-finish failures.
+        download.downloadProgress = .completed(
+            destinationLocation: download.localDestination,
+            etag: download.lastDownloadedETag,
+            error: nil
+        )
+        if let importable = download as? ImportableDownloadable {
+            importable.lastImportError = nil
+            importable.importProgress = nil
+            importable.importStatusText = nil
         }
     }
 
