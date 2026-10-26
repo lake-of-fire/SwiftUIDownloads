@@ -3354,6 +3354,7 @@ extension DownloadController {
         }
 
         var finishStartedWithCompressedFile = false
+        var processingFileOwnership: (url: URL, identity: ChecksumVerificationFileIdentity)?
         do {
             try Task.checkCancellation()
             let alreadyFinished = await MainActor.run {
@@ -3438,6 +3439,18 @@ extension DownloadController {
             }
 
             try Task.checkCancellation()
+            let processingAttributes: [FileAttributeKey: Any]
+            do {
+                processingAttributes = try FileManager.default.attributesOfItem(
+                    atPath: processingFileURL.path
+                )
+            } catch {
+                throw DownloadLocalFileInspectionError(url: processingFileURL, underlyingError: error)
+            }
+            guard let processingIdentity = checksumVerificationFileIdentity(from: processingAttributes) else {
+                throw DownloadableChecksumVerificationError.emptyFile(processingFileURL)
+            }
+            processingFileOwnership = (processingFileURL, processingIdentity)
             let verifiesStagedCandidate = stagedUncompressedFileURL != nil
             let checksumTask = Task.detached(priority: .utility) {
                 () throws -> ChecksumVerificationFileIdentity? in
@@ -3456,6 +3469,7 @@ extension DownloadController {
                 checksumTask.cancel()
             })
             try Task.checkCancellation()
+            try download.requireFileIdentity(processingIdentity, at: processingFileURL)
 
             if let importable = download as? ImportableDownloadable {
                 try Task.checkCancellation()
@@ -3486,6 +3500,10 @@ extension DownloadController {
                     }
                 }
                 try await withTaskCancellationHandler(operation: {
+                    // Import-status observers run on MainActor and may have
+                    // replaced the path during that publication await.
+                    try Task.checkCancellation()
+                    try download.requireFileIdentity(processingIdentity, at: processingFileURL)
                     try await importable.importHandler(
                         processingFileURL,
                         progressHandler
@@ -3498,6 +3516,10 @@ extension DownloadController {
                 try Task.checkCancellation()
             }
 
+            // A retained source has the same ownership requirement as a
+            // staged candidate. Import may suspend while another process
+            // replaces the path; that replacement was never imported here.
+            try download.requireFileIdentity(processingIdentity, at: processingFileURL)
             if let stagedUncompressedFileURL {
                 try Task.checkCancellation()
                 guard processingTasks[download.id]?.id == processingTaskID else {
@@ -3656,7 +3678,18 @@ extension DownloadController {
                 }
                 return
             }
+            let lostInstalledFileOwnership: Bool = {
+                guard let ownership = processingFileOwnership,
+                      ownership.url == download.localDestination else { return false }
+                do {
+                    try download.requireFileIdentity(ownership.identity, at: ownership.url)
+                    return false
+                } catch {
+                    return true
+                }
+            }()
             if requiresCleanChecksumRedownload(error)
+                && !lostInstalledFileOwnership
                 && download.localDestinationChecksum != nil
                 && (!finishStartedWithCompressedFile
                     || transferredCompressedFileURL != nil)
@@ -3696,6 +3729,7 @@ extension DownloadController {
                 let preservesInstalledDestination =
                     stagedUncompressedFileURL != nil
                     || finishStartedWithCompressedFile
+                    || lostInstalledFileOwnership
                 if processingTasks[download.id]?.id == processingTaskID {
                     try? removeAllLocalArtifacts(
                         for: download,
@@ -3711,6 +3745,7 @@ extension DownloadController {
             let preservesInstalledDestination =
                 stagedUncompressedFileURL != nil
                 || finishStartedWithCompressedFile
+                || lostInstalledFileOwnership
             let shouldDeleteLocal = (
                 error is DownloadLocalFileInspectionError
                     || error is DownloadCompressedPayloadValidationError
@@ -3718,6 +3753,18 @@ extension DownloadController {
                 ? false
                 : (download as? ImportableDownloadable)?.deleteAfterImport
                     ?? true
+            // Keep ownership inspection and cleanup on this actor without a
+            // UI-publication await in between. A replacement arriving during
+            // that hop must not inherit the rejected source's cleanup.
+            try? FileManager.default.removeItem(at: download.compressedFileURL)
+            if shouldDeleteLocal && !preservesInstalledDestination {
+                try? FileManager.default.removeItem(at: download.localDestination)
+                pendingInstalledArtifactReceipts[download.id] = nil
+                try? download.removeInstalledArtifactReceipt()
+            }
+            if !preservesInstalledDestination {
+                try? FileManager.default.removeItem(at: download.checksumVerificationMarkerURL)
+            }
             await MainActor.run { [weak self] in
                 if let importable = download as? ImportableDownloadable {
                     importable.lastImportError = error
@@ -3730,21 +3777,6 @@ extension DownloadController {
                 download.isActive = false
                 download.isFinishedDownloading = false
                 download.isFinishedProcessing = true
-                try? FileManager.default.removeItem(at: download.compressedFileURL)
-                if shouldDeleteLocal && !preservesInstalledDestination {
-                    try? FileManager.default.removeItem(at: download.localDestination)
-                }
-                if !preservesInstalledDestination {
-                    try? FileManager.default.removeItem(
-                        at: download.checksumVerificationMarkerURL
-                    )
-                }
-            }
-            if shouldDeleteLocal && !preservesInstalledDestination {
-                pendingInstalledArtifactReceipts[
-                    download.id
-                ] = nil
-                try? download.removeInstalledArtifactReceipt()
             }
             clearDownloadStatusObservers(forDownloadID: download.id)
         }
