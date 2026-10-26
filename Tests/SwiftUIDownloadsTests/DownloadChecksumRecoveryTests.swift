@@ -1,4 +1,5 @@
 import CryptoKit
+import Combine
 import XCTest
 import Brotli
 @testable import SwiftUIDownloads
@@ -36,6 +37,22 @@ private final class CorruptUncompressedUpdateURLProtocol: URLProtocol {
 
 private enum TestImportError: Error {
     case rejectedCandidate
+}
+
+private actor RetainedImportGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
 }
 
 private actor ChecksumRecoveryAttemptExecutor {
@@ -225,6 +242,173 @@ private actor AsyncCompletionFlag {
 }
 
 final class DownloadChecksumRecoveryTests: XCTestCase {
+    @MainActor
+    func testImportStatusReplacementIsRejectedBeforeImporterDispatch() async throws {
+        for checksum in [false, true] {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("import-status-replacement-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let original = Data("verified-local-source".utf8)
+            let replacement = Data("status-observer-replacement".utf8)
+            let destination = directory.appendingPathComponent("payload.bin")
+            try original.write(to: destination, options: .atomic)
+            let imported = AsyncCompletionFlag()
+            let download = ImportableDownloadable(
+                url: destination, name: "Status Replacement", localDestination: destination,
+                localDestinationChecksum: checksum ? sha1Hex(original) : nil,
+                deleteAfterImport: true, isImported: { false },
+                importHandler: { _, _ in await imported.markCompleted() })
+            var replaced = false
+            let subscription = download.$importStatusText.sink { status in
+                guard status == "Importing…", !replaced else { return }
+                do {
+                    try replacement.write(to: destination, options: .atomic)
+                    replaced = true
+                } catch { XCTFail("Unable to replace source during actual status publication: \(error)") }
+            }
+            defer { subscription.cancel() }
+            let session = URLSession(configuration: .ephemeral)
+            defer { session.invalidateAndCancel() }
+            let controller = DownloadController(session: session)
+            await controller.download(download)
+            let importerRan = await imported.value()
+            XCTAssertTrue(replaced, "The real Importing status observer must exercise the actor hop")
+            XCTAssertFalse(importerRan, "A source replaced before dispatch has no import admission")
+            XCTAssertTrue(download.isFailed)
+            XCTAssertFalse(download.isFinishedDownloading)
+            XCTAssertEqual(try Data(contentsOf: destination), replacement)
+        }
+    }
+
+    func testRetainedImportCannotCertifyReplacementWithoutChecksum() async throws {
+        try await exerciseRetainedImportReplacement(checksum: false, deleteAfterImport: false)
+    }
+
+    func testRetainedImportCannotCertifyReplacementWithChecksum() async throws {
+        try await exerciseRetainedImportReplacement(checksum: true, deleteAfterImport: false)
+    }
+
+    func testRetainedImportCannotDeleteReplacement() async throws {
+        for checksum in [false, true] {
+            try await exerciseRetainedImportReplacement(checksum: checksum, deleteAfterImport: true)
+        }
+    }
+
+    func testFailedRetainedImportPreservesReplacement() async throws {
+        for deleteAfterImport in [false, true] {
+            try await exerciseRetainedImportReplacement(checksum: false,
+                deleteAfterImport: deleteAfterImport, outcome: .failure)
+        }
+    }
+
+    func testCancelledRetainedImportPreservesReplacement() async throws {
+        for deleteAfterImport in [false, true] {
+            try await exerciseRetainedImportReplacement(checksum: false,
+                deleteAfterImport: deleteAfterImport, outcome: .cancellation)
+        }
+    }
+
+    func testUnchangedRetainedImportStillFinishesAndAppliesSourceRetention() async throws {
+        for checksum in [false, true] {
+            for deleteAfterImport in [false, true] {
+                try await exerciseRetainedImportReplacement(checksum: checksum,
+                    deleteAfterImport: deleteAfterImport, replacesSource: false)
+            }
+        }
+    }
+
+    private enum RetainedImportOutcome: Sendable { case success, failure, cancellation }
+
+    private func exerciseRetainedImportReplacement(
+        checksum: Bool, deleteAfterImport: Bool,
+        outcome: RetainedImportOutcome = .success, replacesSource: Bool = true
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("retained-import-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suite = "retained-import-metadata-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsDownloadableMetadataStore(userDefaults: defaults)
+        let original = Data("original-local-import".utf8)
+        let replacement = Data("replacement-local-source".utf8)
+        let destination = directory.appendingPathComponent("payload.bin")
+        try original.write(to: destination, options: .atomic)
+        let importStarted = expectation(description: "Actual importer read the retained source")
+        let gate = RetainedImportGate()
+        let download = ImportableDownloadable(
+            url: destination, name: "Retained Source", localDestination: destination,
+            localDestinationChecksum: checksum ? sha1Hex(original) : nil,
+            deleteAfterImport: deleteAfterImport, metadataStore: store,
+            isImported: { false }, importHandler: { source, _ in
+                XCTAssertEqual(try Data(contentsOf: source), original)
+                importStarted.fulfill()
+                await gate.wait()
+                if case .failure = outcome { throw TestImportError.rejectedCandidate }
+            })
+        await download.waitForDownloadMetadata()
+        let originalDownloadedAt = Date(timeIntervalSince1970: 123)
+        await MainActor.run {
+            download.lastDownloaded = originalDownloadedAt
+            download.lastDownloadedETag = "original-etag"
+        }
+        try await download.waitForDownloadMetadataPersistence()
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        // Source == destination exercises the production local transfer and
+        // unstaged finish path; no transfer or processor is substituted.
+        let task = Task { await controller.download(download, etag: "replacement-etag") }
+        addTeardownBlock {
+            task.cancel()
+            await gate.release()
+            await task.value
+        }
+        await fulfillment(of: [importStarted], timeout: 5)
+        if replacesSource {
+            try replacement.write(to: destination, options: .atomic)
+        }
+        if case .cancellation = outcome {
+            await controller.cancelInProgressDownload(download)
+        }
+        await gate.release()
+        await task.value
+        let state = await MainActor.run {
+            (download.isFailed, download.isFinishedDownloading,
+             download.isFinishedProcessing, download.lastDownloaded,
+             download.lastDownloadedETag, download.lastImportError)
+        }
+        if replacesSource {
+            XCTAssertEqual(try Data(contentsOf: destination), replacement,
+                "A processing result cannot delete or redownload another file's replacement")
+            XCTAssertTrue(state.0)
+            XCTAssertFalse(state.1)
+            XCTAssertEqual(state.3, originalDownloadedAt)
+            XCTAssertEqual(state.4, "original-etag")
+            XCTAssertNil(try store.installedArtifactReceipt(sourceURL: destination,
+                destinationURL: destination), "Unimported replacement bytes must not acquire a success receipt")
+            if case .success = outcome {
+                guard let error = state.5 as? DownloadableChecksumVerificationError,
+                      case .fileChangedDuringVerification = error else {
+                    return XCTFail("Expected original-file ownership rejection, got \(String(describing: state.5))")
+                }
+            }
+        } else {
+            XCTAssertFalse(state.0)
+            XCTAssertTrue(state.1)
+            XCTAssertTrue(state.2)
+            XCTAssertEqual(state.4, "replacement-etag")
+            XCTAssertEqual(FileManager.default.fileExists(atPath: destination.path), !deleteAfterImport)
+            if !deleteAfterImport {
+                XCTAssertEqual(try Data(contentsOf: destination), original)
+                XCTAssertNotNil(try store.installedArtifactReceipt(sourceURL: destination,
+                    destinationURL: destination))
+            }
+        }
+    }
+
 
     func testEmptyCompressedReplacementCannotInheritPriorImportSuccess() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
