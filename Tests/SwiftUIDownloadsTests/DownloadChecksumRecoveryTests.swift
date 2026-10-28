@@ -307,7 +307,174 @@ private actor AsyncCompletionFlag {
     func value() -> Bool { completed }
 }
 
+private actor FinalCompletionImportCounter {
+    private var count = 0
+    func recordImport() { count += 1 }
+    func value() -> Int { count }
+}
+
 final class DownloadChecksumRecoveryTests: XCTestCase {
+    @MainActor
+    func testInstalledReceiptFileSizeObserverCancellationRetainsArtifactAndAllowsFreshRetry() async throws {
+        try await exerciseFinalFileSizeAdmission(ordinaryCompletion: false, replacesArtifact: false)
+    }
+
+    @MainActor
+    func testOrdinaryCompletionFileSizeObserverCancellationRetainsArtifactAndAllowsFreshRetry() async throws {
+        try await exerciseFinalFileSizeAdmission(ordinaryCompletion: true, replacesArtifact: false)
+    }
+
+    @MainActor
+    func testInstalledReceiptFileSizeObserverReplacementCannotPublishSuccessOrDeleteReplacement() async throws {
+        try await exerciseFinalFileSizeAdmission(ordinaryCompletion: false, replacesArtifact: true)
+    }
+
+    @MainActor
+    func testOrdinaryCompletionFileSizeObserverReplacementCannotRedownloadOrDeleteReplacement() async throws {
+        try await exerciseFinalFileSizeAdmission(ordinaryCompletion: true, replacesArtifact: true)
+    }
+
+    @MainActor
+    private func exerciseFinalFileSizeAdmission(
+        ordinaryCompletion: Bool, replacesArtifact: Bool
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("final-completion-admission-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suite = "final-completion-metadata-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = UserDefaultsDownloadableMetadataStore(userDefaults: defaults)
+        let source = URL(string: "https://retry-ownership.test/\(UUID().uuidString)/payload.bin")!
+        defer { RetryOwnershipURLProtocol.requests.remove(source) }
+        let destination = directory.appendingPathComponent("payload.bin")
+        let payload = Data("installed-completion-artifact".utf8)
+        let replacement = Data("independent-new-owner-artifact".utf8)
+        try payload.write(to: destination, options: .atomic)
+        let imports = FinalCompletionImportCounter()
+        let download = ImportableDownloadable(
+            url: source, name: "Final Completion Admission", localDestination: destination,
+            localDestinationChecksum: ordinaryCompletion ? sha1Hex(payload) : nil,
+            deleteAfterImport: false, metadataStore: store,
+            isImported: { true },
+            importHandler: { _, _ in await imports.recordImport() })
+        await download.waitForDownloadMetadata()
+        let baselineDate = Date(timeIntervalSince1970: 123)
+        download.lastDownloaded = baselineDate
+        download.lastDownloadedETag = "installed-etag"
+        download.shouldCheckForUpdates = false
+        try await download.waitForDownloadMetadataPersistence()
+        let receipt = try download.makeInstalledArtifactReceipt(finalResponseURL: source)
+        try download.persistInstalledArtifactReceipt(receipt)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RetryOwnershipURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        var operation: Task<Void, Never>?
+        var admissionCallbacks = 0
+        var permitsInterruption = true
+        var observerError: Error?
+        let subscription = download.$fileSize.sink { size in
+            guard size == UInt64(payload.count), permitsInterruption else { return }
+            permitsInterruption = false
+            admissionCallbacks += 1
+            if replacesArtifact {
+                do { try replacement.write(to: destination, options: .atomic) }
+                catch { observerError = error }
+            } else {
+                // This public Published callback runs synchronously during the
+                // final file-size publication. Retire the actual caller before
+                // that publication returns to the processing owner.
+                operation?.cancel()
+            }
+        }
+        defer { subscription.cancel() }
+        let settled = expectation(description: "Final completion admission settles")
+        operation = Task {
+            defer { settled.fulfill() }
+            await controller.finishDownload(download, recordSuccessfulDownload: false)
+        }
+        let completion = await XCTWaiter.fulfillment(of: [settled], timeout: 5)
+        if completion != .completed {
+            operation?.cancel()
+            await controller.cancelInProgressDownload(download)
+            session.invalidateAndCancel()
+        }
+        await operation?.value
+        XCTAssertEqual(completion, .completed)
+        XCTAssertNil(observerError)
+        XCTAssertEqual(admissionCallbacks, 1, "The actual public file-size callback must be exercised")
+        XCTAssertEqual(try Data(contentsOf: destination), replacesArtifact ? replacement : payload)
+        XCTAssertEqual(RetryOwnershipURLProtocol.requests.count(for: source), 0)
+        let initialImports = await imports.value()
+        XCTAssertEqual(initialImports, ordinaryCompletion ? 1 : 0,
+            "Ordinary processing imports once; final rejection must not start another import")
+        XCTAssertTrue(download.isFailed)
+        XCTAssertFalse(download.isActive)
+        XCTAssertFalse(download.isFinishedDownloading)
+        XCTAssertFalse(controller.finishedDownloads.contains(download))
+        XCTAssertTrue(controller.failedDownloads.contains(download))
+        XCTAssertEqual(download.lastDownloaded, baselineDate)
+        XCTAssertEqual(download.lastDownloadedETag, "installed-etag")
+        let persisted = store.loadMetadata(sourceURL: source, destinationURL: destination)
+        XCTAssertEqual(persisted.lastDownloadedAt, baselineDate)
+        XCTAssertEqual(persisted.lastDownloadedETag, "installed-etag")
+
+        if replacesArtifact {
+            // Atomic replacement gives the second artifact its own inode. The
+            // old operation cannot claim success even though the path exists.
+            guard case let .completed(_, _, error) = download.downloadProgress else {
+                return XCTFail("Ownership loss must publish terminal error progress")
+            }
+            XCTAssertNotNil(error)
+            XCTAssertFalse(error is CancellationError, "Physical replacement is not caller cancellation")
+            return
+        }
+        XCTAssertFalse(download.isFinishedProcessing)
+        guard case let .completed(_, _, error) = download.downloadProgress else {
+            return XCTFail("Cancelled final completion must publish terminal cancellation")
+        }
+        XCTAssertTrue(error is CancellationError)
+        let retainedReceipt = try store.installedArtifactReceipt(sourceURL: source, destinationURL: destination)
+        XCTAssertNotNil(retainedReceipt)
+        XCTAssertTrue(download.installedArtifactMatches(try XCTUnwrap(retainedReceipt)))
+        if !ordinaryCompletion { XCTAssertEqual(retainedReceipt, receipt) }
+        if ordinaryCompletion { XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker()) }
+
+        // The successor runs in a fresh Task, with the one-shot interruption
+        // disarmed. Both paths reuse local bytes without GET; ordinary processing
+        // deliberately invokes its importer again, while receipt reuse skips it.
+        let retried = expectation(description: "Fresh completion retry settles")
+        let retry = Task {
+            defer { retried.fulfill() }
+            await controller.finishDownload(download, recordSuccessfulDownload: false)
+        }
+        let retryCompletion = await XCTWaiter.fulfillment(of: [retried], timeout: 5)
+        if retryCompletion != .completed {
+            retry.cancel()
+            await controller.cancelInProgressDownload(download)
+            session.invalidateAndCancel()
+        }
+        await retry.value
+        XCTAssertEqual(retryCompletion, .completed)
+        XCTAssertFalse(download.isFailed)
+        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertTrue(controller.finishedDownloads.contains(download))
+        XCTAssertFalse(controller.failedDownloads.contains(download))
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertEqual(RetryOwnershipURLProtocol.requests.count(for: source), 0)
+        let importsAfterRetry = await imports.value()
+        XCTAssertEqual(importsAfterRetry, ordinaryCompletion ? 2 : 0,
+            "Only the explicit ordinary retry may perform its second import")
+        guard case let .completed(location, _, retryError) = download.downloadProgress else {
+            return XCTFail("Successful retry must replace terminal cancellation progress")
+        }
+        XCTAssertEqual(location, destination)
+        XCTAssertNil(retryError)
+    }
+
     @MainActor
     func testCallerCancellationDuringEmptySourceImportedCallbackCannotPublishSuccess() async throws {
         for importedResult in [false, true] {

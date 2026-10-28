@@ -16,6 +16,13 @@ private struct ChecksumVerificationMarker: Codable {
     let fileSystemFileNumber: UInt64?
 }
 
+/// Final UI admission lost the artifact already validated by this processor.
+/// This must preserve the replacement instead of entering checksum recovery.
+private struct DownloadFinalCompletionSourceChanged: LocalizedError {
+    let url: URL
+    var errorDescription: String? { "The installed download changed before completion: \(url.lastPathComponent)" }
+}
+
 fileprivate struct ChecksumVerificationFileIdentity: Equatable, Sendable {
     let fileSize: UInt64
     let modificationTimeIntervalSince1970: TimeInterval
@@ -3262,6 +3269,7 @@ extension DownloadController {
                 } else {
                     false
                 }
+                var completionReceipt: InstalledArtifactReceipt?
                 if !importDeletedSource {
                     if let pendingReceipt = pendingInstalledArtifactReceipts[receiptKey] {
                         guard download.installedArtifactMatches(pendingReceipt.receipt) else {
@@ -3271,9 +3279,13 @@ extension DownloadController {
                         try download.persistInstalledArtifactReceipt(
                             pendingReceipt.receipt
                         )
-                    } else if download.validInstalledArtifactReceipt() == nil {
-                        throw InstalledArtifactReceiptValidationError
-                            .missingOrInvalid(download.localDestination)
+                        completionReceipt = pendingReceipt.receipt
+                    } else {
+                        guard let receipt = download.validInstalledArtifactReceipt() else {
+                            throw InstalledArtifactReceiptValidationError
+                                .missingOrInvalid(download.localDestination)
+                        }
+                        completionReceipt = receipt
                     }
                 }
                 let metadata = download.cachedDownloadMetadata
@@ -3302,9 +3314,9 @@ extension DownloadController {
                 guard processingTasks[download.id]?.id == processingTaskID else {
                     throw CancellationError()
                 }
+                try await publishSuccessfulCompletion(download, requiringInstalledArtifact: completionReceipt)
                 completionMetadataRetryDownloadIDs.remove(download.id)
                 pendingInstalledArtifactReceipts[receiptKey] = nil
-                await publishSuccessfulCompletion(download)
                 checksumRedownloadAttempted.remove(download.id)
                 clearDownloadStatusObservers(forDownloadID: download.id)
             } catch {
@@ -3317,7 +3329,9 @@ extension DownloadController {
                             download.id
                         ] = nil
                     }
-                    await publishProcessingFailure(error, for: download)
+                    await publishProcessingFailure(error, for: download,
+                        statusText: error is DownloadFinalCompletionSourceChanged
+                            ? "Download changed before completion" : "Saving download metadata failed")
                 }
             }
             return
@@ -3342,12 +3356,25 @@ extension DownloadController {
                 try? FileManager.default.removeItemIfPresent(
                     at: download.compressedFileURL
                 )
-                await MainActor.run {
-                    download.fileSize = existingInstalledArtifactReceipt.byteCount
+                do {
+                    await MainActor.run {
+                        download.fileSize = existingInstalledArtifactReceipt.byteCount
+                    }
+                    try await publishSuccessfulCompletion(download,
+                        requiringInstalledArtifact: existingInstalledArtifactReceipt)
+                    clearDownloadStatusObservers(forDownloadID: download.id)
+                } catch {
+                    // Final rejection settles this owner without deleting the
+                    // installed artifact (including a replacement) or falling
+                    // through to another import.
+                    if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                        await markDownloadCancelled(download, error: error)
+                    } else {
+                        await publishProcessingFailure(error, for: download,
+                            statusText: "Download changed before completion")
+                    }
                 }
-                await publishSuccessfulCompletion(download)
                 checksumRedownloadAttempted.remove(download.id)
-                clearDownloadStatusObservers(forDownloadID: download.id)
                 return
             }
             // A completed installed receipt supersedes any leftover transfer
@@ -3685,6 +3712,7 @@ extension DownloadController {
                 try download.persistInstalledArtifactReceipt(receipt)
             }
 //              print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
+            let completionReceipt = pendingInstalledArtifactReceipts[receiptKey]?.receipt
             let successfulMetadata = pendingInstalledArtifactReceipts[
                 receiptKey
             ]?.successfulDownloadMetadata
@@ -3725,11 +3753,11 @@ extension DownloadController {
                     throw CancellationError()
                 }
             }
+            try await publishSuccessfulCompletion(download, requiringInstalledArtifact: completionReceipt)
             completionMetadataRetryDownloadIDs.remove(download.id)
             pendingInstalledArtifactReceipts[
                 download.id
             ] = nil
-            await publishSuccessfulCompletion(download)
             checksumRedownloadAttempted.remove(download.id)
             clearDownloadStatusObservers(forDownloadID: download.id)
         } catch {
@@ -3744,6 +3772,7 @@ extension DownloadController {
                 return
             }
             let lostInstalledFileOwnership: Bool = {
+                if error is DownloadFinalCompletionSourceChanged { return true }
                 guard let ownership = processingFileOwnership,
                       ownership.url == download.localDestination else { return false }
                 do {
@@ -3792,6 +3821,14 @@ extension DownloadController {
                 return
             }
             checksumRedownloadAttempted.remove(download.id)
+            if error is DownloadFinalCompletionSourceChanged {
+                // The final publisher rejected a different installed artifact.
+                // Preserve it and report a coherent terminal error, rather than
+                // letting generic cleanup or old progress claim completion.
+                await publishProcessingFailure(error, for: download,
+                    statusText: "Download changed before completion")
+                return
+            }
             if error is CancellationError || (error as? URLError)?.code == .cancelled {
                 let preservesInstalledDestination =
                     stagedUncompressedFileURL != nil
@@ -3870,13 +3907,38 @@ extension DownloadController {
                     requiringFileOwnership.url
                 )
             }
-            self.publishSuccessfulCompletion(download)
+            try self.publishSuccessfulCompletion(download)
             self.refreshPublishedDownloadState()
         }
     }
 
     @MainActor
-    private func publishSuccessfulCompletion(_ download: Downloadable) {
+    private func publishSuccessfulCompletion(
+        _ download: Downloadable,
+        requiringInstalledArtifact receipt: InstalledArtifactReceipt? = nil
+    ) throws {
+        // Every caller, including ordinary completion, can be cancelled while
+        // waiting for MainActor. Admit success here, immediately before its
+        // synchronous effects, so the existing processing owner settles rejection.
+        try Task.checkCancellation()
+        if let receipt {
+            let identity = ChecksumVerificationFileIdentity(
+                fileSize: receipt.byteCount,
+                modificationTimeIntervalSince1970: receipt.modificationTimeIntervalSince1970,
+                fileSystemNumber: receipt.fileSystemNumber,
+                fileSystemFileNumber: receipt.fileSystemFileNumber)
+            guard receipt.requestedSourceURL == standardizedArtifactSourceURL(download.url),
+                  receipt.destinationURL == download.localDestination.standardizedFileURL else {
+                throw DownloadFinalCompletionSourceChanged(url: download.localDestination)
+            }
+            do {
+                try download.requireFileIdentity(identity, at: receipt.destinationURL)
+            } catch {
+                throw DownloadFinalCompletionSourceChanged(url: receipt.destinationURL)
+            }
+        }
+        // A concurrent caller may cancel while the synchronous stat runs.
+        try Task.checkCancellation()
         failedDownloads.remove(download)
         activeDownloads.remove(download)
         finishedDownloads.insert(download)
