@@ -51,6 +51,22 @@ final class DownloadOrphanControllerTests: XCTestCase {
         return url
     }
 
+    func testOrphanCleanupDoesNotStartAfterBackgroundDrain() async throws {
+        let fixture = try fixture()
+        let stale = try write("stale.bin", in: fixture.root)
+        await fixture.controller.cancelAndDrainForBackgrounding()
+        do {
+            try await fixture.controller.deleteOrphanFiles(in: [fixture.location])
+            XCTFail("Cleanup must remain suspended")
+        } catch is CancellationError {
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stale.path))
+
+        await fixture.controller.resumeAfterBackgroundDrain(shouldResume: { true })
+        try await fixture.controller.deleteOrphanFiles(in: [fixture.location])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path))
+    }
+
     func testExcludedDescriptorThroughAliasRetainsInstalledBytesAndGeneratedTree() async throws {
         let fixture = try fixture()
         let payload = try write("physical/book.txt", in: fixture.root)

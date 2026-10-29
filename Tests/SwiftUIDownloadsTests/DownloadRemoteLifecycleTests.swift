@@ -1,5 +1,26 @@
+import CryptoKit
 import XCTest
+import SwiftUtilities
 @testable import SwiftUIDownloads
+
+private final class InvalidMetadataHEADURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let kind = request.url!.lastPathComponent
+        var headers = ["Content-Length": "123", "ETag": "untrusted-fragment",
+                       "Last-Modified": "Wed, 01 Jan 2031 00:00:00 GMT"]
+        if kind == "range" { headers["Content-Range"] = "bytes 0-122/1000" }
+        if kind == "multipart" { headers["Content-Type"] = "multipart/byteranges; boundary=part" }
+        let response = HTTPURLResponse(url: request.url!, statusCode: Int(kind) ?? 200,
+            httpVersion: "HTTP/1.1", headerFields: headers)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
 
 private final class UnavailableHEADURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -200,6 +221,50 @@ private actor EmptyCompressedRemoteAttemptExecutor {
     func count() -> Int { invocationCount }
 }
 
+private actor SuspendedTransferAttemptExecutor {
+    private var count = 0
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    let started: XCTestExpectation
+    let restarted: XCTestExpectation
+
+    init(started: XCTestExpectation, restarted: XCTestExpectation) {
+        self.started = started
+        self.restarted = restarted
+    }
+
+    func execute(download: Downloadable) async throws -> DownloadTransferResult {
+        count += 1
+        if count == 1 {
+            await withCheckedContinuation { continuation in
+                releaseContinuation = continuation
+                started.fulfill()
+            }
+            try Task.checkCancellation()
+        }
+        restarted.fulfill()
+        try Data("foreground-retry".utf8).write(to: download.localDestination)
+        return DownloadTransferResult(destinationLocation: download.localDestination, etag: nil, lastModified: nil)
+    }
+
+    func releaseCanceledTransfer() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+
+    func attemptCount() -> Int { count }
+}
+
+private actor InterruptedThenSuccessfulAttemptExecutor {
+    private var count = 0
+
+    func execute(download: Downloadable) throws -> DownloadTransferResult {
+        count += 1
+        if count == 1 { throw CancellationError() }
+        try Data("recovered-download".utf8).write(to: download.localDestination)
+        return DownloadTransferResult(destinationLocation: download.localDestination, etag: nil, lastModified: nil)
+    }
+}
+
 private actor SuccessfulRemoteAttemptExecutor {
     private let etag: String?
     private let lastModified: Date?
@@ -348,6 +413,325 @@ private struct ValidatorMetadataStore: DownloadableMetadataStore {
 
 final class DownloadRemoteLifecycleTests: XCTestCase {
 
+    @MainActor
+    func testAssuredDownloadRechecksExpiredOrMissingRemoteCheck() async throws {
+        let previousChecks: [Date?] = [Date(timeIntervalSinceNow: -3 * 60 * 60), nil]
+        for previousCheck in previousChecks {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("assured-update-\(UUID())", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let destination = directory.appendingPathComponent("payload.bin")
+            let installed = Data("installed-a".utf8)
+            let replacement = Data("remote-b".utf8)
+            try installed.write(to: destination)
+            let download = Downloadable(
+                url: URL(string: "https://assured-update.test/payload.bin")!,
+                name: "Assured update", localDestination: destination,
+                metadataStore: ValidatorMetadataStore(backing: ValidatorMetadataBacking(loadFailureCount: 0))
+            )
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
+            let session = URLSession(configuration: configuration)
+            defer { session.invalidateAndCancel() }
+            let attempts = SuccessfulRemoteAttemptExecutor(etag: "remote-b", payload: replacement)
+            let controller = DownloadController(session: session, attemptExecutor: { download, session in
+                try await attempts.execute(download: download, session: session)
+            })
+
+            await controller.finishDownload(download, etag: "installed-a")
+            download.lastCheckedETagAt = Date()
+            await controller.ensureDownloaded(download: download)
+            XCTAssertTrue(controller.assuredDownloads.contains(download))
+            XCTAssertEqual(try Data(contentsOf: destination), installed)
+            let recentCheckCount = await attempts.count()
+            XCTAssertEqual(recentCheckCount, 0, "A recent check must retain the installed artifact")
+
+            download.lastCheckedETagAt = previousCheck
+            download.shouldCheckForUpdates = false
+            await controller.ensureDownloaded(download: download)
+            let disabledCheckCount = await attempts.count()
+            XCTAssertEqual(disabledCheckCount, 0, "Disabled update checks must remain disabled")
+
+            download.shouldCheckForUpdates = true
+            await controller.ensureDownloaded(download: download)
+            let updateCount = await attempts.count()
+            XCTAssertEqual(updateCount, 1, "Prior assurance must not suppress a due update check")
+            XCTAssertEqual(try Data(contentsOf: destination), replacement)
+            XCTAssertEqual(download.lastDownloadedETag, "remote-b")
+            XCTAssertNotNil(download.lastCheckedETagAt)
+            XCTAssertTrue(download.isFinishedProcessing)
+        }
+    }
+
+    @MainActor
+    func testStaleBackgroundDownloadNotificationLeavesAdmissionOpen() async {
+        let controller = DownloadController()
+        await controller.handleAppLifecycleNotification(.background) { false }
+        let suspended = await controller.backgroundWorkIsSuspended
+        XCTAssertFalse(suspended)
+    }
+
+    @MainActor
+    func testOlderDownloadPauseCannotOverrideNewerActivation() async throws {
+        let controller = DownloadController()
+        let source = AppLifecycleNotificationSource()
+        let pause = try XCTUnwrap(source.notification(for: .background) { true })
+        let activation = try XCTUnwrap(source.notification(for: .active) { true })
+        await controller.applyAppLifecycleNotification(activation)
+        await controller.applyAppLifecycleNotification(pause)
+        let suspended = await controller.backgroundWorkIsSuspended
+        XCTAssertFalse(suspended)
+    }
+
+    @MainActor
+    func testOlderDownloadActivationCannotReopenNewerPause() async throws {
+        let controller = DownloadController()
+        let source = AppLifecycleNotificationSource()
+        let activation = try XCTUnwrap(source.notification(for: .active) { true })
+        let pause = try XCTUnwrap(source.notification(for: .background) { true })
+        await controller.applyAppLifecycleNotification(pause)
+        await controller.applyAppLifecycleNotification(activation)
+        let suspended = await controller.backgroundWorkIsSuspended
+        XCTAssertTrue(suspended)
+    }
+
+    @MainActor
+    func testDownloadLifecycleRechecksStateAfterActorHop() async {
+        let controller = DownloadController()
+        var checks = 0
+        await controller.handleAppLifecycleNotification(.background) {
+            checks += 1
+            return checks == 1
+        }
+        let suspended = await controller.backgroundWorkIsSuspended
+        XCTAssertFalse(suspended, "A background result that became stale during delivery cannot close admission")
+    }
+
+    @MainActor
+    func testCancelledDownloadNotificationCannotPauseWork() async {
+        let controller = DownloadController()
+        let notification = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            await controller.handleAppLifecycleNotification(.background) { true }
+        }
+        await notification.value
+        let suspended = await controller.backgroundWorkIsSuspended
+        XCTAssertFalse(suspended)
+    }
+
+    @MainActor
+    func testCurrentDownloadNotificationsPauseThenReopenAdmission() async {
+        let controller = DownloadController()
+        await controller.handleAppLifecycleNotification(.background) { true }
+        let paused = await controller.backgroundWorkIsSuspended
+        XCTAssertTrue(paused)
+        await controller.handleAppLifecycleNotification(.active) { true }
+        let resumed = await controller.backgroundWorkIsSuspended
+        XCTAssertFalse(resumed)
+    }
+
+    @MainActor
+    func testDownloadNotificationsRecoverInterruptedTransferAndRejectOldPause() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let started = expectation(description: "transfer held during cancellation cleanup")
+        let restarted = expectation(description: "transfer restarted after current activation")
+        let executor = SuspendedTransferAttemptExecutor(started: started, restarted: restarted)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            try await executor.execute(download: download)
+        })
+        let download = Downloadable(
+            url: URL(string: "https://notification-recovery.test/payload.bin")!,
+            name: "Notification recovery",
+            localDestination: directory.appendingPathComponent("payload.bin")
+        )
+        let original = Task { await controller.download(download) }
+        await fulfillment(of: [started], timeout: 3)
+        let source = AppLifecycleNotificationSource()
+        let pause = try XCTUnwrap(source.notification(for: .background) { true })
+        await controller.applyAppLifecycleNotification(pause)
+        let activation = try XCTUnwrap(source.notification(for: .active) { true })
+        let foreground = Task {
+            await controller.applyAppLifecycleNotification(activation)
+        }
+        await executor.releaseCanceledTransfer()
+        await original.value
+        await foreground.value
+        await fulfillment(of: [restarted], timeout: 3)
+        await controller.applyAppLifecycleNotification(pause)
+
+        let suspended = await controller.backgroundWorkIsSuspended
+        let attempts = await executor.attemptCount()
+        let state = await MainActor.run { (download.isFinishedProcessing, download.isFailed) }
+        XCTAssertFalse(suspended)
+        XCTAssertEqual(attempts, 2)
+        XCTAssertTrue(state.0)
+        XCTAssertFalse(state.1)
+        XCTAssertEqual(try Data(contentsOf: download.localDestination), Data("foreground-retry".utf8))
+    }
+
+    @MainActor
+    func testSupersededDownloadPausePreservesInFlightTransfer() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let started = expectation(description: "original transfer started")
+        let completed = expectation(description: "original transfer completed")
+        let executor = SuspendedTransferAttemptExecutor(started: started, restarted: completed)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            try await executor.execute(download: download)
+        })
+        let download = Downloadable(
+            url: URL(string: "https://notification-recovery.test/payload.bin")!,
+            name: "Obsolete pause",
+            localDestination: directory.appendingPathComponent("payload.bin")
+        )
+        let original = Task { await controller.download(download) }
+        await fulfillment(of: [started], timeout: 3)
+        let source = AppLifecycleNotificationSource()
+        let pause = try XCTUnwrap(source.notification(for: .background) { true })
+        let activation = try XCTUnwrap(source.notification(for: .active) { true })
+        // Foreground was published before the component received background.
+        // That obsolete delivery must not interrupt an otherwise valid transfer.
+        await controller.applyAppLifecycleNotification(pause)
+        let suspended = await controller.backgroundWorkIsSuspended
+        XCTAssertFalse(suspended)
+        let foreground = Task {
+            await controller.applyAppLifecycleNotification(activation)
+        }
+        await executor.releaseCanceledTransfer()
+        await original.value
+        await foreground.value
+        await fulfillment(of: [completed], timeout: 3)
+
+        let attempts = await executor.attemptCount()
+        XCTAssertEqual(attempts, 1)
+        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertFalse(download.isFailed)
+        XCTAssertEqual(try Data(contentsOf: download.localDestination), Data("foreground-retry".utf8))
+    }
+
+    func testPinnedArtifactSurvivesMissingOrChangedHTTPValidatorWithoutReplacement() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pinned-artifact-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = Data("verified-dictionary".utf8)
+        let checksum = Insecure.SHA1.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+
+        let installedETags: [String?] = [nil, "obsolete-validator"]
+        for hasMarker in [false, true] {
+            for installedETag in installedETags {
+                let destination = directory.appendingPathComponent(UUID().uuidString + ".realm")
+                try payload.write(to: destination)
+                let initialAttributes = try FileManager.default.attributesOfItem(atPath: destination.path)
+                let download = Downloadable(
+                    url: URL(string: "https://pinned-artifact.test/\(UUID()).realm")!,
+                    name: "Pinned dictionary", localDestination: destination,
+                    localDestinationChecksum: checksum,
+                    metadataStore: ValidatorMetadataStore(backing: ValidatorMetadataBacking(
+                        metadata: DownloadMetadata(lastDownloadedETag: installedETag), loadFailureCount: 0
+                    ))
+                )
+                if hasMarker { try download.ensureVerifiedLocalDestinationChecksum() }
+                let configuration = URLSessionConfiguration.ephemeral
+                configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
+                let session = URLSession(configuration: configuration)
+                defer { session.invalidateAndCancel() }
+                let attempts = SuccessfulRemoteAttemptExecutor(etag: "remote-b", payload: payload)
+                let controller = DownloadController(session: session, attemptExecutor: { download, session in
+                    try await attempts.execute(download: download, session: session)
+                })
+
+                await controller.ensureDownloaded(download: download)
+
+                let count = await attempts.count()
+                XCTAssertEqual(count, 0, "Verified pinned bytes must survive HTTP validator drift")
+                XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+                XCTAssertEqual(try Data(contentsOf: destination), payload)
+                let finalAttributes = try FileManager.default.attributesOfItem(atPath: destination.path)
+                XCTAssertEqual(finalAttributes[.systemFileNumber] as? NSNumber,
+                               initialAttributes[.systemFileNumber] as? NSNumber)
+                let state = await MainActor.run {
+                    (download.isFinishedProcessing, download.lastDownloadedETag, download.lastCheckedETagAt)
+                }
+                XCTAssertTrue(state.0)
+                XCTAssertEqual(state.1, installedETag)
+                XCTAssertNil(state.2, "A skipped remote check must not manufacture HTTP metadata")
+            }
+        }
+    }
+
+    func testPinnedArtifactStillRepairsCorruptionBeforeSkippingRemoteCheck() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pinned-repair-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = Data("verified-dictionary".utf8)
+        let checksum = Insecure.SHA1.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+        let destination = directory.appendingPathComponent("dictionary.realm")
+        try Data("corrupt-dictionary".utf8).write(to: destination)
+        let download = Downloadable(
+            url: URL(string: "https://pinned-repair.test/\(UUID()).realm")!,
+            name: "Pinned repair", localDestination: destination,
+            localDestinationChecksum: checksum,
+            metadataStore: ValidatorMetadataStore(backing: ValidatorMetadataBacking(loadFailureCount: 0))
+        )
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ETagOnlyHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let attempts = SuccessfulRemoteAttemptExecutor(etag: "repaired", payload: payload)
+        let controller = DownloadController(session: session, attemptExecutor: { download, session in
+            try await attempts.execute(download: download, session: session)
+        })
+
+        await controller.ensureDownloaded(download: download)
+
+        let count = await attempts.count()
+        XCTAssertEqual(count, 1, "Repair must still replace corrupt pinned bytes exactly once")
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+    }
+
+    func testInvalidHEADResponseCannotPublishFileSizeOrUpdateValidators() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [InvalidMetadataHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+
+        for kind in ["404", "503", "206", "range", "multipart"] {
+            let download = Downloadable(
+                url: URL(string: "https://metadata-head.test/\(UUID())/\(kind)")!,
+                name: "Invalid metadata response",
+                localDestination: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("missing-\(UUID())")
+            )
+            await MainActor.run { download.fileSize = 456 }
+            do {
+                try await download.fetchRemoteFileSize(session: session)
+                XCTFail("Accepted invalid HEAD response: \(kind)")
+            } catch {
+                XCTAssertTrue(error is URLResourceDownloadHTTPError || error is DownloadResponseAdmissionError,
+                    "Unexpected failure for \(kind): \(error)")
+            }
+            let fileSize = await MainActor.run { download.fileSize }
+            XCTAssertEqual(fileSize, 456, "Invalid HEAD must preserve existing size for \(kind)")
+            let result = await controller.checkRemoteModification(for: download)
+            guard case .unavailable = result else {
+                XCTFail("Invalid HEAD validators admitted for \(kind)")
+                continue
+            }
+        }
+    }
+
     func testRemoteFileSizeLeavesUnknownContentLengthUnset() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [UnknownLengthHEADURLProtocol.self]
@@ -365,6 +749,22 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
 
         let fileSize = await MainActor.run { download.fileSize }
         XCTAssertNil(fileSize)
+    }
+
+    func testRemoteFileSizePublishesSuccessfulWholeResponseLength() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [InvalidMetadataHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let download = Downloadable(
+            url: URL(string: "https://metadata-head.test/200")!,
+            name: "Known length",
+            localDestination: FileManager.default.temporaryDirectory
+                .appendingPathComponent("missing-\(UUID())")
+        )
+        try await download.fetchRemoteFileSize(session: session)
+        let fileSize = await MainActor.run { download.fileSize }
+        XCTAssertEqual(fileSize, 123)
     }
 
     func testDownloadableIdentityUsesStandardizedSourceAndDestination() {
@@ -396,6 +796,29 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
             DownloadOperationKey(taskDescription: original.id.taskDescription),
             original.id
         )
+    }
+
+    @MainActor
+    func testDownloadIdentityRemainsStableAcrossFileAndPublishedStateChanges() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let destination = root.appendingPathComponent("dictionary.zip")
+        let source = URL(string: "https://identity.test/dictionary.zip")!
+        let download = Downloadable(url: source, name: "Dictionary", localDestination: destination)
+        let equivalent = Downloadable(url: source, name: "Renamed", localDestination: destination)
+        let key = download.id
+        var retained = Set([download])
+        try Data("installed payload".utf8).write(to: destination)
+        download.isActive = true
+        download.isFinishedDownloading = true
+        download.isFinishedProcessing = true
+        download.fileSize = 17
+        XCTAssertEqual(download.id, key)
+        XCTAssertTrue(retained.contains(equivalent))
+        retained.formUnion([equivalent, download])
+        XCTAssertEqual(retained.count, 1)
+        XCTAssertEqual(retained.remove(equivalent), download)
     }
 
     func testExecutionConfigurationNormalizesEquivalentInputs() {
@@ -1086,6 +1509,323 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
 
         let recordedCheck = await MainActor.run { download.lastCheckedETagAt }
         XCTAssertEqual(recordedCheck, previousCheck)
+    }
+
+    func testRequestsArrivingAfterBackgroundDrainWaitForActivation() async throws {
+        for request in ["download", "finish", "checksumRecovery", "ensure"] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let executor = SuccessfulRemoteAttemptExecutor()
+            let session = URLSession(configuration: .ephemeral)
+            defer { session.invalidateAndCancel() }
+            let controller = DownloadController(session: session, attemptExecutor: { download, session in
+                try await executor.execute(download: download, session: session)
+            })
+            let destination = directory.appendingPathComponent("payload.bin")
+            let download = Downloadable(
+                url: URL(string: "https://late-background.test/\(request)/payload.bin")!,
+                name: request,
+                localDestination: destination
+            )
+            await download.waitForDownloadMetadata()
+            let installedPayload = Data("preserved-installed-artifact".utf8)
+            if request == "finish" || request == "checksumRecovery" {
+                try installedPayload.write(to: destination)
+            }
+            await controller.cancelAndDrainForBackgrounding()
+            switch request {
+            case "download": await controller.download(download)
+            case "finish": await controller.finishDownload(download)
+            case "checksumRecovery": await controller.recoverLocalChecksumFailure(for: download)
+            default: await controller.ensureDownloaded(download: download)
+            }
+
+            let pausedAttempts = await executor.count()
+            XCTAssertEqual(pausedAttempts, 0, request)
+            let pausedState = await MainActor.run { (download.isFinishedProcessing, download.isFailed) }
+            XCTAssertFalse(pausedState.0, request)
+            XCTAssertFalse(pausedState.1, request)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                XCTAssertEqual(try Data(contentsOf: destination), installedPayload, request)
+            }
+            await controller.resumeAfterBackgroundDrain(shouldResume: { false })
+            let inactiveAttempts = await executor.count()
+            XCTAssertEqual(inactiveAttempts, 0, "Rejected activation must keep \(request) deferred")
+            await controller.resumeAfterBackgroundDrain(shouldResume: { true })
+            let recovered = await MainActor.run { (download.isFinishedProcessing, download.isFailed) }
+            XCTAssertTrue(recovered.0, request)
+            XCTAssertFalse(recovered.1, request)
+            if request == "checksumRecovery" {
+                XCTAssertEqual(try Data(contentsOf: destination), Data("replacement-payload".utf8))
+            }
+        }
+    }
+
+    func testExplicitCancellationRemovesDeferredChecksumRecovery() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executor = SuccessfulRemoteAttemptExecutor()
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, session in
+            try await executor.execute(download: download, session: session)
+        })
+        let download = Downloadable(
+            url: URL(string: "https://cancel-deferred-checksum.test/payload.bin")!,
+            name: "Canceled deferred recovery",
+            localDestination: directory.appendingPathComponent("payload.bin")
+        )
+        let installed = Data("preserve-until-explicit-retry".utf8)
+        try installed.write(to: download.localDestination)
+        await controller.cancelAndDrainForBackgrounding()
+        await controller.recoverLocalChecksumFailure(for: download)
+        await controller.cancelInProgressDownload(download)
+        await controller.resumeAfterBackgroundDrain(shouldResume: { true })
+
+        let attempts = await executor.count()
+        XCTAssertEqual(attempts, 0)
+        XCTAssertEqual(try Data(contentsOf: download.localDestination), installed)
+    }
+
+    func testCancelingChecksumRecoveryCallerCancelsOwnedProducer() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let started = expectation(description: "checksum recovery transfer started")
+        let completedTransfer = expectation(description: "canceled transfer must not publish")
+        completedTransfer.isInverted = true
+        let executor = SuspendedTransferAttemptExecutor(started: started, restarted: completedTransfer)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            try await executor.execute(download: download)
+        })
+        let download = Downloadable(
+            url: URL(string: "https://checksum-caller-cancellation.test/payload.bin")!,
+            name: "Checksum cancellation",
+            localDestination: directory.appendingPathComponent("payload.bin")
+        )
+        let recovery = Task { await controller.recoverLocalChecksumFailure(for: download) }
+        await fulfillment(of: [started], timeout: 3)
+        recovery.cancel()
+        await executor.releaseCanceledTransfer()
+        await recovery.value
+
+        let state = await MainActor.run { (download.isFinishedProcessing, download.isFinishedDownloading) }
+        XCTAssertFalse(state.0)
+        XCTAssertFalse(state.1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: download.localDestination.path))
+        await fulfillment(of: [completedTransfer], timeout: 0.01)
+    }
+
+    func testSuspensionDrainWaitsForCanceledTransferCleanup() async throws {
+        let started = expectation(description: "producer is held")
+        let restarted = expectation(description: "no replacement producer during suspension")
+        restarted.isInverted = true
+        let executor = SuspendedTransferAttemptExecutor(started: started, restarted: restarted)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            try await executor.execute(download: download)
+        })
+        let download = Downloadable(
+            url: URL(string: "https://suspension-drain.test/payload.bin")!,
+            name: "Suspension drain",
+            localDestination: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        )
+        let producer = Task { await controller.ensureDownloaded(download: download) }
+        await fulfillment(of: [started], timeout: 3)
+        let drained = expectation(description: "all producer cleanup settled")
+        let drain = Task {
+            await controller.cancelAndDrainForBackgrounding()
+            drained.fulfill()
+        }
+        // The executor cannot finish until explicitly released. Even a task
+        // cancellation must not be mistaken for producer settlement.
+        let premature = await XCTWaiter.fulfillment(of: [drained], timeout: 0.05)
+        XCTAssertEqual(premature, .timedOut)
+        await executor.releaseCanceledTransfer()
+        await producer.value
+        await drain.value
+        await controller.resumeAfterBackgroundDrain(shouldResume: { false })
+        let count = await executor.attemptCount()
+        XCTAssertEqual(count, 1)
+        let failed = await MainActor.run { download.isFailed }
+        XCTAssertFalse(failed)
+        await fulfillment(of: [restarted], timeout: 0.01)
+    }
+
+    func testForegroundRecoveryWaitsForCanceledProducerThenRestarts() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let started = expectation(description: "transfer held during cancellation cleanup")
+        let restarted = expectation(description: "replacement transfer")
+        restarted.assertForOverFulfill = true
+        let executor = SuspendedTransferAttemptExecutor(started: started, restarted: restarted)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            try await executor.execute(download: download)
+        })
+        let download = Downloadable(
+            url: URL(string: "https://foreground-race.test/payload.bin")!,
+            name: "Foreground overlap",
+            localDestination: directory.appendingPathComponent("payload.bin")
+        )
+        let original = Task { await controller.ensureDownloaded(download: download) }
+        await fulfillment(of: [started], timeout: 3)
+        await controller.cancelLongRunningWorkForBackgrounding()
+        let foreground = Task { await controller.resumeRecoverableDownloadsAfterForegrounding() }
+        let duplicateForeground = Task { await controller.resumeRecoverableDownloadsAfterForegrounding() }
+        // Give both notifications the canceled owner while its cleanup is held.
+        await Task.yield()
+        await executor.releaseCanceledTransfer()
+        await original.value
+        await foreground.value
+        await duplicateForeground.value
+        await fulfillment(of: [restarted], timeout: 3)
+        let count = await executor.attemptCount()
+        XCTAssertEqual(count, 2, "Exactly one replacement producer must run")
+        let state = await MainActor.run { (download.isFinishedProcessing, download.isFailed) }
+        XCTAssertTrue(state.0)
+        XCTAssertFalse(state.1)
+        XCTAssertEqual(try Data(contentsOf: download.localDestination), Data("foreground-retry".utf8))
+    }
+
+    @MainActor
+    private final class RecoveryActivationState {
+        var isActive = true
+        var observedActivation = false
+    }
+
+    func testForegroundRecoveryRechecksActivationAfterProducerCleanup() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let started = expectation(description: "transfer held during cancellation cleanup")
+        let restarted = expectation(description: "replacement transfer after real activation")
+        let executor = SuspendedTransferAttemptExecutor(started: started, restarted: restarted)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            try await executor.execute(download: download)
+        })
+        let download = Downloadable(
+            url: URL(string: "https://stale-activation.test/payload.bin")!,
+            name: "Stale activation",
+            localDestination: directory.appendingPathComponent("payload.bin")
+        )
+        let original = Task { await controller.download(download) }
+        await fulfillment(of: [started], timeout: 3)
+        await controller.cancelLongRunningWorkForBackgrounding()
+        let activation = await RecoveryActivationState()
+        let admitted = expectation(description: "foreground request admitted")
+        let foreground = Task {
+            await controller.resumeAfterBackgroundDrain(shouldResume: {
+                if !activation.observedActivation {
+                    activation.observedActivation = true
+                    admitted.fulfill()
+                }
+                return activation.isActive
+            })
+        }
+        await fulfillment(of: [admitted], timeout: 3)
+        // The original producer still owns cleanup. Deactivate before releasing
+        // it, without delivering another cancellation generation to the actor.
+        await MainActor.run { activation.isActive = false }
+        await executor.releaseCanceledTransfer()
+        await original.value
+        await foreground.value
+        let staleCount = await executor.attemptCount()
+        XCTAssertEqual(staleCount, 1, "A stale activation must not start another transfer")
+
+        // The stale request must leave direct, non-assured work recoverable.
+        await MainActor.run { activation.isActive = true }
+        await controller.resumeAfterBackgroundDrain(shouldResume: { activation.isActive })
+        await fulfillment(of: [restarted], timeout: 3)
+        let recoveredCount = await executor.attemptCount()
+        XCTAssertEqual(recoveredCount, 2)
+        XCTAssertEqual(try Data(contentsOf: download.localDestination), Data("foreground-retry".utf8))
+    }
+
+    func testInterruptedDownloadCanRecoverWithoutBackgrounding() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let download = Downloadable(
+            url: URL(string: "https://interrupted.test/payload.bin")!,
+            name: "Interrupted transfer",
+            localDestination: directory.appendingPathComponent("payload.bin")
+        )
+        let executor = InterruptedThenSuccessfulAttemptExecutor()
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, _ in
+            try await executor.execute(download: download)
+        })
+        await controller.ensureDownloaded(download: download)
+        let interrupted = await MainActor.run { (download.isFailed, download.failureMessage) }
+        XCTAssertTrue(interrupted.0)
+        XCTAssertEqual(interrupted.1, "Download interrupted. Please retry.")
+        // Activation retries an assured failure without a Retry tap or a
+        // preceding background transition.
+        await controller.resumeAfterBackgroundDrain(shouldResume: { true })
+        let recovered = await MainActor.run { (download.isFailed, download.isFinishedProcessing, download.failureMessage) }
+        XCTAssertFalse(recovered.0)
+        XCTAssertTrue(recovered.1)
+        XCTAssertNil(recovered.2)
+        XCTAssertEqual(try Data(contentsOf: download.localDestination), Data("recovered-download".utf8))
+    }
+
+    func testBackgroundCancellationDoesNotPublishFailureAndResumesTransfer() async throws {
+        try await exerciseBackgroundCancellation(assureDownload: true)
+    }
+
+    func testBackgroundCancellationResumesDirectDownloadOutsideAssuranceList() async throws {
+        try await exerciseBackgroundCancellation(assureDownload: false)
+    }
+
+    private func exerciseBackgroundCancellation(assureDownload: Bool) async throws {
+        let started = expectation(description: "initial transfer started")
+        let resumed = expectation(description: "foreground transfer restarted")
+        HangingDownloadURLProtocol.didStart = { started.fulfill() }
+        defer {
+            HangingDownloadURLProtocol.didStart = nil
+            HangingDownloadURLProtocol.didStop = nil
+        }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("background-download-\(UUID().uuidString)")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingDownloadURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let download = Downloadable(
+            url: URL(string: "https://background.test/payload.bin")!,
+            name: "Background recovery",
+            localDestination: directory.appendingPathComponent("payload.bin")
+        )
+        let operation = Task {
+            if assureDownload {
+                await controller.ensureDownloaded(download: download)
+            } else {
+                await controller.download(download)
+            }
+        }
+        await fulfillment(of: [started], timeout: 3)
+        await controller.cancelLongRunningWorkForBackgrounding()
+        await operation.value
+        let paused = await MainActor.run { (download.isFailed, download.failureMessage) }
+        XCTAssertFalse(paused.0, "Background suspension is not a failed download")
+        XCTAssertNil(paused.1, "Do not show CancellationError for app backgrounding")
+        HangingDownloadURLProtocol.didStart = { resumed.fulfill() }
+        let foreground = Task { await controller.resumeRecoverableDownloadsAfterForegrounding() }
+        await fulfillment(of: [resumed], timeout: 3)
+        await controller.cancelAllInProgressDownloads()
+        await foreground.value
     }
 
     func testCancellingControllerTaskCancelsUnderlyingURLSessionTask() async throws {

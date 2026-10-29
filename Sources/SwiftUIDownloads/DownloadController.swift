@@ -3,6 +3,7 @@ import SwiftUI
 import Combine
 import BackgroundAssets
 import CryptoKit
+import SwiftUtilities
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -180,6 +181,9 @@ public actor DownloadActor {
 
 fileprivate func errorDescription(from error: Error) -> String {
     let nsError = error as NSError
+    if error is CancellationError {
+        return "Download interrupted. Please retry."
+    }
     if let checksumError = error as? DownloadableChecksumVerificationError {
         return checksumError.localizedDescription
     } else if let installError = error as? URLResourceDownloadInstallError {
@@ -343,13 +347,15 @@ public struct DownloadExecutionConfigurationSignature: Hashable, Sendable {
     public let preservedLocalArtifactDirectories: [URL]
     public let metadataCacheNamespace: String
     public let kind: DownloadExecutionKind
+    public let allowsUITestArtifactReuse: Bool
 
     public init(
         mirrorURL: URL?,
         localDestinationChecksum: String?,
         preservedLocalArtifactDirectories: Set<URL>,
         metadataCacheNamespace: String,
-        kind: DownloadExecutionKind
+        kind: DownloadExecutionKind,
+        allowsUITestArtifactReuse: Bool = false
     ) {
         self.mirrorURL = mirrorURL.map(DownloadOperationKey.standardizedSourceURL)
         self.localDestinationChecksum = Self.normalizedOptionalString(
@@ -363,6 +369,7 @@ public struct DownloadExecutionConfigurationSignature: Hashable, Sendable {
         )).sorted { $0.absoluteString < $1.absoluteString }
         self.metadataCacheNamespace = metadataCacheNamespace
         self.kind = kind
+        self.allowsUITestArtifactReuse = allowsUITestArtifactReuse
     }
 
     static func normalizedOptionalString(
@@ -407,6 +414,9 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     public let localDestination: URL
     /// If the file is compressed, this is the post-decompression checksum.
     public let localDestinationChecksum: String?
+    /// Only fixed-checksum dictionary payloads opt in. Writable databases,
+    /// installed metadata and generated caches remain owned by each test run.
+    public let allowsUITestArtifactReuse: Bool
     /// Generated artifacts which belong to this download but are not the
     /// downloaded payload itself. Orphan cleanup preserves these directories
 
@@ -438,9 +448,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     private let downloadObservationLock = NSLock()
     private var downloadObservationGeneration = UUID()
     
-    public var id: DownloadOperationKey {
-        DownloadOperationKey(sourceURL: url, destinationURL: localDestination)
-    }
+    public let id: DownloadOperationKey
 
     public var executionConfigurationSignature: DownloadExecutionConfigurationSignature {
         DownloadExecutionConfigurationSignature(
@@ -448,7 +456,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             localDestinationChecksum: localDestinationChecksum,
             preservedLocalArtifactDirectories: preservedLocalArtifactDirectories,
             metadataCacheNamespace: metadataStore.metadataCacheNamespace,
-            kind: .download
+            kind: .download,
+            allowsUITestArtifactReuse: allowsUITestArtifactReuse
         )
     }
 
@@ -559,13 +568,16 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         localDestinationChecksum: String? = nil,
         preservedLocalArtifactDirectories: Set<URL> = [],
         isFromBackgroundAssetsDownloader: Bool? = nil,
-        metadataStore: (any DownloadableMetadataStore)? = nil
+        metadataStore: (any DownloadableMetadataStore)? = nil,
+        allowsUITestArtifactReuse: Bool = false
     ) {
+        self.id = DownloadOperationKey(sourceURL: url, destinationURL: localDestination)
         self.url = url
         self.mirrorURL = mirrorURL
         self.name = name
         self.localDestination = localDestination
         self.localDestinationChecksum = localDestinationChecksum
+        self.allowsUITestArtifactReuse = allowsUITestArtifactReuse
         self.preservedLocalArtifactDirectories = Set(
             preservedLocalArtifactDirectories.map(\.standardizedFileURL)
         )
@@ -1025,6 +1037,9 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         )
         request.httpMethod = "HEAD"
         let response = try await session.data(for: request).1
+        if let error = downloadResponseAdmissionError(response: response, requestedURL: url) {
+            throw error
+        }
         let expectedContentLength = response.expectedContentLength
         await MainActor.run {
             self.fileSize = expectedContentLength >= 0
@@ -1253,7 +1268,7 @@ public enum DownloadDirectory {
             if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
                 containerURL = sharedContainerURL
             }
-#if DEBUG
+#if DEBUG || MANABI_NATIVE_TEST_STORAGE
             if let testAppGroupURL = Self.testAppGroupURL(groupIdentifier: groupIdentifier) {
                 containerURL = testAppGroupURL
             }
@@ -1275,7 +1290,7 @@ public enum DownloadDirectory {
             if let groupIdentifier = groupIdentifier, let sharedContainerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupIdentifier) {
                 containerURL = sharedContainerURL
             }
-#if DEBUG
+#if DEBUG || MANABI_NATIVE_TEST_STORAGE
             if let testAppGroupURL = Self.testAppGroupURL(groupIdentifier: groupIdentifier) {
                 containerURL = testAppGroupURL
             }
@@ -1336,15 +1351,23 @@ public enum DownloadDirectory {
         return url
     }
 
-    private static func testAppGroupURL(groupIdentifier: String?) -> URL? {
+#endif
+
+#if DEBUG || MANABI_NATIVE_TEST_STORAGE
+    // The native measurement runner enables storage isolation without DEBUG,
+    // preserving optimized production lookup paths. App/archive builds omit it.
+    static func testAppGroupURL(
+        groupIdentifier: String?,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        isRunningTests: Bool = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+            || NSClassFromString("XCTest.XCTestCase") != nil
+    ) -> URL? {
         guard groupIdentifier != nil else { return nil }
-        if let testAppGroupPath = ProcessInfo.processInfo.environment["MANABI_TEST_APP_GROUP_DIR"],
+        if let testAppGroupPath = environment["MANABI_TEST_APP_GROUP_DIR"],
            !testAppGroupPath.isEmpty {
             return URL(fileURLWithPath: testAppGroupPath, isDirectory: true)
         }
-        let isRunningTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
-            || NSClassFromString("XCTestCase") != nil
-            || NSClassFromString("XCTest.XCTestCase") != nil
         guard isRunningTests else { return nil }
         return URL(fileURLWithPath: "/tmp/manabi-reader-test-app-group", isDirectory: true)
     }
@@ -1359,7 +1382,8 @@ public extension Downloadable {
         url: URL,
         localDestinationChecksum: String? = nil,
         preservedLocalArtifactDirectories: Set<URL> = [],
-        metadataStore: (any DownloadableMetadataStore)? = nil
+        metadataStore: (any DownloadableMetadataStore)? = nil,
+        allowsUITestArtifactReuse: Bool = false
     ) {
 //        let filename = filename ?? url.lastPathComponent.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? url.lastPathComponent
         let filename = filename ?? url.lastPathComponent
@@ -1371,7 +1395,8 @@ public extension Downloadable {
             localDestination: destination.directoryURL.appendingPathComponent(filename),
             localDestinationChecksum: localDestinationChecksum,
             preservedLocalArtifactDirectories: preservedLocalArtifactDirectories,
-            metadataStore: metadataStore
+            metadataStore: metadataStore,
+            allowsUITestArtifactReuse: allowsUITestArtifactReuse
         )
     }
     
@@ -1521,6 +1546,29 @@ private final class DownloadAttemptTerminalWaiter: @unchecked Sendable {
 
 public class DownloadController: NSObject, ObservableObject, @unchecked Sendable {
     public let objectWillChange = ObservableObjectPublisher()
+
+    public enum LocalPreparationOutcome: Sendable, Equatable {
+        case available
+        case unavailable
+        /// A network-capable producer or background suspension owns admission.
+        case busy
+    }
+
+    /// Scoped observation of startup preparation; never participates in admission.
+    /// Fixed labels let an owning app time actor waits without exposing paths.
+    public enum LocalPreparationStage: String, Sendable {
+        case metadataRequested, metadataReady, processingRequested
+        case stateRequested, stateRead, stateReady, verifiedArtifact
+        case publicationRequested, publicationStarted, publicationApplied, publicationFinished, completed
+    }
+
+    @TaskLocal public static var localPreparationStageObserver:
+        (@Sendable (LocalPreparationStage) -> Void)?
+
+    private enum ProcessingScope: Sendable, Equatable {
+        case ordinary
+        case localOnly
+    }
     
     typealias DownloadAttemptExecutor = @Sendable (
         _ download: Downloadable,
@@ -1530,6 +1578,7 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
         let id: UUID
         let task: Task<Void, Never>
         let completion: DownloadWorkCompletion
+        var scope: ProcessingScope = .ordinary
     }
     private struct SuccessfulDownloadMetadata: Sendable {
         let downloadedAt: Date
@@ -1605,6 +1654,12 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     private var processingTasks = [DownloadOperationKey: ProcessingTaskRecord]()
     private var checksumRecoveryTasks = [DownloadOperationKey: ProcessingTaskRecord]()
     private var downloadTasks = [DownloadOperationKey: ProcessingTaskRecord]()
+    private var backgroundSuspendedDownloads = Set<DownloadOperationKey>()
+    private var backgroundSuspendedChecksumRecoveries = Set<DownloadOperationKey>()
+    private var backgroundSuspensionGeneration: UInt64 = 0
+    @DownloadActor internal private(set) var backgroundWorkIsSuspended = false
+    @MainActor private let lifecycleNotifications = AppLifecycleNotificationSource()
+    @DownloadActor private var lifecycleNotificationAdmission = AppLifecycleNotificationAdmission()
     private var downloadAttemptIDs = [DownloadOperationKey: UUID]()
     private var activeTransferStagingURLs = Set<URL>()
     private var checksumRecoveriesReadyForProcessing = Set<DownloadOperationKey>()
@@ -1707,10 +1762,12 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
 #if canImport(UIKit)
         NotificationCenter.default
             .publisher(for: UIApplication.didEnterBackgroundNotification)
-            .sink { [weak self] _ in
-                guard let self else { return }
-                Task { @DownloadActor [weak self] in
-                    await self?.cancelLongRunningWorkForBackgrounding()
+            .sink { [weak self] notification in
+                guard let application = notification.object as? UIApplication else { return }
+                Task { @MainActor [weak self] in
+                    await self?.handleAppLifecycleNotification(.background) {
+                        application.applicationState == .background
+                    }
                 }
             }
             .store(in: &cancellables)
@@ -1719,13 +1776,42 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
             .publisher(for: UIApplication.willEnterForegroundNotification)
             .merge(with: NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification))
             .sink { [weak self] _ in
-                guard let self else { return }
-                Task { @DownloadActor [weak self] in
-                    await self?.resumeRecoverableDownloadsAfterForegrounding()
+                Task { @MainActor [weak self] in
+                    await self?.handleAppLifecycleNotification(.active) {
+                        UIApplication.shared.applicationState == .active
+                    }
                 }
             }
             .store(in: &cancellables)
 #endif
+    }
+
+    @MainActor
+    internal func handleAppLifecycleNotification(
+        _ phase: AppLifecycleNotification.Phase,
+        isCurrent: @escaping @MainActor @Sendable () -> Bool
+    ) async {
+        guard let notification = lifecycleNotifications.notification(
+            for: phase,
+            isCurrent: isCurrent
+        ) else { return }
+        await applyAppLifecycleNotification(notification)
+    }
+
+    @DownloadActor
+    internal func applyAppLifecycleNotification(
+        _ notification: AppLifecycleNotification
+    ) async {
+        guard await notification.isCurrent(),
+              lifecycleNotificationAdmission.accept(notification) else { return }
+        switch notification.phase {
+        case .active:
+            await resumeAfterBackgroundDrain(shouldResume: {
+                notification.isCurrent()
+            })
+        case .background:
+            await cancelLongRunningWorkForBackgrounding()
+        }
     }
 }
 
@@ -1878,8 +1964,10 @@ public extension DownloadController {
     func deleteOrphanFiles(in locations: [DownloadDirectory], excluding: Set<Downloadable> = Set()) async throws {
         guard !locations.isEmpty else { return }
         try Task.checkCancellation()
+        guard !backgroundWorkIsSuspended else { throw CancellationError() }
         var retainedDownloads = await assuredDownloads.union(excluding)
         try Task.checkCancellation()
+        guard !backgroundWorkIsSuspended else { throw CancellationError() }
 
         // Direct downloads and standalone processors need not be in the
         // assurance list. Capture actual owners after the last actor hop and
@@ -2097,10 +2185,30 @@ extension DownloadController {
     }
 
     @DownloadActor
-    private func joinCurrentWorkIfNeeded(for key: DownloadOperationKey) async -> Bool {
-        guard let work = currentWork(for: key) else { return false }
-        _ = await work.completion.wait()
+    private func deferWorkIfBackgroundSuspended(
+        _ download: Downloadable,
+        checksumRecovery: Bool = false
+    ) -> Bool {
+        guard backgroundWorkIsSuspended else { return false }
+        // Late requests are not part of the already-completed suspension drain.
+        // Retain their identity for activation without starting another writer.
+        backgroundSuspendedDownloads.insert(download.id)
+        if checksumRecovery { backgroundSuspendedChecksumRecoveries.insert(download.id) }
         return true
+    }
+
+    @DownloadActor
+    private func joinCurrentWorkIfNeeded(
+        for key: DownloadOperationKey,
+        continuingAfterLocalPreparation: Bool = false
+    ) async -> Bool {
+        while let work = currentWork(for: key) {
+            guard await work.completion.wait(), !Task.isCancelled else { return true }
+            // A local processor cannot discharge remote freshness or repair.
+            // Recheck ownership after its completion before continuing assurance.
+            if !continuingAfterLocalPreparation || work.scope == .ordinary { return true }
+        }
+        return false
     }
 
     @DownloadActor
@@ -2114,7 +2222,9 @@ extension DownloadController {
         let observation = await DownloadReplayObservation(owner: owner, replay: replay)
         if let work {
             _ = await work.completion.wait()
-        } else if !Task.isCancelled, admittedDownloads[owner.id] === owner {
+        }
+        if (work == nil || work?.scope == .localOnly),
+           !Task.isCancelled, admittedDownloads[owner.id] === owner {
             // Registration is not readiness. Dispatch the requested action with
             // its original options, and let its normal admission recheck work
             // which may have arrived during the main-actor observation hop.
@@ -2262,6 +2372,74 @@ extension DownloadController {
         )
     }
 
+    /// Prepares retained bytes without remote checks, transfers, or checksum
+    /// recovery. A canceled owner drains its processor before throwing; other
+    /// local waiters own only their wait. This never establishes remote assurance.
+    /// Missing or invalid retained bytes are unavailable; network-capable work
+    /// returns busy without being joined. Availability is a snapshot, not a lease.
+    @DownloadActor
+    public func prepareAvailableLocalArtifact(
+        download: Downloadable
+    ) async throws -> LocalPreparationOutcome {
+        try Task.checkCancellation()
+        Self.localPreparationStageObserver?(.metadataRequested)
+        await download.waitForDownloadMetadata()
+        Self.localPreparationStageObserver?(.metadataReady)
+        try Task.checkCancellation()
+        switch await admit(download) {
+        case .owner:
+            break
+        case .compatibleReplay(let owner):
+            let outcome = try await prepareAvailableLocalArtifact(download: owner)
+            try Task.checkCancellation()
+            if outcome != .busy {
+                await mirrorTerminalState(from: owner, to: download)
+            }
+            try Task.checkCancellation()
+            return outcome
+        case .rejected:
+            return .unavailable
+        }
+        try Task.checkCancellation()
+        guard !backgroundWorkIsSuspended,
+              downloadTasks[download.id] == nil,
+              checksumRecoveryTasks[download.id] == nil else { return .busy }
+        Self.localPreparationStageObserver?(.processingRequested)
+        if let processing = processingTasks[download.id] {
+            guard processing.scope == .localOnly else { return .busy }
+            _ = await processing.completion.wait()
+            try Task.checkCancellation()
+        } else {
+            await finishDownloadedFile(
+                download,
+                recordSuccessfulDownload: false,
+                transferredFileURL: nil,
+                scope: .localOnly
+            )
+            try Task.checkCancellation()
+        }
+        Self.localPreparationStageObserver?(.stateRequested)
+        let finished = await MainActor.run {
+            let finished = download.isFinishedProcessing && !download.isFailed
+            Self.localPreparationStageObserver?(.stateRead)
+            return finished
+        }
+        Self.localPreparationStageObserver?(.stateReady)
+        let importable = download as? ImportableDownloadable
+        let imported = await importable?.isImported() ?? true
+        try Task.checkCancellation()
+        // Recheck after suspension: a replacement producer may now own the path.
+        guard !backgroundWorkIsSuspended,
+              downloadTasks[download.id] == nil,
+              checksumRecoveryTasks[download.id] == nil,
+              processingTasks[download.id] == nil else { return .busy }
+        let outcome: LocalPreparationOutcome = finished && imported
+            && (download.hasAdmissibleInstalledArtifact() || importable?.deleteAfterImport == true)
+            ? .available : .unavailable
+        Self.localPreparationStageObserver?(.completed)
+        return outcome
+    }
+
     @MainActor
     private func ensureDownloaded(
         download: Downloadable,
@@ -2288,9 +2466,20 @@ extension DownloadController {
         case .rejected:
             return
         }
-        if await joinCurrentWorkIfNeeded(for: download.id) { return }
+        guard !(await deferWorkIfBackgroundSuspended(download)) else { return }
+        if await joinCurrentWorkIfNeeded(
+            for: download.id, continuingAfterLocalPreparation: true
+        ) { return }
         guard !Task.isCancelled else { return }
-        if assuredDownloads.contains(download) && !failedDownloads.contains(download) {
+        let updateCheckInterval = TimeInterval(60 * 60 * 2)
+        let hasVerifiedPinnedArtifact = download.localDestinationChecksum != nil
+            && download.hasVerifiedLocalDestinationChecksumMarker()
+        let isUpdateCheckDue = shouldCheckForUpdates && !hasVerifiedPinnedArtifact && (
+            download.lastCheckedETagAt == nil
+                || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > updateCheckInterval
+        )
+        // Assurance establishes local readiness, not indefinite remote freshness.
+        if !isUpdateCheckDue, assuredDownloads.contains(download) && !failedDownloads.contains(download) {
             let importable = download as? ImportableDownloadable
             let importIsComplete = await importable?.isImported() ?? true
             let importedWithoutRetainedSource = importIsComplete
@@ -2327,8 +2516,15 @@ extension DownloadController {
                         recordSuccessfulDownload: false
                     )
                 }
-            let updateCheckInterval = TimeInterval(60 * 60 * 2)
+            // A checksum pins the accepted bytes, independently of HTTP
+            // validators. Re-fetching an already verified pinned artifact
+            // can only reinstall the same bytes (or fail verification), and
+            // needlessly revokes dictionary readers through file replacement.
+            // Validation/repair above still runs before taking this shortcut.
+            let hasVerifiedPinnedArtifact = download.localDestinationChecksum != nil
+                && download.hasVerifiedLocalDestinationChecksumMarker()
             if shouldCheckForUpdates,
+               !hasVerifiedPinnedArtifact,
                download.lastCheckedETagAt == nil
                 || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > updateCheckInterval {
                 switch await checkRemoteModification(for: download) {
@@ -2392,6 +2588,7 @@ extension DownloadController {
             return
         }
         guard !Task.isCancelled,
+              !deferWorkIfBackgroundSuspended(download),
               downloadAttemptIDs[download.id] == nil else { return }
         let previousProcessingTask = processingTasks[download.id]?.task
         let previousRecoveryTask = checksumRecoveryTasks[download.id]?.task
@@ -2463,6 +2660,26 @@ extension DownloadController {
             }()
         }
         resetDownloadStatusObservers(for: download)
+
+        // The logical attempt already owns this destination. A seed is only
+        // installed when no prior destination exists; normal checksum/receipt
+        // processing below still determines whether the download is ready.
+        if let cache = download.uiTestArtifactCache,
+           let checksum = download.localDestinationChecksum,
+           !FileManager.default.fileExists(atPath: download.localDestination.path) {
+            do {
+                if try cache.restore(checksum: checksum, to: download.localDestination) {
+                    return DownloadTransferResult(
+                        destinationLocation: download.localDestination,
+                        etag: nil, lastModified: nil, finalResponseURL: download.url
+                    )
+                }
+            } catch {
+                // A cache error is a miss, never proof of dictionary corruption.
+                // Cancellation still belongs to the controller's attempt.
+                guard !Task.isCancelled else { return nil }
+            }
+        }
         
         if download.url.isFileURL {
             await { @MainActor in
@@ -2636,6 +2853,11 @@ extension DownloadController {
                     includingDestination: false
                 )
             }
+            if terminalAttemptError is CancellationError
+                || (terminalAttemptError as? URLError)?.code == .cancelled {
+                await markDownloadCancelled(download, error: terminalAttemptError)
+                return nil
+            }
             await MainActor.run { [weak self] in
                 self?.finishedDownloads.remove(download)
                 self?.failedDownloads.insert(download)
@@ -2705,17 +2927,27 @@ extension DownloadController {
     @DownloadActor
     private func cancelOwnedDownloadWork(
         matching operationKey: DownloadOperationKey? = nil,
-        matchingSourceURL sourceURL: URL? = nil
-    ) {
+        matchingSourceURL sourceURL: URL? = nil,
+        preservingBackgroundSuspension: Bool = false
+    ) async {
         let matches: (DownloadOperationKey) -> Bool = { key in
             (operationKey == nil || key == operationKey)
                 && (sourceURL == nil || key.sourceURL == sourceURL)
         }
+        let explicitlyCanceledSuspensions: Set<DownloadOperationKey> = preservingBackgroundSuspension
+            ? [] : backgroundSuspendedDownloads.filter(matches)
+        backgroundSuspendedDownloads.subtract(explicitlyCanceledSuspensions)
+        backgroundSuspendedChecksumRecoveries.subtract(explicitlyCanceledSuspensions)
         let records = downloadTasks.filter { matches($0.key) }
             .map(\.value)
             + processingTasks.filter { matches($0.key) }.map(\.value)
             + checksumRecoveryTasks.filter { matches($0.key) }.map(\.value)
         records.forEach { $0.task.cancel() }
+        for key in explicitlyCanceledSuspensions where currentWork(for: key) == nil {
+            if let download = admittedDownloads[key] {
+                await markDownloadCancelled(download)
+            }
+        }
         // Each owner removes only its candidates and publishes its terminal
         // cancellation. Ownership remains until it drains. Cancellation itself
         // must not await an importer that may have requested this cancellation.
@@ -2750,13 +2982,77 @@ extension DownloadController {
 
     @DownloadActor
     func cancelLongRunningWorkForBackgrounding() async {
-        try? await cancelInProgressDownloads(inApp: true)
+        backgroundWorkIsSuspended = true
+        backgroundSuspensionGeneration &+= 1
+        backgroundSuspendedDownloads.formUnion(downloadTasks.keys)
+        backgroundSuspendedDownloads.formUnion(processingTasks.keys)
+        backgroundSuspendedDownloads.formUnion(checksumRecoveryTasks.keys)
+        // Mark the reason before canceling. The owned task propagates cancellation
+        // to URLSession, retry backoff and import without a main-actor race.
+        await cancelOwnedDownloadWork(preservingBackgroundSuspension: true)
+    }
+
+    /// Cancellation alone can return while decompression, import, or metadata
+    /// settlement still owns a shared-file lock. The app's suspension assertion
+    /// covers this drain; the ordinary notification observer remains nonblocking.
+    @DownloadActor
+    public func reopenAdmissionAfterBackgroundDrain(
+        shouldResume: @MainActor @Sendable () -> Bool
+    ) async -> Bool {
+        let generation = backgroundSuspensionGeneration
+        guard await shouldResume(), generation == backgroundSuspensionGeneration,
+              !Task.isCancelled else { return false }
+        // The caller has already joined the suspension drain. Reopening local
+        // admission must not wait for recoverable transfers or remote checks.
+        backgroundWorkIsSuspended = false
+        return true
     }
 
     @DownloadActor
-    func resumeRecoverableDownloadsAfterForegrounding() async {
-        let downloads = await MainActor.run { Array(assuredDownloads) }
+    public func resumeAfterBackgroundDrain(
+        shouldResume: @MainActor @Sendable () -> Bool
+    ) async {
+        let generation = backgroundSuspensionGeneration
+        guard await shouldResume(), generation == backgroundSuspensionGeneration else { return }
+        await resumeRecoverableDownloadsAfterForegrounding(shouldResume: shouldResume)
+    }
+
+    @DownloadActor
+    public func cancelAndDrainForBackgrounding() async {
+        await cancelLongRunningWorkForBackgrounding()
+        let records = Array(downloadTasks.values)
+            + Array(processingTasks.values)
+            + Array(checksumRecoveryTasks.values)
+        for record in records {
+            // Producer settlement must not be replaced by a canceled waiter's
+            // early return. The producer retains ownership through its cleanup.
+            await record.task.value
+        }
+    }
+
+    @DownloadActor
+    func resumeRecoverableDownloadsAfterForegrounding(
+        shouldResume: @MainActor @Sendable () -> Bool = { true }
+    ) async {
+        let generation = backgroundSuspensionGeneration
+        guard await shouldResume(), generation == backgroundSuspensionGeneration,
+              !Task.isCancelled else { return }
+        backgroundWorkIsSuspended = false
+        let suspendedDownloads = backgroundSuspendedDownloads.compactMap { admittedDownloads[$0] }
+        let downloads = await MainActor.run { Array(assuredDownloads.union(suspendedDownloads)) }
         for download in downloads {
+            guard await shouldResume(), generation == backgroundSuspensionGeneration,
+                  !Task.isCancelled else { return }
+            let wasBackgroundSuspended = backgroundSuspendedDownloads.contains(download.id)
+            if wasBackgroundSuspended {
+                // A join of the canceled producer is not a retry. Wait until its
+                // cleanup has released ownership before inspecting recovery state.
+                while let work = currentWork(for: download.id) {
+                    guard await work.completion.wait() else { return }
+                }
+                guard await shouldResume(), generation == backgroundSuspensionGeneration,
+                      !Task.isCancelled else { return }
+            }
             let state = await MainActor.run {
                 (
                     isFailed: download.isFailed,
@@ -2773,6 +3069,17 @@ extension DownloadController {
             let importedWithoutRetainedSource = isImported
                 && (download as? ImportableDownloadable)?.deleteAfterImport == true
 
+            guard await shouldResume(), generation == backgroundSuspensionGeneration,
+                  !Task.isCancelled else { return }
+            if wasBackgroundSuspended {
+                // Keep the retry claim through every await above. A stale
+                // activation must not consume the next activation's recovery.
+                guard backgroundSuspendedDownloads.remove(download.id) != nil else { continue }
+            }
+            if backgroundSuspendedChecksumRecoveries.remove(download.id) != nil {
+                await recoverLocalChecksumFailure(for: download)
+                continue
+            }
             if state.isFinishedProcessing {
                 if completionMetadataRetryDownloadIDs.contains(download.id),
                    hasProcessableLocalArtifact || importedWithoutRetainedSource {
@@ -2795,7 +3102,7 @@ extension DownloadController {
                 continue
             }
 
-            guard hasRecoverableFile || state.isFailed || state.isActive || state.isFinishedDownloading else {
+            guard wasBackgroundSuspended || hasRecoverableFile || state.isFailed || state.isActive || state.isFinishedDownloading else {
                 continue
             }
 
@@ -2832,20 +3139,28 @@ extension DownloadController {
 
     @DownloadActor
     private func markDownloadCancelled(_ download: Downloadable, error: Error = CancellationError()) async {
+        let isBackgroundSuspension = backgroundSuspendedDownloads.contains(download.id)
         await MainActor.run { [weak self] in
             if let importable = download as? ImportableDownloadable {
                 importable.lastImportError = nil
                 importable.importProgress = nil
                 importable.importStatusText = nil
             }
-            self?.failedDownloads.insert(download)
-            self?.activeDownloads.remove(download)
             self?.finishedDownloads.remove(download)
-            download.isFailed = true
-            download.isActive = false
+            if isBackgroundSuspension {
+                self?.failedDownloads.remove(download)
+                self?.activeDownloads.insert(download)
+            } else {
+                self?.failedDownloads.insert(download)
+                self?.activeDownloads.remove(download)
+            }
+            download.isFailed = !isBackgroundSuspension
+            download.isActive = isBackgroundSuspension
             download.isFinishedDownloading = false
             download.isFinishedProcessing = false
-            download.downloadProgress = .completed(destinationLocation: nil, etag: nil, error: error)
+            download.downloadProgress = isBackgroundSuspension
+                ? .uninitiated
+                : .completed(destinationLocation: nil, etag: nil, error: error)
         }
         clearDownloadStatusObservers(forDownloadID: download.id)
     }
@@ -2862,7 +3177,8 @@ extension DownloadController {
     private func removeAllLocalArtifacts(
         for download: Downloadable,
         includingDestination: Bool,
-        preservingActiveTransfers: Bool = true
+        preservingActiveTransfers: Bool = true,
+        preservingCompressedInput: Bool = false
     ) throws {
         if includingDestination {
             try FileManager.default.removeItemIfPresent(
@@ -2876,9 +3192,11 @@ extension DownloadController {
             ] = nil
             try download.removeInstalledArtifactReceipt()
         }
-        try FileManager.default.removeItemIfPresent(
-            at: download.compressedFileURL
-        )
+        if !preservingCompressedInput {
+            try FileManager.default.removeItemIfPresent(
+                at: download.compressedFileURL
+            )
+        }
 
         let removed = try download.stagingPaths.removeTemporaryArtifacts(
             preserving: preservingActiveTransfers ? activeTransferStagingURLs : []
@@ -2916,7 +3234,7 @@ extension DownloadController {
         }
 
         if await joinCurrentWorkIfNeeded(for: download.id) { return }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, !deferWorkIfBackgroundSuspended(download) else { return }
         await finishDownloadedFile(
             download,
             etag: etag,
@@ -2937,8 +3255,16 @@ extension DownloadController {
         updatesRemoteModifiedAt: Bool = false,
         recordSuccessfulDownload: Bool = true,
         transferredFileURL: URL?,
-        expectedDownloadAttemptID: UUID? = nil
+        expectedDownloadAttemptID: UUID? = nil,
+        scope: ProcessingScope = .ordinary
     ) async {
+        if scope == .localOnly {
+            guard downloadTasks[download.id] == nil,
+                  checksumRecoveryTasks[download.id] == nil,
+                  processingTasks[download.id].map({ $0.scope == .localOnly }) ?? true else {
+                return
+            }
+        }
         if let expectedDownloadAttemptID,
            downloadAttemptIDs[download.id] != expectedDownloadAttemptID {
             if let transferredFileURL,
@@ -2973,6 +3299,17 @@ extension DownloadController {
             return
         }
 
+        // Preserve ownership checks above before publishing cancellation: an
+        // obsolete transfer must never reset a replacement producer's state.
+        guard !Task.isCancelled, !deferWorkIfBackgroundSuspended(download) else {
+            if let transferredFileURL,
+               transferredFileURL != download.localDestination {
+                activeTransferStagingURLs.remove(transferredFileURL)
+                try? FileManager.default.removeItemIfPresent(at: transferredFileURL)
+            }
+            await markDownloadCancelled(download)
+            return
+        }
         let processingTaskID = UUID()
         let completion = DownloadWorkCompletion()
         let task = Task { @DownloadActor [weak self] in
@@ -2991,11 +3328,12 @@ extension DownloadController {
                 updatesRemoteModifiedAt: updatesRemoteModifiedAt,
                 recordSuccessfulDownload: recordSuccessfulDownload,
                 transferredFileURL: transferredFileURL,
-                processingTaskID: processingTaskID
+                processingTaskID: processingTaskID,
+                scope: scope
             )
         }
         processingTasks[download.id] = ProcessingTaskRecord(
-            id: processingTaskID, task: task, completion: completion
+            id: processingTaskID, task: task, completion: completion, scope: scope
         )
         await withTaskCancellationHandler(operation: {
             await task.value
@@ -3031,6 +3369,7 @@ extension DownloadController {
         case .rejected:
             return
         }
+        guard !deferWorkIfBackgroundSuspended(download, checksumRecovery: true) else { return }
         if let currentDownload = downloadTasks[download.id]?.task {
             // The in-flight replacement owns checksum validation and recovery.
             await currentDownload.value
@@ -3075,6 +3414,8 @@ extension DownloadController {
             return
         }
 
+        guard !Task.isCancelled,
+              !deferWorkIfBackgroundSuspended(download, checksumRecovery: true) else { return }
         let taskID = UUID()
         let completion = DownloadWorkCompletion()
         let task = Task { @DownloadActor [weak self] in
@@ -3116,7 +3457,11 @@ extension DownloadController {
             task: task,
             completion: completion
         )
-        await task.value
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     @DownloadActor
@@ -3194,9 +3539,33 @@ extension DownloadController {
         updatesRemoteModifiedAt: Bool = false,
         recordSuccessfulDownload: Bool,
         transferredFileURL: URL? = nil,
-        processingTaskID: UUID
+        processingTaskID: UUID,
+        scope: ProcessingScope = .ordinary
     ) async {
         await download.waitForDownloadMetadata()
+        if scope == .localOnly {
+            // Seed reuse is still validated by the normal checksum/receipt path.
+            // Restore only while this registered processor owns the destination.
+            if !download.hasProcessableLocalArtifact(),
+               let cache = download.uiTestArtifactCache,
+               let checksum = download.localDestinationChecksum {
+                _ = try? cache.restore(checksum: checksum, to: download.localDestination)
+            }
+            guard !Task.isCancelled else { return }
+            let importedWithoutSource = if let importable = download as? ImportableDownloadable,
+                                           importable.deleteAfterImport {
+                await importable.isImported()
+            } else {
+                false
+            }
+            let hasLocalArtifact = hasProcessableArtifactOrPendingReceipt(for: download)
+            if importedWithoutSource, !hasLocalArtifact,
+               !completionMetadataRetryDownloadIDs.contains(download.id) {
+                await markDownloadAsProcessed(download)
+                return
+            }
+            guard hasLocalArtifact || importedWithoutSource else { return }
+        }
         if transferredFileURL != nil {
             // A transferred replacement owns a new completion result. Its
             // metadata supersedes any dirty completion values retained from
@@ -3334,6 +3703,7 @@ extension DownloadController {
         if let attemptOwnedTransferredFileURL {
             activeTransferStagingURLs.insert(attemptOwnedTransferredFileURL)
         }
+        var preservesRetainedCompressedInput = false
         defer {
             if let attemptOwnedTransferredFileURL {
                 activeTransferStagingURLs.remove(attemptOwnedTransferredFileURL)
@@ -3346,7 +3716,8 @@ extension DownloadController {
                     at: stagedUncompressedFileURL
                 )
             }
-            if compressedCandidateURL == download.compressedFileURL {
+            if compressedCandidateURL == download.compressedFileURL,
+               !preservesRetainedCompressedInput {
                 try? FileManager.default.removeItemIfPresent(
                     at: download.compressedFileURL
                 )
@@ -3356,16 +3727,36 @@ extension DownloadController {
         var finishStartedWithCompressedFile = false
         do {
             try Task.checkCancellation()
-            let alreadyFinished = await MainActor.run {
-                download.isFinishedProcessing && !download.isFailed
+            let canReuseInstalledArtifact: Bool
+            if scope == .localOnly {
+                // Retained pinned bytes can be admitted on their own identity.
+                // Do not queue native verification behind a read of UI flags.
+                canReuseInstalledArtifact = transferredFileURL == nil
+                    && compressedCandidateURL == nil
+                    && download.localDestinationChecksum != nil
+                    && download.hasVerifiedLocalDestinationChecksumMarker()
+            } else {
+                let alreadyFinished = await MainActor.run {
+                    download.isFinishedProcessing && !download.isFailed
+                }
+                canReuseInstalledArtifact = transferredFileURL == nil
+                    && compressedCandidateURL == nil && alreadyFinished
             }
-            if alreadyFinished, transferredFileURL == nil, compressedCandidateURL == nil {
+            if canReuseInstalledArtifact {
                 let importable = download as? ImportableDownloadable
                 let importIsComplete = await importable?.isImported() ?? true
+                try Task.checkCancellation()
+                guard processingTasks[download.id]?.id == processingTaskID else {
+                    throw CancellationError()
+                }
                 let importedWithoutRetainedSource = importIsComplete
                     && importable?.deleteAfterImport == true
                 if (importIsComplete && download.hasAdmissibleInstalledArtifact())
                     || importedWithoutRetainedSource {
+                    if scope == .localOnly { Self.localPreparationStageObserver?(.verifiedArtifact) }
+                    // Publication is idempotent and remains on the main actor;
+                    // its UI state is not authority for the preceding native read.
+                    await publishSuccessfulCompletion(download, onlyIfChanged: true)
                     clearDownloadStatusObservers(forDownloadID: download.id)
                     return
                 }
@@ -3456,6 +3847,14 @@ extension DownloadController {
                 checksumTask.cancel()
             })
             try Task.checkCancellation()
+
+            if let cache = download.uiTestArtifactCache,
+               let checksum = download.localDestinationChecksum {
+                // Seed bytes have their own verification and atomic publication.
+                // Failure to cache cannot fail an otherwise verified download.
+                try? cache.publish(checksum: checksum, from: processingFileURL)
+                try Task.checkCancellation()
+            }
 
             if let importable = download as? ImportableDownloadable {
                 try Task.checkCancellation()
@@ -3656,7 +4055,8 @@ extension DownloadController {
                 }
                 return
             }
-            if requiresCleanChecksumRedownload(error)
+            if scope == .ordinary,
+               requiresCleanChecksumRedownload(error)
                 && download.localDestinationChecksum != nil
                 && (!finishStartedWithCompressedFile
                     || transferredCompressedFileURL != nil)
@@ -3693,6 +4093,8 @@ extension DownloadController {
             }
             checksumRedownloadAttempted.remove(download.id)
             if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                preservesRetainedCompressedInput = scope == .localOnly
+                    && compressedCandidateURL == download.compressedFileURL
                 let preservesInstalledDestination =
                     stagedUncompressedFileURL != nil
                     || finishStartedWithCompressedFile
@@ -3701,7 +4103,8 @@ extension DownloadController {
                         for: download,
                         includingDestination: !preservesInstalledDestination
                             && download.localDestinationChecksum != nil
-                            && !download.hasVerifiedLocalDestinationChecksumMarker()
+                            && !download.hasVerifiedLocalDestinationChecksumMarker(),
+                        preservingCompressedInput: preservesRetainedCompressedInput
                     )
                 }
 
@@ -3769,28 +4172,48 @@ extension DownloadController {
     }
 
     @DownloadActor
-    private func publishSuccessfulCompletion(_ download: Downloadable) async {
+    private func publishSuccessfulCompletion(
+        _ download: Downloadable, onlyIfChanged: Bool = false
+    ) async {
+        Self.localPreparationStageObserver?(.publicationRequested)
         await MainActor.run { [weak self] in
-            self?.failedDownloads.remove(download)
-            self?.activeDownloads.remove(download)
-            self?.finishedDownloads.insert(download)
-            download.isFailed = false
-            download.isActive = false
-            download.isFinishedDownloading = true
-            download.isFinishedProcessing = true
-            // A successful retry supersedes every previous terminal error,
-            // including local-copy and standalone-finish failures.
-            download.downloadProgress = .completed(
-                destinationLocation: download.localDestination,
-                etag: download.lastDownloadedETag,
-                error: nil
-            )
-            if let importable = download as? ImportableDownloadable {
-                importable.lastImportError = nil
-                importable.importProgress = nil
-                importable.importStatusText = nil
+            Self.localPreparationStageObserver?(.publicationStarted)
+            if let self {
+                if self.failedDownloads.contains(download) { self.failedDownloads.remove(download) }
+                if self.activeDownloads.contains(download) { self.activeDownloads.remove(download) }
+                if !onlyIfChanged || !self.finishedDownloads.contains(download) {
+                    self.finishedDownloads.insert(download)
+                }
             }
+            if download.isFailed { download.isFailed = false }
+            if download.isActive { download.isActive = false }
+            // Actual processing must notify existing consumers even when
+            // rebuilding derived state leaves these flags unchanged. Only
+            // reuse of an already-verified artifact is an idempotent replay.
+            if !onlyIfChanged || !download.isFinishedDownloading { download.isFinishedDownloading = true }
+            if !onlyIfChanged || !download.isFinishedProcessing { download.isFinishedProcessing = true }
+            // Every success clears prior terminal errors.
+            let etag = download.lastDownloadedETag
+            let hasCurrentCompletion: Bool
+            if case let .completed(destination, previousETag, error) = download.downloadProgress {
+                hasCurrentCompletion = destination == download.localDestination
+                    && previousETag == etag && error == nil
+            } else {
+                hasCurrentCompletion = false
+            }
+            if !onlyIfChanged || !hasCurrentCompletion {
+                download.downloadProgress = .completed(
+                    destinationLocation: download.localDestination, etag: etag, error: nil
+                )
+            }
+            if let importable = download as? ImportableDownloadable {
+                if importable.lastImportError != nil { importable.lastImportError = nil }
+                if importable.importProgress != nil { importable.importProgress = nil }
+                if importable.importStatusText != nil { importable.importStatusText = nil }
+            }
+            Self.localPreparationStageObserver?(.publicationApplied)
         }
+        Self.localPreparationStageObserver?(.publicationFinished)
     }
 
     @DownloadActor
@@ -3847,7 +4270,8 @@ extension DownloadController {
         do {
             let (_, response) = try await session.data(for: request)
             guard let httpURLResponse = response as? HTTPURLResponse,
-                  httpURLResponse.statusCode == 200 else {
+                  httpURLResponse.statusCode == 200,
+                  downloadResponseAdmissionError(response: response, requestedURL: download.url) == nil else {
                 return .unavailable
             }
 

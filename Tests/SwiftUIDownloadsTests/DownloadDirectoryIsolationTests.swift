@@ -82,3 +82,41 @@ final class DownloadDirectoryIsolationTests: XCTestCase {
     }
 }
 #endif
+
+#if DEBUG || MANABI_NATIVE_TEST_STORAGE
+final class NativeTestDownloadDirectoryTests: XCTestCase {
+    func testExplicitGroupStorageUsesSelectedRoot() {
+        XCTAssertEqual(DownloadDirectory.testAppGroupURL(
+            groupIdentifier: "group.io.manabi.shared",
+            environment: ["MANABI_TEST_APP_GROUP_DIR": "/fixture/native-measurement"],
+            isRunningTests: true
+        )?.path, "/fixture/native-measurement")
+    }
+
+    func testNongroupStorageNeverUsesGroupOverride() {
+        XCTAssertNil(DownloadDirectory.testAppGroupURL(
+            groupIdentifier: nil,
+            environment: ["MANABI_TEST_APP_GROUP_DIR": "/fixture/native-measurement"],
+            isRunningTests: true
+        ))
+    }
+
+    func testUnconfiguredTestProcessUsesExistingFallback() {
+        for environment in [[:], ["MANABI_TEST_APP_GROUP_DIR": ""]] {
+            XCTAssertEqual(DownloadDirectory.testAppGroupURL(
+                groupIdentifier: "group.io.manabi.shared",
+                environment: environment,
+                isRunningTests: true
+            )?.path, "/tmp/manabi-reader-test-app-group")
+        }
+    }
+
+    func testOrdinaryProcessWithoutOverrideKeepsNormalStorage() {
+        XCTAssertNil(DownloadDirectory.testAppGroupURL(
+            groupIdentifier: "group.io.manabi.shared",
+            environment: [:],
+            isRunningTests: false
+        ))
+    }
+}
+#endif

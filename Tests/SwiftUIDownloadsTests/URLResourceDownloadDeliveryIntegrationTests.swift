@@ -173,9 +173,14 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
         let fixture = try fixture("complete", existing: true), recorder = DeliveryTerminalRecorder()
         let done = expectation(description: "Cancellation after delegate installation")
         let subscription = subscribe(fixture.task, recorder: recorder, completion: done)
-        fixture.task.didInstallDelegate = { [weak task = fixture.task] in task?.cancel() }
+        var installedDelegate: URLSessionTaskDelegate?
+        fixture.task.didInstallDelegate = { [weak task = fixture.task] in
+            installedDelegate = task?.downloadTask.delegate
+            task?.cancel()
+        }
 
         fixture.task.resume()
+        XCTAssertNotNil(installedDelegate)
         await fulfillment(of: [done], timeout: 5)
         fixture.task.resume()
         fixture.task.cancel()
@@ -188,7 +193,12 @@ final class URLResourceDownloadDeliveryIntegrationTests: XCTestCase {
         XCTAssertEqual(recorder.results.count, 1)
         XCTAssertEqual((recorder.results.first?.error as? URLError)?.code, .cancelled)
         XCTAssertTrue(recorder.failed)
-        XCTAssertNil(fixture.task.downloadTask.delegate)
+        // Our wrapper never replaces the activated task's delegate. Foundation
+        // may itself clear that property after completion; its retention timing
+        // is not a delivery guarantee. Wrapper release is tested separately below.
+        if let remainingDelegate = fixture.task.downloadTask.delegate {
+            XCTAssertTrue(remainingDelegate === installedDelegate)
+        }
         XCTAssertEqual(try String(contentsOf: fixture.destination, encoding: .utf8), "previous-complete-book")
         XCTAssertEqual(try String(contentsOf: late, encoding: .utf8), "must-not-replace-the-winner")
     }

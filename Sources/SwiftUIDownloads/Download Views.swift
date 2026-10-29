@@ -363,6 +363,8 @@ struct CancelDownloadButton: View {
     }
 }
     
+// Used only by the dormant DownloadControls below.
+#if DEBUG
 public struct FailureMessagesButton: View {
     var messages: [String]?
     
@@ -388,6 +390,8 @@ public struct FailureMessagesButton: View {
         }
     }
 }
+
+#endif
 
 struct InnerDownloadProgressView: View {
     let size: CGFloat // Size parameter for circle, path, and stop image
@@ -504,6 +508,8 @@ public struct HidingDownloadButton: View {
     }
 }
 
+// Dormant UI retained for local development; excluded from shipping builds.
+#if DEBUG
 public struct DownloadControls: View {
     @ObservedObject var downloadable: Downloadable
     @Binding var downloadURLs: [String]
@@ -557,6 +563,8 @@ public struct DownloadControls: View {
         .tint(.secondary)
     }
 }
+#endif
+
 //struct DownloadProgressView_Previews: PreviewProvider {
 //    static var previews: some View {
 //        Text("hi")

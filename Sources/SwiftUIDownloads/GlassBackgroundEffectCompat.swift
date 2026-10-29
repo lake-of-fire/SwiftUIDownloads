@@ -1,3 +1,5 @@
+// Dormant compatibility styling retained for local development.
+#if DEBUG
 import SwiftUI
 
 public enum GlassBackgroundDisplayMode {
@@ -36,3 +38,5 @@ public extension View {
         }
     }
 }
+
+#endif
