@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 @testable import SwiftUIDownloads
 import XCTest
 
@@ -354,6 +355,43 @@ final class DownloadMetadataCacheTests: XCTestCase {
         download.lastDownloadedETag = "new"
         try await download.waitForDownloadMetadataPersistence()
         XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "new")
+    }
+
+    @MainActor
+    func testVerifiedNativeAdmissionDefersFailedCompletionMetadata() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("native-admission-metadata-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let payload = Data("pinned native artifact".utf8)
+        let destination = root.appendingPathComponent("dictionary.bin")
+        try payload.write(to: destination)
+        let store = RecordingDownloadMetadataStore(metadata: DownloadMetadata(), saveFailureCount: 4)
+        let download = Downloadable(
+            url: URL(string: "https://example.com/native-admission.bin")!, name: "Native admission",
+            localDestination: destination,
+            localDestinationChecksum: Insecure.SHA1.hash(data: payload).map { String(format: "%02x", $0) }.joined(),
+            metadataStore: store
+        )
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        await controller.finishDownload(download, etag: "installed-etag")
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertTrue(download.isFailed)
+        let beforeRetry = try await controller.verifiedLocalArtifactAvailability(download: download)
+        XCTAssertEqual(beforeRetry, .unavailable)
+        XCTAssertTrue(download.isFailed)
+        let failedPreparation = try await controller.prepareAvailableLocalArtifact(download: download)
+        XCTAssertEqual(failedPreparation, .unavailable,
+                       "A valid marker cannot bypass unsettled completion metadata")
+        XCTAssertTrue(download.isFailed)
+        store.allowFutureSaves()
+        await controller.finishDownload(download, recordSuccessfulDownload: false)
+        XCTAssertFalse(download.isFailed)
+        XCTAssertEqual(store.storedMetadata.lastDownloadedETag, "installed-etag")
+        let afterRetry = try await controller.verifiedLocalArtifactAvailability(download: download)
+        XCTAssertEqual(afterRetry, .available)
     }
 
     @MainActor

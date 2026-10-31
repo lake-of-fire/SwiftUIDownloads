@@ -168,6 +168,121 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
     }
 
     @MainActor
+    func testVerifiedNativeAdmissionLeavesPublicationToOrdinaryOwner() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("verified native dictionary".utf8)
+        try payload.write(to: f.destination)
+        let download = f.descriptor("native", checksum: Self.checksum(payload))
+        try download.ensureVerifiedLocalDestinationChecksum()
+        let controller = f.controller { _, _ in
+            XCTFail("Verified native admission must remain offline")
+            throw URLError(.notConnectedToInternet)
+        }
+        let capture = LocalPreparationStageCapture()
+        let outcome = try await DownloadController.$localPreparationStageObserver.withValue({
+            capture.append($0)
+        }) {
+            try await controller.verifiedLocalArtifactAvailability(download: download)
+        }
+        XCTAssertEqual(outcome, .available)
+        XCTAssertEqual(capture.snapshot(), [.verifiedArtifact, .completed])
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertFalse(download.isFinishedDownloading)
+        XCTAssertTrue(controller.finishedDownloads.isEmpty)
+        XCTAssertTrue(controller.assuredDownloads.isEmpty)
+        // Compatible descriptors share native proof without mirroring UI flags.
+        let replay = f.descriptor("replay", checksum: Self.checksum(payload))
+        let replayOutcome = try await controller.verifiedLocalArtifactAvailability(download: replay)
+        XCTAssertEqual(replayOutcome, .available)
+        XCTAssertFalse(replay.isFinishedProcessing)
+        await controller.ensureDownloaded(download: download)
+        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertTrue(download.isFinishedDownloading)
+        XCTAssertTrue(controller.finishedDownloads.contains(download))
+        XCTAssertEqual(try Data(contentsOf: f.destination), payload)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testVerifiedNativeAdmissionRequiresCurrentPinnedIdentity() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("pinned dictionary".utf8)
+        try payload.write(to: f.destination)
+        let download = f.descriptor("native", checksum: Self.checksum(payload))
+        let controller = f.controller { _, _ in throw URLError(.notConnectedToInternet) }
+        let unverified = try await controller.verifiedLocalArtifactAvailability(download: download)
+        XCTAssertEqual(unverified, .unavailable)
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        try download.ensureVerifiedLocalDestinationChecksum()
+        let available = try await controller.verifiedLocalArtifactAvailability(download: download)
+        XCTAssertEqual(available, .available)
+        // Atomic replacement invalidates proof even when bytes and length match.
+        try payload.write(to: f.destination, options: .atomic)
+        let replaced = try await controller.verifiedLocalArtifactAvailability(download: download)
+        XCTAssertEqual(replaced, .unavailable)
+        XCTAssertFalse(download.isFailed)
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testVerifiedNativeAdmissionDefersCompressedInputAndImports() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("pinned input".utf8)
+        try payload.write(to: f.destination)
+        let download = f.descriptor("native", checksum: Self.checksum(payload))
+        try download.ensureVerifiedLocalDestinationChecksum()
+        try Data("pending compressed input".utf8).write(to: download.compressedFileURL)
+        let controller = f.controller { _, _ in throw URLError(.notConnectedToInternet) }
+        let compressed = try await controller.verifiedLocalArtifactAvailability(download: download)
+        XCTAssertEqual(compressed, .unavailable)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: download.compressedFileURL.path))
+        try FileManager.default.moveItem(
+            at: download.compressedFileURL, to: f.root.appendingPathComponent("retained-input")
+        )
+        let imports = ReplayCounter()
+        let importable = ImportableDownloadable(
+            url: f.source.appendingPathComponent("import"), name: "import", localDestination: f.destination,
+            localDestinationChecksum: Self.checksum(payload), deleteAfterImport: false,
+            metadataStore: f.store,
+            isImported: { _ = await imports.next(); return true },
+            importHandler: { _, _ in XCTFail("Admission must not start an importer") }
+        )
+        let importOutcome = try await controller.verifiedLocalArtifactAvailability(download: importable)
+        XCTAssertEqual(importOutcome, .unavailable)
+        let importChecks = await imports.count
+        XCTAssertEqual(importChecks, 0)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testVerifiedNativeAdmissionPreservesBackgroundAndCancellationBoundaries() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("verified dictionary".utf8)
+        try payload.write(to: f.destination)
+        let download = f.descriptor("native", checksum: Self.checksum(payload))
+        try download.ensureVerifiedLocalDestinationChecksum()
+        let controller = f.controller { _, _ in throw URLError(.notConnectedToInternet) }
+        await controller.cancelAndDrainForBackgrounding()
+        let suspended = try await controller.verifiedLocalArtifactAvailability(download: download)
+        XCTAssertEqual(suspended, .busy)
+        let reopened = await controller.reopenAdmissionAfterBackgroundDrain(shouldResume: { true })
+        XCTAssertTrue(reopened)
+        let available = try await controller.verifiedLocalArtifactAvailability(download: download)
+        XCTAssertEqual(available, .available)
+        let canceled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await controller.verifiedLocalArtifactAvailability(download: download)
+        }
+        do {
+            _ = try await canceled.value
+            XCTFail("Canceled native admission must throw")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
     func testLocalPreparationObservationIsScopedAndPreservesVerifiedOfflineReadiness() async throws {
         let f = try fixture(observeLocalRequests: true)
         let payload = Data("verified local dictionary".utf8)
@@ -191,14 +306,13 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         let stages = capture.snapshot()
         let expectedOrder: [(DownloadController.LocalPreparationStage, DownloadController.LocalPreparationStage)] = [
             (.metadataRequested, .metadataReady),
-            (.publicationRequested, .publicationStarted),
-            (.publicationStarted, .publicationApplied),
-            (.publicationApplied, .publicationFinished),
-            (.publicationFinished, .stateRequested),
-            (.stateRequested, .stateRead),
-            (.stateRead, .stateReady),
+            (.metadataReady, .processingRequested),
+            (.processingRequested, .verifiedArtifact),
             (.verifiedArtifact, .completed),
         ]
+        XCTAssertFalse(stages.contains(.publicationRequested))
+        XCTAssertFalse(stages.contains(.stateRequested))
+        XCTAssertFalse(download.isFinishedProcessing)
         for (before, after) in expectedOrder {
             XCTAssertLessThan(try XCTUnwrap(stages.firstIndex(of: before)),
                               try XCTUnwrap(stages.firstIndex(of: after)))
@@ -238,7 +352,7 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
     }
 
     @MainActor
-    func testVerifiedLocalPreparationClearsStaleTerminalFailure() async throws {
+    func testVerifiedLocalPreparationDefersClearingStaleFailureToOrdinaryAssurance() async throws {
         let f = try fixture(observeLocalRequests: true)
         let payload = Data("healthy installed dictionary".utf8)
         try payload.write(to: f.destination)
@@ -255,6 +369,10 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         controller.failedDownloads.insert(download)
         let outcome = try await controller.prepareAvailableLocalArtifact(download: download)
         XCTAssertEqual(outcome, .available)
+        XCTAssertTrue(download.isFailed, "UI errors do not defeat current native proof")
+        XCTAssertTrue(controller.failedDownloads.contains(download))
+        XCTAssertFalse(controller.finishedDownloads.contains(download))
+        await controller.ensureDownloaded(download: download)
         XCTAssertFalse(download.isFailed)
         XCTAssertFalse(controller.failedDownloads.contains(download))
         XCTAssertTrue(controller.finishedDownloads.contains(download))
@@ -295,7 +413,7 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
     }
 
     @MainActor
-    func testLocalPreparationRestoresProcessStateFromVerifiedPinnedArtifact() async throws {
+    func testLocalPreparationLeavesVerifiedPinnedUIStateForOrdinaryAssurance() async throws {
         let f = try fixture(observeLocalRequests: true)
         let payload = Data("already verified dictionary".utf8)
         try payload.write(to: f.destination)
@@ -309,9 +427,12 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         }
         let outcome = try await controller.prepareAvailableLocalArtifact(download: download)
         XCTAssertEqual(outcome, .available)
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertFalse(download.isFinishedDownloading)
+        XCTAssertFalse(controller.assuredDownloads.contains(download))
+        await controller.ensureDownloaded(download: download)
         XCTAssertTrue(download.isFinishedProcessing)
         XCTAssertTrue(download.isFinishedDownloading)
-        XCTAssertFalse(controller.assuredDownloads.contains(download))
         XCTAssertNil(download.lastDownloaded)
         XCTAssertEqual(try Data(contentsOf: f.destination), payload)
         let count = await transfers.count
@@ -385,17 +506,260 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
             return try Self.transfer(download, text: "unexpected")
         }
 
-        let outcome = try await controller.prepareAvailableLocalArtifact(download: download)
+        let capture = LocalPreparationStageCapture()
+        let outcome = try await DownloadController.$localPreparationStageObserver.withValue({
+            capture.append($0)
+        }) {
+            try await controller.prepareAvailableLocalArtifact(download: download)
+        }
 
         XCTAssertEqual(outcome, .available)
-        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertFalse(download.isFinishedDownloading)
+        XCTAssertTrue(controller.finishedDownloads.isEmpty)
+        XCTAssertFalse(capture.snapshot().contains(.publicationRequested))
+        XCTAssertFalse(capture.snapshot().contains(.stateRequested))
         XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
         XCTAssertEqual(try Data(contentsOf: f.destination), payload)
         XCTAssertFalse(controller.assuredDownloads.contains(download))
         XCTAssertNil(download.lastDownloaded)
         XCTAssertNil(download.lastCheckedETagAt)
+        let replay = f.descriptor("compatible local", checksum: Self.checksum(payload))
+        let replayOutcome = try await controller.prepareAvailableLocalArtifact(download: replay)
+        XCTAssertEqual(replayOutcome, .available)
+        XCTAssertFalse(replay.isFinishedProcessing)
+        XCTAssertFalse(replay.isFinishedDownloading)
+        await controller.ensureDownloaded(download: replay)
+        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertTrue(replay.isFinishedProcessing)
+        XCTAssertTrue(replay.isFinishedDownloading)
+        XCTAssertEqual(replay.fileSize, UInt64(payload.count))
+        XCTAssertNil(download.lastDownloaded)
+        XCTAssertNil(download.lastCheckedETagAt)
+        XCTAssertNil(download.lastDownloadedETag)
         let transferCount = await transfers.count
         XCTAssertEqual(transferCount, 0)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testConcurrentCompatibleFreshNativePreparationsLeaveUICompletionToAssurance() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data(repeating: 0x61, count: 1024 * 1024)
+        try payload.write(to: f.destination)
+        let owner = f.descriptor("fresh owner", checksum: Self.checksum(payload))
+        let replay = f.descriptor("fresh replay", checksum: Self.checksum(payload))
+        let controller = f.controller { _, _ in
+            XCTFail("Concurrent native preparation must remain offline")
+            throw URLError(.notConnectedToInternet)
+        }
+        async let ownerOutcome = controller.prepareAvailableLocalArtifact(download: owner)
+        async let replayOutcome = controller.prepareAvailableLocalArtifact(download: replay)
+        let outcomes = try await [ownerOutcome, replayOutcome]
+        XCTAssertEqual(outcomes, [.available, .available])
+        XCTAssertTrue(owner.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertFalse(owner.isFinishedProcessing)
+        XCTAssertFalse(replay.isFinishedProcessing)
+        XCTAssertTrue(controller.finishedDownloads.isEmpty)
+        await controller.ensureDownloaded(download: replay)
+        XCTAssertTrue(replay.isFinishedProcessing)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testFreshNativePreparationRechecksAtomicReplacementAfterVerification() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("fresh pinned dictionary".utf8)
+        try payload.write(to: f.destination)
+        let download = f.descriptor("native replacement", checksum: Self.checksum(payload))
+        let controller = f.controller { _, _ in
+            XCTFail("Native preparation must remain offline")
+            throw URLError(.notConnectedToInternet)
+        }
+        let destination = f.destination
+        let outcome = try await DownloadController.$localPreparationStageObserver.withValue({ stage in
+            if stage == .verifiedArtifact {
+                // Identical bytes on a new inode still invalidate the marker.
+                do { try payload.write(to: destination, options: .atomic) }
+                catch { XCTFail("Could not replace verified fixture: \(error)") }
+            }
+        }) {
+            try await controller.prepareAvailableLocalArtifact(download: download)
+        }
+        XCTAssertEqual(outcome, .unavailable)
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testFreshNativePreparationCancellationAtAdmissionLeavesRetryAvailable() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("cancelable native dictionary".utf8)
+        try payload.write(to: f.destination)
+        let download = f.descriptor("native cancellation", checksum: Self.checksum(payload))
+        let controller = f.controller { _, _ in
+            XCTFail("Local preparation and retry must remain offline")
+            throw URLError(.notConnectedToInternet)
+        }
+        let canceled = Task {
+            try await DownloadController.$localPreparationStageObserver.withValue({ stage in
+                if stage == .processingRequested {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+            }) {
+                try await controller.prepareAvailableLocalArtifact(download: download)
+            }
+        }
+        do {
+            _ = try await canceled.value
+            XCTFail("Canceled native owner must throw")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertFalse(download.isFinishedProcessing)
+        let retried = try await controller.prepareAvailableLocalArtifact(download: download)
+        XCTAssertEqual(retried, .available)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testCanceledNativeProcessorPreservesRetainedBytesWithoutProof() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("retained native input survives cancellation".utf8)
+        try payload.write(to: f.destination)
+        let download = f.descriptor("canceled native processor", checksum: Self.checksum(payload))
+        let controller = f.controller { _, _ in
+            XCTFail("Canceling local verification cannot require a remote replacement")
+            throw URLError(.notConnectedToInternet)
+        }
+        let markerURL = download.checksumVerificationMarkerURL
+        let outcome = try await DownloadController.$localPreparationStageObserver.withValue({ stage in
+            if stage == .verifiedArtifact {
+                // Exercise cancellation cleanup without reusable proof. This
+                // is a deterministic completion-boundary test, not mid-hash QA.
+                do { try FileManager.default.removeItem(at: markerURL) }
+                catch { XCTFail("Could not invalidate fixture proof: \(error)") }
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+        }) {
+            try await controller.prepareAvailableLocalArtifact(download: download)
+        }
+        XCTAssertEqual(outcome, .unavailable)
+        XCTAssertEqual(try Data(contentsOf: f.destination), payload)
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        let retried = try await controller.prepareAvailableLocalArtifact(download: download)
+        XCTAssertEqual(retried, .available)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertEqual(try Data(contentsOf: f.destination), payload)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testNativePreparationRehashesCorruptMarkerAndOrdinaryAssuranceStaysOffline() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("healthy retained bytes with a truncated marker".utf8)
+        try payload.write(to: f.destination)
+        let download = f.descriptor("corrupt marker", checksum: Self.checksum(payload))
+        try Data("{\"schemaVersion\":".utf8).write(to: download.checksumVerificationMarkerURL)
+        let controller = f.controller { _, _ in
+            XCTFail("Marker repair must not acquire remote bytes")
+            throw URLError(.notConnectedToInternet)
+        }
+        let before = try await controller.verifiedLocalArtifactAvailability(download: download)
+        XCTAssertEqual(before, .unavailable)
+        let outcome = try await controller.prepareAvailableLocalArtifact(download: download)
+        XCTAssertEqual(outcome, .available)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertEqual(try Data(contentsOf: f.destination), payload)
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertFalse(download.isFinishedDownloading)
+        await controller.ensureDownloaded(download: download)
+        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertFalse(download.isFailed)
+        XCTAssertNil(download.lastDownloaded)
+        XCTAssertNil(download.lastCheckedETagAt)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testNativePreparationMarkerWriteFailurePreservesPayloadForOfflineRetry() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("healthy retained bytes with blocked marker persistence".utf8)
+        try payload.write(to: f.destination)
+        let download = f.descriptor("blocked marker", checksum: Self.checksum(payload))
+        // A directory deterministically prevents the atomic marker file write.
+        // Retain its contents to verify error cleanup does not remove occupants.
+        try FileManager.default.createDirectory(
+            at: download.checksumVerificationMarkerURL, withIntermediateDirectories: false
+        )
+        let blocker = download.checksumVerificationMarkerURL.appendingPathComponent("retained-blocker")
+        let blockerBytes = Data("retain me".utf8)
+        try blockerBytes.write(to: blocker)
+        let controller = f.controller { _, _ in
+            XCTFail("Marker I/O failure and retry must stay offline")
+            throw URLError(.notConnectedToInternet)
+        }
+        let outcome = try await controller.prepareAvailableLocalArtifact(download: download)
+        XCTAssertEqual(outcome, .unavailable)
+        XCTAssertTrue(download.isFailed)
+        XCTAssertFalse(download.isFinishedDownloading)
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertEqual(try Data(contentsOf: f.destination), payload)
+        XCTAssertEqual(try Data(contentsOf: blocker), blockerBytes)
+        let failedProof = try await controller.verifiedLocalArtifactAvailability(download: download)
+        XCTAssertEqual(failedProof, .unavailable)
+
+        try FileManager.default.moveItem(
+            at: download.checksumVerificationMarkerURL,
+            to: f.root.appendingPathComponent("preserved-marker-blocker")
+        )
+        let retried = try await controller.prepareAvailableLocalArtifact(download: download)
+        XCTAssertEqual(retried, .available)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertEqual(try Data(contentsOf: f.destination), payload)
+        XCTAssertTrue(download.isFailed, "Native readiness leaves stale UI failure to assurance")
+        await controller.ensureDownloaded(download: download)
+        XCTAssertFalse(download.isFailed)
+        XCTAssertTrue(download.isFinishedDownloading)
+        XCTAssertNil(download.lastDownloaded)
+        XCTAssertNil(download.lastCheckedETagAt)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testCorruptMarkerDoesNotAdmitMismatchedPinnedBytes() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("expected pinned bytes".utf8)
+        try Data("different retained bytes".utf8).write(to: f.destination)
+        let download = f.descriptor("corrupt marker mismatch", checksum: Self.checksum(payload))
+        try Data("not JSON".utf8).write(to: download.checksumVerificationMarkerURL)
+        let controller = f.controller { _, _ in
+            XCTFail("A bad checksum must not trigger local-only network recovery")
+            throw URLError(.notConnectedToInternet)
+        }
+        let outcome = try await controller.prepareAvailableLocalArtifact(download: download)
+        XCTAssertEqual(outcome, .unavailable)
+        XCTAssertTrue(download.isFailed)
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.destination.path))
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testFreshNativePreparationRejectsEmptyPinnedFile() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        try Data().write(to: f.destination)
+        let download = f.descriptor("empty native", checksum: Self.checksum(Data()))
+        let controller = f.controller { _, _ in
+            XCTFail("Invalid native preparation cannot recover remotely")
+            throw URLError(.notConnectedToInternet)
+        }
+        let outcome = try await controller.prepareAvailableLocalArtifact(download: download)
+        XCTAssertEqual(outcome, .unavailable)
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertTrue(download.isFailed)
         XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
     }
 
@@ -421,6 +785,7 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(outcome, .available)
         XCTAssertEqual(try Data(contentsOf: f.destination), payload)
         XCTAssertTrue(download.isReadyForImmediateLocalRead())
+        XCTAssertTrue(download.isFinishedProcessing, "Compressed processing retains ordinary publication")
         XCTAssertFalse(FileManager.default.fileExists(atPath: download.compressedFileURL.path))
         let transferCount = await transfers.count
         XCTAssertEqual(transferCount, 0)
@@ -541,6 +906,10 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         await fulfillment(of: [entered], timeout: 2)
         let returned = expectation(description: "local requests do not await remote gate")
         let local = Task {
+            let native = try await controller.verifiedLocalArtifactAvailability(download: owner)
+            let nativeReplay = try await controller.verifiedLocalArtifactAvailability(download: f.descriptor("native replay"))
+            XCTAssertEqual(native, .busy)
+            XCTAssertEqual(nativeReplay, .busy)
             let direct = try await controller.prepareAvailableLocalArtifact(download: owner)
             let replay = try await controller.prepareAvailableLocalArtifact(download: f.descriptor("replay"))
             XCTAssertEqual(direct, .busy)
@@ -632,6 +1001,8 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         let controller = f.controller { _, _ in throw URLError(.notConnectedToInternet) }
         let owner = Task { try await controller.prepareAvailableLocalArtifact(download: download) }
         await fulfillment(of: [entered], timeout: 2)
+        let nativeWhileProcessing = try await controller.verifiedLocalArtifactAvailability(download: replay)
+        XCTAssertEqual(nativeWhileProcessing, .unavailable)
         let returned = expectation(description: "local waiter waits for shared processor")
         returned.isInverted = true
         let canceled = expectation(description: "local waiter cancellation returns independently")
@@ -804,7 +1175,8 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         let stagedAfterCancellation = try FileManager.default.contentsOfDirectory(
             at: f.root, includingPropertiesForKeys: nil
         )
-        XCTAssertEqual(Set(stagedAfterCancellation), Set([download.compressedFileURL]),
+        XCTAssertEqual(Set(stagedAfterCancellation.map { $0.resolvingSymlinksInPath() }),
+                       Set([download.compressedFileURL.resolvingSymlinksInPath()]),
                        "Only the retained input survives; attempt-owned staging is removed")
         XCTAssertEqual(LocalPreparationURLProtocol.requests.count(download.url), 0)
 
@@ -813,6 +1185,7 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(outcome, .available)
         XCTAssertEqual(try Data(contentsOf: f.destination), payload)
         XCTAssertTrue(download.isReadyForImmediateLocalRead())
+        XCTAssertTrue(download.isFinishedProcessing, "Compressed processing retains ordinary publication")
         XCTAssertFalse(FileManager.default.fileExists(atPath: download.compressedFileURL.path))
         XCTAssertEqual(LocalPreparationURLProtocol.requests.count(download.url), 0)
     }
@@ -1053,6 +1426,260 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(replay.isFinishedProcessing)
         XCTAssertNil(replay.importProgress)
         XCTAssertNil(replay.importStatusText)
+    }
+
+    @MainActor
+    func testOrdinaryStartupAssuranceReusesVerifiedPinnedReceiptOffline() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("retained startup dictionary".utf8)
+        try payload.write(to: f.destination)
+        let checksum = Self.checksum(payload)
+        let installed = f.descriptor("installed dictionary", checksum: checksum)
+        let seed = f.controller { _, _ in throw URLError(.badURL) }
+        await seed.finishDownload(installed, finalResponseURL: f.source)
+        let original = try XCTUnwrap(f.store.installedArtifactReceipt(
+            sourceURL: f.source, destinationURL: f.destination
+        ))
+        let downloadedAt = installed.lastDownloaded
+        // A new process's descriptor starts without completion UI state, while
+        // its retained bytes, verification marker and receipt remain on disk.
+        let restored = f.descriptor("restored dictionary", checksum: checksum)
+        XCTAssertFalse(restored.isFinishedProcessing)
+        let controller = f.controller { _, _ in
+            XCTFail("Retained startup assurance must stay offline")
+            throw URLError(.notConnectedToInternet)
+        }
+        let capture = LocalPreparationStageCapture()
+        await DownloadController.$localPreparationStageObserver.withValue({ capture.append($0) }) {
+            await controller.ensureDownloaded(download: restored)
+        }
+        XCTAssertEqual(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 1)
+        XCTAssertFalse(restored.isFailed)
+        XCTAssertTrue(restored.isFinishedProcessing)
+        XCTAssertEqual(restored.lastDownloaded, downloadedAt)
+        XCTAssertEqual(try f.store.installedArtifactReceipt(
+            sourceURL: f.source, destinationURL: f.destination
+        ), original)
+        XCTAssertEqual(try Data(contentsOf: f.destination), payload)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testFinishReusesVerifiedReceiptForUnchangedPlainFile() async throws {
+        let originalURL = URL(string: "https://cdn.invalid/original.txt")!
+        let updatedURL = URL(string: "https://cdn.invalid/updated.txt")!
+        for finalURL in [nil, updatedURL] as [URL?] {
+            let f = try fixture()
+            let payload = Data("retained plain file".utf8)
+            try payload.write(to: f.destination)
+            let seedController = f.controller { _, _ in throw URLError(.badURL) }
+            await seedController.finishDownload(f.descriptor("seed"), finalResponseURL: originalURL)
+            let original = try XCTUnwrap(f.store.installedArtifactReceipt(
+                sourceURL: f.source, destinationURL: f.destination
+            ))
+            let download = f.descriptor("retained")
+            let controller = f.controller { _, _ in
+                XCTFail("Finishing retained bytes must not acquire a replacement")
+                throw URLError(.badURL)
+            }
+            let capture = LocalPreparationStageCapture()
+            await DownloadController.$localPreparationStageObserver.withValue({ capture.append($0) }) {
+                await controller.finishDownload(download, etag: "retained", finalResponseURL: finalURL)
+            }
+
+            XCTAssertEqual(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 1,
+                           "Validate stored proof fully once, then reuse it within this finish")
+            XCTAssertFalse(download.isFailed)
+            XCTAssertTrue(download.isFinishedProcessing)
+            XCTAssertEqual(download.lastDownloadedETag, "retained")
+            let receipt = try XCTUnwrap(f.store.installedArtifactReceipt(
+                sourceURL: f.source, destinationURL: f.destination
+            ))
+            XCTAssertEqual(receipt.schemaVersion, original.schemaVersion)
+            XCTAssertEqual(receipt.sha256Digest, original.sha256Digest)
+            XCTAssertEqual(receipt.byteCount, original.byteCount)
+            XCTAssertEqual(receipt.modificationTimeIntervalSince1970, original.modificationTimeIntervalSince1970)
+            XCTAssertEqual(receipt.fileSystemFileNumber, original.fileSystemFileNumber)
+            XCTAssertEqual(receipt.fileSystemNumber, original.fileSystemNumber)
+            XCTAssertEqual(receipt.requestedSourceURL, original.requestedSourceURL)
+            XCTAssertEqual(receipt.destinationURL, original.destinationURL)
+            XCTAssertEqual(receipt.finalResponseURL, finalURL ?? originalURL)
+            XCTAssertEqual(try Data(contentsOf: f.destination), payload)
+        }
+    }
+
+    @MainActor
+    func testFinishReusesVerifiedReceiptWithoutRecordingAnotherDownload() async throws {
+        let f = try fixture()
+        try Data("already installed".utf8).write(to: f.destination)
+        let download = f.descriptor("installed")
+        let controller = f.controller { _, _ in throw URLError(.badURL) }
+        await controller.finishDownload(download, finalResponseURL: f.source)
+        let original = try XCTUnwrap(f.store.installedArtifactReceipt(
+            sourceURL: f.source, destinationURL: f.destination
+        ))
+        let downloadedAt = download.lastDownloaded
+        let capture = LocalPreparationStageCapture()
+        await DownloadController.$localPreparationStageObserver.withValue({ capture.append($0) }) {
+            await controller.finishDownload(download, recordSuccessfulDownload: false)
+        }
+        XCTAssertEqual(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 1)
+        XCTAssertFalse(download.isFailed)
+        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertEqual(download.lastDownloaded, downloadedAt)
+        XCTAssertEqual(try f.store.installedArtifactReceipt(
+            sourceURL: f.source, destinationURL: f.destination
+        ), original)
+    }
+
+    @MainActor
+    func testFinishRejectsReceiptReplacedDuringSuspendedImportCheck() async throws {
+        let f = try fixture()
+        let originalPayload = Data("original contents".utf8)
+        let replacement = Data("replaced contents".utf8)
+        try originalPayload.write(to: f.destination)
+        let seedController = f.controller { _, _ in throw URLError(.badURL) }
+        await seedController.finishDownload(f.descriptor("seed"))
+        let original = try XCTUnwrap(f.store.installedArtifactReceipt(
+            sourceURL: f.source, destinationURL: f.destination
+        ))
+        let gate = ReplayGate()
+        let entered = expectation(description: "receipt validated before import-state suspension")
+        let destination = f.destination
+        let download = ImportableDownloadable(
+            url: f.source, name: "suspended check", localDestination: destination,
+            deleteAfterImport: false, metadataStore: f.store,
+            isImported: {
+                entered.fulfill()
+                await gate.wait()
+                do {
+                    try replacement.write(to: destination, options: .atomic)
+                    // Preserve length and mtime: the replacement inode must
+                    // invalidate the operation's previously verified facts.
+                    try FileManager.default.setAttributes([
+                        .modificationDate: Date(timeIntervalSince1970: original.modificationTimeIntervalSince1970)
+                    ], ofItemAtPath: destination.path)
+                } catch { XCTFail("Could not replace retained input: \(error)") }
+                return true
+            },
+            importHandler: { _, _ in XCTFail("A replaced receipt cannot admit an import") }
+        )
+        let controller = f.controller { _, _ in throw URLError(.badURL) }
+        let capture = LocalPreparationStageCapture()
+        let finish = Task {
+            await DownloadController.$localPreparationStageObserver.withValue({ capture.append($0) }) {
+                await controller.finishDownload(download, recordSuccessfulDownload: false)
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 1)
+        await gate.open()
+        await finish.value
+        XCTAssertTrue(download.isFailed)
+        XCTAssertFalse(controller.finishedDownloads.contains(download))
+        XCTAssertEqual(try Data(contentsOf: destination), replacement)
+        XCTAssertNil(try f.store.installedArtifactReceipt(sourceURL: f.source, destinationURL: destination))
+        XCTAssertFalse(download.isReadyForImmediateLocalRead())
+    }
+
+    @MainActor
+    private func assertFinishRehashesAfterSuspendedImporter(replacingSource: Bool) async throws {
+        let f = try fixture()
+        let payload = Data("original contents".utf8)
+        let replacement = Data("replaced contents".utf8)
+        let originalURL = URL(string: "https://cdn.invalid/import-source.txt")!
+        try payload.write(to: f.destination)
+        let seedController = f.controller { _, _ in throw URLError(.badURL) }
+        await seedController.finishDownload(f.descriptor("seed"), finalResponseURL: originalURL)
+        let original = try XCTUnwrap(f.store.installedArtifactReceipt(
+            sourceURL: f.source, destinationURL: f.destination
+        ))
+        let gate = ReplayGate()
+        let entered = expectation(description: "importer suspended after initial byte validation")
+        let imported = ReplayImportState()
+        let download = ImportableDownloadable(
+            url: f.source, name: "suspended importer", localDestination: f.destination,
+            deleteAfterImport: false, metadataStore: f.store,
+            isImported: { await imported.isImported },
+            importHandler: { input, _ in
+                entered.fulfill()
+                await gate.wait()
+                if replacingSource {
+                    try replacement.write(to: input, options: .atomic)
+                    try FileManager.default.setAttributes([
+                        .modificationDate: Date(timeIntervalSince1970: original.modificationTimeIntervalSince1970)
+                    ], ofItemAtPath: input.path)
+                }
+                await imported.setImported(true)
+            }
+        )
+        let controller = f.controller { _, _ in throw URLError(.badURL) }
+        let capture = LocalPreparationStageCapture()
+        let finish = Task {
+            await DownloadController.$localPreparationStageObserver.withValue({ capture.append($0) }) {
+                await controller.finishDownload(download)
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertEqual(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 1)
+        await gate.open()
+        await finish.value
+        XCTAssertEqual(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 2,
+                       "An importer must earn fresh byte proof even when its input is unchanged")
+        XCTAssertFalse(download.isFailed)
+        XCTAssertTrue(download.isFinishedProcessing)
+        let receipt = try XCTUnwrap(f.store.installedArtifactReceipt(
+            sourceURL: f.source, destinationURL: f.destination
+        ))
+        let expectedPayload = replacingSource ? replacement : payload
+        let expectedDigest = SHA256.hash(data: expectedPayload).map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(receipt.sha256Digest, expectedDigest)
+        XCTAssertEqual(receipt.finalResponseURL, originalURL)
+        XCTAssertEqual(try Data(contentsOf: f.destination), expectedPayload)
+        XCTAssertTrue(download.isReadyForImmediateLocalRead())
+        if replacingSource {
+            XCTAssertNotEqual(receipt.fileSystemFileNumber, original.fileSystemFileNumber)
+            XCTAssertFalse(download.installedArtifactMatches(original))
+        } else {
+            XCTAssertEqual(receipt, original)
+        }
+    }
+
+    @MainActor
+    func testFinishRehashesUnchangedInputAfterSuspendedImporter() async throws {
+        try await assertFinishRehashesAfterSuspendedImporter(replacingSource: false)
+    }
+
+    @MainActor
+    func testFinishRehashesReplacementAfterSuspendedImporter() async throws {
+        try await assertFinishRehashesAfterSuspendedImporter(replacingSource: true)
+    }
+
+    @MainActor
+    func testStoredReceiptAlwaysRequiresFullSHA256Validation() async throws {
+        let f = try fixture()
+        try Data("untrusted stored proof".utf8).write(to: f.destination)
+        let download = f.descriptor("untrusted")
+        let receipt = try download.makeInstalledArtifactReceipt(finalResponseURL: f.source)
+        let forged = InstalledArtifactReceipt(
+            requestedSourceURL: receipt.requestedSourceURL, finalResponseURL: receipt.finalResponseURL,
+            destinationURL: receipt.destinationURL, sha256Digest: String(repeating: "0", count: 64),
+            byteCount: receipt.byteCount, modificationTimeIntervalSince1970: receipt.modificationTimeIntervalSince1970,
+            fileSystemNumber: receipt.fileSystemNumber, fileSystemFileNumber: receipt.fileSystemFileNumber
+        )
+        // Every non-byte identity field matches the current file.
+        try download.persistInstalledArtifactReceipt(forged)
+        XCTAssertFalse(download.installedArtifactMatches(forged))
+        XCTAssertNil(download.validInstalledArtifactReceipt())
+        try download.persistInstalledArtifactReceipt(forged)
+        let controller = f.controller { _, _ in throw URLError(.badURL) }
+        let capture = LocalPreparationStageCapture()
+        await DownloadController.$localPreparationStageObserver.withValue({ capture.append($0) }) {
+            await controller.finishDownload(download, recordSuccessfulDownload: false)
+        }
+        XCTAssertEqual(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 1)
+        XCTAssertTrue(download.isFailed)
+        XCTAssertNil(try f.store.installedArtifactReceipt(sourceURL: f.source, destinationURL: f.destination))
     }
 
     @MainActor

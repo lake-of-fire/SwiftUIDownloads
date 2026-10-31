@@ -84,6 +84,7 @@ private func sha256Checksum(for fileURL: URL) throws -> String {
     let fileHandle = try FileHandle(forReadingFrom: fileURL)
     defer { try? fileHandle.close() }
 
+    DownloadController.localPreparationStageObserver?(.hashingInstalledArtifact)
     var hasher = SHA256()
     while autoreleasepool(invoking: {
         guard !Task.isCancelled else { return false }
@@ -110,6 +111,29 @@ private func installedArtifactReceipt(
             == identity.modificationTimeIntervalSince1970
         && receipt.fileSystemNumber == identity.fileSystemNumber
         && receipt.fileSystemFileNumber == identity.fileSystemFileNumber
+}
+
+/// Operation-local result of full SHA256 validation; never persisted or cached.
+fileprivate struct VerifiedInstalledArtifactReceipt: Sendable {
+    let receipt: InstalledArtifactReceipt
+
+    init?(validating receipt: InstalledArtifactReceipt, for download: Downloadable) {
+        guard download.installedArtifactMatches(receipt) else { return nil }
+        self.receipt = receipt
+    }
+
+    func isCurrent(for download: Downloadable) -> Bool {
+        guard !Task.isCancelled,
+              let identity = download.installedArtifactIdentity(matching: receipt) else {
+            return false
+        }
+        // Without an inode identity, retain the full validation fallback.
+        guard identity.fileSystemNumber != nil,
+              identity.fileSystemFileNumber != nil else {
+            return download.installedArtifactMatches(receipt)
+        }
+        return true
+    }
 }
 
 private enum InstalledArtifactReceiptValidationError: LocalizedError {
@@ -158,6 +182,17 @@ private struct DownloadLocalFileInspectionError: LocalizedError {
 
     var errorDescription: String? {
         "Unable to inspect local file at \(url.path): \(underlyingError.localizedDescription)"
+    }
+}
+
+/// A disposable verification marker is not the payload. Failure to inspect
+/// or retain it must fail admission without treating healthy bytes as corrupt.
+private struct DownloadChecksumMarkerIOError: LocalizedError {
+    let url: URL
+    let underlyingError: Error
+
+    var errorDescription: String? {
+        "Unable to use checksum verification marker at \(url.path): \(underlyingError.localizedDescription)"
     }
 }
 
@@ -461,6 +496,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         )
     }
 
+#if DEBUG
     private var shouldLogReaderOptimizationDiagnostics: Bool {
         let loweredName = name.lowercased()
         let loweredFilename = localDestination.lastPathComponent.lowercased()
@@ -470,11 +506,15 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             || loweredFilename.contains("lookup-cache")
             || loweredPath.contains("lookup-cache")
     }
+#endif
 
     private func logReaderOptimizationDiagnostic(
         _ stage: String,
         _ details: [String: String] = [:]
     ) {
+#if DEBUG
+        // Exportable TestFlight milestones are owned by ReaderLoadTrace. Keep
+        // these older console-only probes out of distribution builds.
         guard shouldLogReaderOptimizationDiagnostics else { return }
         var segments: [String] = [
             "stage=\(stage)",
@@ -487,6 +527,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             }
         }
         debugPrint(segments.joined(separator: " "))
+#endif
     }
     
     public func hash(into hasher: inout Hasher) {
@@ -661,6 +702,10 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     }
 
     func validInstalledArtifactReceipt() -> InstalledArtifactReceipt? {
+        verifiedInstalledArtifactReceipt()?.receipt
+    }
+
+    fileprivate func verifiedInstalledArtifactReceipt() -> VerifiedInstalledArtifactReceipt? {
         let receipt: InstalledArtifactReceipt
         do {
             guard let storedReceipt = try metadataStore.installedArtifactReceipt(
@@ -675,16 +720,19 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             return nil
         }
 
-        guard installedArtifactMatches(receipt) else {
+        guard let verified = VerifiedInstalledArtifactReceipt(validating: receipt, for: self) else {
             if !Task.isCancelled {
                 try? removeInstalledArtifactReceipt()
             }
             return nil
         }
-        return receipt
+        return verified
     }
 
-    func installedArtifactMatches(_ receipt: InstalledArtifactReceipt) -> Bool {
+    /// Binding and metadata checks only; this does not establish byte proof.
+    fileprivate func installedArtifactIdentity(
+        matching receipt: InstalledArtifactReceipt
+    ) -> ChecksumVerificationFileIdentity? {
         let standardizedSourceURL = standardizedArtifactSourceURL(url)
         let standardizedDestinationURL = localDestination.standardizedFileURL
         guard receipt.schemaVersion == InstalledArtifactReceipt.currentSchemaVersion,
@@ -696,7 +744,14 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
               let initialIdentity = checksumVerificationFileIdentity(
                 from: attributes
               ),
-              installedArtifactReceipt(receipt, matches: initialIdentity),
+              installedArtifactReceipt(receipt, matches: initialIdentity) else {
+            return nil
+        }
+        return initialIdentity
+    }
+
+    func installedArtifactMatches(_ receipt: InstalledArtifactReceipt) -> Bool {
+        guard let initialIdentity = installedArtifactIdentity(matching: receipt),
               let digest = try? sha256Checksum(for: localDestination),
               digest == receipt.sha256Digest,
               let currentAttributes = try? FileManager.default.attributesOfItem(
@@ -712,13 +767,26 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     func makeInstalledArtifactReceipt(
         finalResponseURL: URL?
     ) throws -> InstalledArtifactReceipt {
+        try makeInstalledArtifactReceipt(finalResponseURL: finalResponseURL, reusing: nil)
+    }
+
+    fileprivate func makeInstalledArtifactReceipt(
+        finalResponseURL: URL?,
+        reusing verifiedReceipt: VerifiedInstalledArtifactReceipt?
+    ) throws -> InstalledArtifactReceipt {
         let attributes = try FileManager.default.attributesOfItem(
             atPath: localDestination.path
         )
         guard let identity = checksumVerificationFileIdentity(from: attributes) else {
             throw DownloadableChecksumVerificationError.emptyFile(localDestination)
         }
-        let digest = try sha256Checksum(for: localDestination)
+        let digest: String
+        if let verifiedReceipt, verifiedReceipt.isCurrent(for: self) {
+            digest = verifiedReceipt.receipt.sha256Digest
+        } else {
+            digest = try sha256Checksum(for: localDestination)
+        }
+        try Task.checkCancellation()
         try requireFileIdentity(identity, at: localDestination)
         return InstalledArtifactReceipt(
             requestedSourceURL: standardizedArtifactSourceURL(url),
@@ -955,11 +1023,28 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         if checkingCancellation {
             try Task.checkCancellation()
         }
-        let data = try JSONEncoder().encode(marker)
-        try data.write(to: checksumVerificationMarkerURL, options: .atomic)
-        let currentAttributes = try FileManager.default.attributesOfItem(
-            atPath: localDestination.path
-        )
+        do {
+            let data = try JSONEncoder().encode(marker)
+            try data.write(to: checksumVerificationMarkerURL, options: .atomic)
+        } catch {
+            throw DownloadChecksumMarkerIOError(
+                url: checksumVerificationMarkerURL,
+                underlyingError: error
+            )
+        }
+        let currentAttributes: [FileAttributeKey: Any]
+        do {
+            currentAttributes = try FileManager.default.attributesOfItem(
+                atPath: localDestination.path
+            )
+        } catch {
+            // A failed stat is not proof that the verified payload changed.
+            try? FileManager.default.removeItem(at: checksumVerificationMarkerURL)
+            throw DownloadLocalFileInspectionError(
+                url: localDestination,
+                underlyingError: error
+            )
+        }
         guard checksumVerificationFileIdentity(from: currentAttributes) == identity else {
             try? FileManager.default.removeItem(at: checksumVerificationMarkerURL)
             throw DownloadableChecksumVerificationError
@@ -976,8 +1061,26 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
 
     private func loadChecksumVerificationMarker() throws -> ChecksumVerificationMarker? {
         guard FileManager.default.fileExists(atPath: checksumVerificationMarkerURL.path) else { return nil }
-        let data = try Data(contentsOf: checksumVerificationMarkerURL)
-        return try JSONDecoder().decode(ChecksumVerificationMarker.self, from: data)
+        let data: Data
+        do {
+            let attributes = try FileManager.default.attributesOfItem(
+                atPath: checksumVerificationMarkerURL.path
+            )
+            // Non-file occupants cannot provide verification. Rehash bytes and
+            // let atomic marker persistence fail safely if the path is blocked.
+            guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                return nil
+            }
+            data = try Data(contentsOf: checksumVerificationMarkerURL)
+        } catch {
+            throw DownloadChecksumMarkerIOError(
+                url: checksumVerificationMarkerURL,
+                underlyingError: error
+            )
+        }
+        // Truncated JSON and obsolete/malformed shapes are disposable cache
+        // misses. Only a fresh checksum verification can replace their proof.
+        return try? JSONDecoder().decode(ChecksumVerificationMarker.self, from: data)
     }
     
     @MainActor
@@ -1560,6 +1663,7 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
         case metadataRequested, metadataReady, processingRequested
         case stateRequested, stateRead, stateReady, verifiedArtifact
         case publicationRequested, publicationStarted, publicationApplied, publicationFinished, completed
+        case hashingInstalledArtifact
     }
 
     @TaskLocal public static var localPreparationStageObserver:
@@ -2127,6 +2231,56 @@ public extension DownloadController {
 }
 
 extension DownloadController {
+    /// Read-only admission of an already verified pinned file. This does not
+    /// publish download UI state or establish remote assurance. The ordinary
+    /// download owner still publishes completion and performs recovery.
+    /// `.unavailable` selects normal local preparation, including imports and
+    /// retained compressed inputs. Availability is a snapshot, not a lease.
+    @DownloadActor
+    public func verifiedLocalArtifactAvailability(
+        download: Downloadable
+    ) async throws -> LocalPreparationOutcome {
+        try Task.checkCancellation()
+        await download.waitForDownloadMetadata()
+        try Task.checkCancellation()
+        switch await admit(download) {
+        case .owner:
+            break
+        case .compatibleReplay(let owner):
+            return try await verifiedLocalArtifactAvailability(download: owner)
+        case .rejected:
+            return .unavailable
+        }
+        try Task.checkCancellation()
+        guard !backgroundWorkIsSuspended,
+              downloadTasks[download.id] == nil,
+              checksumRecoveryTasks[download.id] == nil else { return .busy }
+        if let processing = processingTasks[download.id] {
+            // Preserve the normal local path's shared wait and cancellation.
+            return processing.scope == .localOnly ? .unavailable : .busy
+        }
+        guard canPrepareNativePinnedArtifact(download),
+              download.hasVerifiedLocalDestinationChecksumMarker() else {
+            return .unavailable
+        }
+        // No suspension between producer exclusion and native identity proof.
+        Self.localPreparationStageObserver?(.verifiedArtifact)
+        Self.localPreparationStageObserver?(.completed)
+        return .available
+    }
+
+    /// Eligibility only; callers must separately exclude producers and prove
+    /// the current checksum marker before admitting bytes.
+    @DownloadActor
+    private func canPrepareNativePinnedArtifact(_ download: Downloadable) -> Bool {
+        !(download is ImportableDownloadable)
+            && download.localDestinationChecksum != nil
+            && !completionMetadataRetryDownloadIDs.contains(download.id)
+            && pendingInstalledArtifactReceipts[download.id] == nil
+            && !FileManager.default.fileExists(atPath: download.compressedFileURL.path)
+            && FileManager.default.fileExists(atPath: download.localDestination.path)
+    }
+
     @DownloadActor
     private func admit(
         _ proposedDownload: Downloadable,
@@ -2376,7 +2530,10 @@ extension DownloadController {
     /// recovery. A canceled owner drains its processor before throwing; other
     /// local waiters own only their wait. This never establishes remote assurance.
     /// Missing or invalid retained bytes are unavailable; network-capable work
-    /// returns busy without being joined. Availability is a snapshot, not a lease.
+    /// returns busy without being joined. Retained pinned, non-importing files
+    /// without compressed input or unsettled completion metadata are prepared
+    /// from native checksum proof without publishing download UI state. Ordinary
+    /// assurance publishes that state later. Availability is a snapshot, not a lease.
     @DownloadActor
     public func prepareAvailableLocalArtifact(
         download: Downloadable
@@ -2390,8 +2547,20 @@ extension DownloadController {
         case .owner:
             break
         case .compatibleReplay(let owner):
+            let preparesNativeArtifactOnly = canPrepareNativePinnedArtifact(owner)
             let outcome = try await prepareAvailableLocalArtifact(download: owner)
             try Task.checkCancellation()
+            if preparesNativeArtifactOnly, outcome == .available {
+                // Recursion suspended: native replay must recheck ownership and
+                // proof too, without waiting for terminal UI state to mirror.
+                guard !backgroundWorkIsSuspended,
+                      downloadTasks[owner.id] == nil,
+                      checksumRecoveryTasks[owner.id] == nil,
+                      processingTasks[owner.id] == nil else { return .busy }
+                return canPrepareNativePinnedArtifact(owner)
+                    && owner.hasVerifiedLocalDestinationChecksumMarker()
+                    ? .available : .unavailable
+            }
             if outcome != .busy {
                 await mirrorTerminalState(from: owner, to: download)
             }
@@ -2404,6 +2573,7 @@ extension DownloadController {
         guard !backgroundWorkIsSuspended,
               downloadTasks[download.id] == nil,
               checksumRecoveryTasks[download.id] == nil else { return .busy }
+        let preparesNativeArtifactOnly = canPrepareNativePinnedArtifact(download)
         Self.localPreparationStageObserver?(.processingRequested)
         if let processing = processingTasks[download.id] {
             guard processing.scope == .localOnly else { return .busy }
@@ -2414,9 +2584,25 @@ extension DownloadController {
                 download,
                 recordSuccessfulDownload: false,
                 transferredFileURL: nil,
-                scope: .localOnly
+                scope: .localOnly,
+                preparesNativeArtifactOnly: preparesNativeArtifactOnly
             )
             try Task.checkCancellation()
+        }
+        if preparesNativeArtifactOnly {
+            // The registered processor has drained. Do not queue native
+            // readiness behind cosmetic flags; recheck live producers and proof
+            // without another suspension before returning the snapshot.
+            guard !backgroundWorkIsSuspended,
+                  downloadTasks[download.id] == nil,
+                  checksumRecoveryTasks[download.id] == nil,
+                  processingTasks[download.id] == nil else { return .busy }
+            let outcome: LocalPreparationOutcome =
+                canPrepareNativePinnedArtifact(download)
+                && download.hasVerifiedLocalDestinationChecksumMarker()
+                ? .available : .unavailable
+            Self.localPreparationStageObserver?(.completed)
+            return outcome
         }
         Self.localPreparationStageObserver?(.stateRequested)
         let finished = await MainActor.run {
@@ -3256,7 +3442,8 @@ extension DownloadController {
         recordSuccessfulDownload: Bool = true,
         transferredFileURL: URL?,
         expectedDownloadAttemptID: UUID? = nil,
-        scope: ProcessingScope = .ordinary
+        scope: ProcessingScope = .ordinary,
+        preparesNativeArtifactOnly: Bool = false
     ) async {
         if scope == .localOnly {
             guard downloadTasks[download.id] == nil,
@@ -3329,7 +3516,8 @@ extension DownloadController {
                 recordSuccessfulDownload: recordSuccessfulDownload,
                 transferredFileURL: transferredFileURL,
                 processingTaskID: processingTaskID,
-                scope: scope
+                scope: scope,
+                preparesNativeArtifactOnly: preparesNativeArtifactOnly
             )
         }
         processingTasks[download.id] = ProcessingTaskRecord(
@@ -3540,7 +3728,8 @@ extension DownloadController {
         recordSuccessfulDownload: Bool,
         transferredFileURL: URL? = nil,
         processingTaskID: UUID,
-        scope: ProcessingScope = .ordinary
+        scope: ProcessingScope = .ordinary,
+        preparesNativeArtifactOnly: Bool = false
     ) async {
         await download.waitForDownloadMetadata()
         if scope == .localOnly {
@@ -3641,28 +3830,33 @@ extension DownloadController {
             }
             return
         }
-        let existingInstalledArtifactReceipt = transferredFileURL == nil
-            ? download.validInstalledArtifactReceipt()
+        let usesNativePreparation = preparesNativeArtifactOnly
+            && scope == .localOnly
+            && !recordSuccessfulDownload
+            && transferredFileURL == nil
+            && canPrepareNativePinnedArtifact(download)
+        let verifiedInstalledArtifactReceipt = transferredFileURL == nil
+            && !usesNativePreparation
+            ? download.verifiedInstalledArtifactReceipt()
             : nil
+        let existingInstalledArtifactReceipt = verifiedInstalledArtifactReceipt?.receipt
         if !recordSuccessfulDownload,
            download.localDestinationChecksum == nil,
-           let existingInstalledArtifactReceipt {
+           let verifiedInstalledArtifactReceipt {
             let importIsComplete = if let importable = download as? ImportableDownloadable {
                 await importable.isImported()
             } else {
                 true
             }
             if importIsComplete,
-               download.installedArtifactMatches(
-                existingInstalledArtifactReceipt
-               ),
+               verifiedInstalledArtifactReceipt.isCurrent(for: download),
                !Task.isCancelled,
                processingTasks[download.id]?.id == processingTaskID {
                 try? FileManager.default.removeItemIfPresent(
                     at: download.compressedFileURL
                 )
                 await MainActor.run {
-                    download.fileSize = existingInstalledArtifactReceipt.byteCount
+                    download.fileSize = verifiedInstalledArtifactReceipt.receipt.byteCount
                 }
                 await publishSuccessfulCompletion(download)
                 checksumRedownloadAttempted.remove(download.id)
@@ -3727,6 +3921,27 @@ extension DownloadController {
         var finishStartedWithCompressedFile = false
         do {
             try Task.checkCancellation()
+            if usesNativePreparation {
+                // Keep verification under this processor's cancellation and
+                // drain lifetime. It writes only current native checksum proof;
+                // the ordinary assurance owner retains UI/receipt publication.
+                let checksumTask = Task.detached(priority: .utility) {
+                    try download.ensureVerifiedLocalDestinationChecksum()
+                }
+                try await withTaskCancellationHandler(operation: {
+                    try await checksumTask.value
+                }, onCancel: {
+                    checksumTask.cancel()
+                })
+                try Task.checkCancellation()
+                guard processingTasks[download.id]?.id == processingTaskID else {
+                    throw CancellationError()
+                }
+                Self.localPreparationStageObserver?(.verifiedArtifact)
+                try Task.checkCancellation()
+                clearDownloadStatusObservers(forDownloadID: download.id)
+                return
+            }
             let canReuseInstalledArtifact: Bool
             if scope == .localOnly {
                 // Retained pinned bytes can be admitted on their own identity.
@@ -3979,7 +4194,15 @@ extension DownloadController {
             } else {
                 let receipt = try download.makeInstalledArtifactReceipt(
                     finalResponseURL: finalResponseURL
-                        ?? existingInstalledArtifactReceipt?.finalResponseURL
+                        ?? existingInstalledArtifactReceipt?.finalResponseURL,
+                    // Importers may suspend or mutate input. Replacements and
+                    // imports always earn new byte proof; only retained plain
+                    // files may reuse this operation's validation after stat.
+                    reusing: transferredFileURL == nil
+                        && compressedCandidateURL == nil
+                        && stagedUncompressedFileURL == nil
+                        && !(download is ImportableDownloadable)
+                        ? verifiedInstalledArtifactReceipt : nil
                 )
                 let successfulMetadata = recordSuccessfulDownload
                     ? SuccessfulDownloadMetadata(
@@ -4098,7 +4321,11 @@ extension DownloadController {
                 let preservesInstalledDestination =
                     stagedUncompressedFileURL != nil
                     || finishStartedWithCompressedFile
-                if processingTasks[download.id]?.id == processingTaskID {
+                // Native preparation only inspected retained input. Canceling
+                // it must not delete those bytes or their receipt; ordinary
+                // assurance owns any later corruption recovery.
+                if processingTasks[download.id]?.id == processingTaskID,
+                   !usesNativePreparation {
                     try? removeAllLocalArtifacts(
                         for: download,
                         includingDestination: !preservesInstalledDestination
@@ -4116,6 +4343,7 @@ extension DownloadController {
                 || finishStartedWithCompressedFile
             let shouldDeleteLocal = (
                 error is DownloadLocalFileInspectionError
+                    || error is DownloadChecksumMarkerIOError
                     || error is DownloadCompressedPayloadValidationError
             )
                 ? false
@@ -4137,7 +4365,8 @@ extension DownloadController {
                 if shouldDeleteLocal && !preservesInstalledDestination {
                     try? FileManager.default.removeItem(at: download.localDestination)
                 }
-                if !preservesInstalledDestination {
+                if !preservesInstalledDestination,
+                   !(error is DownloadChecksumMarkerIOError) {
                     try? FileManager.default.removeItem(
                         at: download.checksumVerificationMarkerURL
                     )
