@@ -705,6 +705,24 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         verifiedInstalledArtifactReceipt()?.receipt
     }
 
+    /// Readiness comes from the current pinned checksum marker, not from the
+    /// stored receipt's SHA256. The receipt only binds this prior installation
+    /// to the same source, destination and file identity. Do not use this as a
+    /// VerifiedInstalledArtifactReceipt or as byte proof for an unpinned file.
+    fileprivate func retainedPinnedArtifactByteCount() -> UInt64? {
+        guard let expectedChecksum = localDestinationChecksum?.lowercased(),
+              let receipt = try? metadataStore.installedArtifactReceipt(
+                sourceURL: url, destinationURL: localDestination
+              ),
+              let identity = installedArtifactIdentity(matching: receipt),
+              let marker = try? loadChecksumVerificationMarker(),
+              marker.expectedChecksum == expectedChecksum,
+              checksumVerificationMarker(marker, matches: identity) else {
+            return nil
+        }
+        return identity.fileSize
+    }
+
     fileprivate func verifiedInstalledArtifactReceipt() -> VerifiedInstalledArtifactReceipt? {
         let receipt: InstalledArtifactReceipt
         do {
@@ -3830,6 +3848,22 @@ extension DownloadController {
             }
             return
         }
+        if scope == .ordinary,
+           !recordSuccessfulDownload,
+           transferredFileURL == nil,
+           finalResponseURL == nil,
+           canPrepareNativePinnedArtifact(download),
+           let byteCount = download.retainedPinnedArtifactByteCount(),
+           !Task.isCancelled,
+           processingTasks[download.id]?.id == processingTaskID {
+            // Local preparation admits these exact pinned bytes without UI
+            // publication. Finish ordinary assurance without
+            // hashing them again merely to validate the acquisition receipt.
+            await publishSuccessfulCompletion(download, fileSize: byteCount)
+            checksumRedownloadAttempted.remove(download.id)
+            clearDownloadStatusObservers(forDownloadID: download.id)
+            return
+        }
         let usesNativePreparation = preparesNativeArtifactOnly
             && scope == .localOnly
             && !recordSuccessfulDownload
@@ -4402,11 +4436,13 @@ extension DownloadController {
 
     @DownloadActor
     private func publishSuccessfulCompletion(
-        _ download: Downloadable, onlyIfChanged: Bool = false
+        _ download: Downloadable, onlyIfChanged: Bool = false,
+        fileSize: UInt64? = nil
     ) async {
         Self.localPreparationStageObserver?(.publicationRequested)
         await MainActor.run { [weak self] in
             Self.localPreparationStageObserver?(.publicationStarted)
+            if let fileSize { download.fileSize = fileSize }
             if let self {
                 if self.failedDownloads.contains(download) { self.failedDownloads.remove(download) }
                 if self.activeDownloads.contains(download) { self.activeDownloads.remove(download) }

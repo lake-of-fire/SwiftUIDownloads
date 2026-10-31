@@ -1436,11 +1436,17 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         let checksum = Self.checksum(payload)
         let installed = f.descriptor("installed dictionary", checksum: checksum)
         let seed = f.controller { _, _ in throw URLError(.badURL) }
-        await seed.finishDownload(installed, finalResponseURL: f.source)
+        await seed.finishDownload(
+            installed, etag: "retained-etag",
+            remoteModifiedAt: Date(timeIntervalSince1970: 1234),
+            finalResponseURL: f.source, updatesRemoteModifiedAt: true
+        )
         let original = try XCTUnwrap(f.store.installedArtifactReceipt(
             sourceURL: f.source, destinationURL: f.destination
         ))
         let downloadedAt = installed.lastDownloaded
+        let modifiedAt = installed.lastModifiedAt
+        let checkedAt = installed.lastCheckedETagAt
         // A new process's descriptor starts without completion UI state, while
         // its retained bytes, verification marker and receipt remain on disk.
         let restored = f.descriptor("restored dictionary", checksum: checksum)
@@ -1453,15 +1459,185 @@ final class DownloadCompatibleReplayTests: XCTestCase, @unchecked Sendable {
         await DownloadController.$localPreparationStageObserver.withValue({ capture.append($0) }) {
             await controller.ensureDownloaded(download: restored)
         }
-        XCTAssertEqual(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 1)
+        XCTAssertEqual(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 0)
         XCTAssertFalse(restored.isFailed)
+        XCTAssertTrue(restored.isFinishedDownloading)
         XCTAssertTrue(restored.isFinishedProcessing)
+        XCTAssertTrue(controller.finishedDownloads.contains(restored))
+        XCTAssertEqual(restored.fileSize, UInt64(payload.count))
         XCTAssertEqual(restored.lastDownloaded, downloadedAt)
+        XCTAssertEqual(restored.lastDownloadedETag, "retained-etag")
+        XCTAssertEqual(restored.lastModifiedAt, modifiedAt)
+        XCTAssertEqual(restored.lastCheckedETagAt, checkedAt)
+        guard case let .completed(destination, etag, error) = restored.downloadProgress else {
+            return XCTFail("Initial ordinary assurance must publish completion")
+        }
+        XCTAssertEqual(destination, f.destination)
+        XCTAssertEqual(etag, "retained-etag")
+        XCTAssertNil(error)
         XCTAssertEqual(try f.store.installedArtifactReceipt(
             sourceURL: f.source, destinationURL: f.destination
         ), original)
         XCTAssertEqual(try Data(contentsOf: f.destination), payload)
         XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testRetainedPinnedFinishPreservesExplicitResponseURLUpdate() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("retained pinned bytes with updated response metadata".utf8)
+        try payload.write(to: f.destination)
+        let checksum = Self.checksum(payload)
+        let installed = f.descriptor("installed", checksum: checksum)
+        await f.controller { _, _ in throw URLError(.badURL) }
+            .finishDownload(installed, finalResponseURL: f.source)
+        let installedAt = installed.lastDownloaded
+        let restored = f.descriptor("restored", checksum: checksum)
+        let responseURL = URL(string: "https://cdn.invalid/retained-dictionary")!
+        let controller = f.controller { _, _ in
+            XCTFail("Updating retained receipt metadata must stay offline")
+            throw URLError(.notConnectedToInternet)
+        }
+        await controller.finishDownload(
+            restored, finalResponseURL: responseURL,
+            recordSuccessfulDownload: false
+        )
+        let receipt = try XCTUnwrap(f.store.installedArtifactReceipt(
+            sourceURL: f.source, destinationURL: f.destination
+        ))
+        XCTAssertEqual(receipt.finalResponseURL, responseURL)
+        XCTAssertEqual(restored.lastDownloaded, installedAt)
+        XCTAssertTrue(restored.isFinishedProcessing)
+        XCTAssertFalse(restored.isFailed)
+        XCTAssertEqual(try Data(contentsOf: f.destination), payload)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testOrdinaryStartupAssuranceRequiresPinnedMarkerAndBoundReceipt() async throws {
+        for invalidation in ["missing-marker", "corrupt-marker", "missing-receipt", "unbound-receipt", "replacement"] {
+            let f = try fixture(observeLocalRequests: true)
+            let payload = Data("retained dictionary requiring full preparation".utf8)
+            try payload.write(to: f.destination)
+            let checksum = Self.checksum(payload)
+            let installed = f.descriptor("installed", checksum: checksum)
+            await f.controller { _, _ in throw URLError(.badURL) }.finishDownload(installed)
+            let original = try XCTUnwrap(f.store.installedArtifactReceipt(
+                sourceURL: f.source, destinationURL: f.destination
+            ))
+            switch invalidation {
+            case "missing-marker":
+                try FileManager.default.removeItem(at: installed.checksumVerificationMarkerURL)
+            case "corrupt-marker":
+                try Data("invalid marker".utf8).write(to: installed.checksumVerificationMarkerURL)
+            case "missing-receipt":
+                try installed.removeInstalledArtifactReceipt()
+            case "unbound-receipt":
+                let unbound = InstalledArtifactReceipt(
+                    requestedSourceURL: URL(string: "https://other.invalid/dictionary")!,
+                    finalResponseURL: original.finalResponseURL,
+                    destinationURL: original.destinationURL,
+                    sha256Digest: original.sha256Digest, byteCount: original.byteCount,
+                    modificationTimeIntervalSince1970: original.modificationTimeIntervalSince1970,
+                    fileSystemNumber: original.fileSystemNumber,
+                    fileSystemFileNumber: original.fileSystemFileNumber
+                )
+                try installed.persistInstalledArtifactReceipt(unbound)
+            default:
+                try payload.write(to: f.destination, options: .atomic)
+            }
+            let restored = f.descriptor("restored", checksum: checksum)
+            let controller = f.controller { _, _ in
+                XCTFail("Valid retained pinned bytes must stay offline: \(invalidation)")
+                throw URLError(.notConnectedToInternet)
+            }
+            let capture = LocalPreparationStageCapture()
+            await DownloadController.$localPreparationStageObserver.withValue({ capture.append($0) }) {
+                await controller.ensureDownloaded(download: restored)
+            }
+            XCTAssertEqual(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 1, invalidation)
+            XCTAssertFalse(restored.isFailed, invalidation)
+            XCTAssertTrue(restored.isFinishedProcessing, invalidation)
+            XCTAssertTrue(restored.hasVerifiedLocalDestinationChecksumMarker(), invalidation)
+            XCTAssertNotNil(restored.validInstalledArtifactReceipt(), invalidation)
+            XCTAssertEqual(try Data(contentsOf: f.destination), payload, invalidation)
+            XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0, invalidation)
+        }
+    }
+
+    @MainActor
+    func testOrdinaryStartupAssuranceRejectsReplacedPinnedBytes() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("original pinned dictionary".utf8)
+        try payload.write(to: f.destination)
+        let checksum = Self.checksum(payload)
+        let installed = f.descriptor("installed", checksum: checksum)
+        await f.controller { _, _ in throw URLError(.badURL) }.finishDownload(installed)
+        let originalDate = installed.lastDownloaded
+        try Data("replaced corrupt dictionary".utf8).write(to: f.destination, options: .atomic)
+        let restored = f.descriptor("restored", checksum: checksum)
+        XCTAssertFalse(restored.hasVerifiedLocalDestinationChecksumMarker())
+        let transfers = ReplayCounter()
+        let controller = f.controller { _, _ in
+            _ = await transfers.next()
+            throw URLError(.notConnectedToInternet)
+        }
+        await controller.ensureDownloaded(download: restored)
+        XCTAssertTrue(restored.isFailed)
+        XCTAssertFalse(restored.isFinishedDownloading)
+        XCTAssertFalse(controller.finishedDownloads.contains(restored))
+        XCTAssertEqual(restored.lastDownloaded, originalDate)
+        let attempts = await transfers.count
+        XCTAssertEqual(attempts, 1, "Changed bytes must enter ordinary checksum recovery")
+    }
+
+    @MainActor
+    func testOrdinaryStartupAssuranceStillHashesUnpinnedReceipt() async throws {
+        let f = try fixture(observeLocalRequests: true)
+        let payload = Data("unpinned retained dictionary".utf8)
+        try payload.write(to: f.destination)
+        await f.controller { _, _ in throw URLError(.badURL) }
+            .finishDownload(f.descriptor("installed"))
+        let original = try XCTUnwrap(f.store.installedArtifactReceipt(
+            sourceURL: f.source, destinationURL: f.destination
+        ))
+        let restored = f.descriptor("restored")
+        let controller = f.controller { _, _ in
+            XCTFail("Valid unpinned receipt must stay offline")
+            throw URLError(.notConnectedToInternet)
+        }
+        let capture = LocalPreparationStageCapture()
+        await DownloadController.$localPreparationStageObserver.withValue({ capture.append($0) }) {
+            await controller.ensureDownloaded(download: restored)
+        }
+        XCTAssertGreaterThan(capture.snapshot().filter { $0 == .hashingInstalledArtifact }.count, 0)
+        XCTAssertFalse(restored.isFailed)
+        XCTAssertTrue(restored.isFinishedProcessing)
+        XCTAssertEqual(try f.store.installedArtifactReceipt(
+            sourceURL: f.source, destinationURL: f.destination
+        ), original)
+        XCTAssertEqual(LocalPreparationURLProtocol.requests.count(f.source), 0)
+    }
+
+    @MainActor
+    func testPinnedMarkerDoesNotCertifyStoredReceiptDigest() async throws {
+        let f = try fixture()
+        let payload = Data("independently pinned bytes".utf8)
+        try payload.write(to: f.destination)
+        let download = f.descriptor("pinned", checksum: Self.checksum(payload))
+        try download.ensureVerifiedLocalDestinationChecksum()
+        let receipt = try download.makeInstalledArtifactReceipt(finalResponseURL: f.source)
+        let forged = InstalledArtifactReceipt(
+            requestedSourceURL: receipt.requestedSourceURL, finalResponseURL: receipt.finalResponseURL,
+            destinationURL: receipt.destinationURL, sha256Digest: String(repeating: "0", count: 64),
+            byteCount: receipt.byteCount, modificationTimeIntervalSince1970: receipt.modificationTimeIntervalSince1970,
+            fileSystemNumber: receipt.fileSystemNumber, fileSystemFileNumber: receipt.fileSystemFileNumber
+        )
+        try download.persistInstalledArtifactReceipt(forged)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertFalse(download.installedArtifactMatches(forged))
+        XCTAssertNil(download.validInstalledArtifactReceipt(),
+                     "Pinned readiness must not weaken the full SHA256 receipt-validation API")
     }
 
     @MainActor
