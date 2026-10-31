@@ -3638,7 +3638,8 @@ extension DownloadController {
                 download,
                 etag: etag,
                 remoteModifiedAt: remoteModifiedAt,
-                updatesRemoteModifiedAt: updatesRemoteModifiedAt
+                updatesRemoteModifiedAt: updatesRemoteModifiedAt,
+                revalidateInstalledDestination: true
             )
             guard !Task.isCancelled else {
                 discardTransferredCandidate(transferResult, for: download)
@@ -3676,7 +3677,8 @@ extension DownloadController {
         etag: String?,
         remoteModifiedAt: Date? = nil,
         updatesRemoteModifiedAt: Bool = false,
-        preserveInstalledDestination: Bool = false
+        preserveInstalledDestination: Bool = false,
+        revalidateInstalledDestination: Bool = false
     ) async -> DownloadTransferResult? {
         checksumRedownloadAttempted.insert(download.id)
         await MainActor.run { [weak self] in
@@ -3692,6 +3694,64 @@ extension DownloadController {
             download.isFinishedDownloading = false
             download.isFinishedProcessing = false
         }
+        guard !Task.isCancelled else { return nil }
+        if revalidateInstalledDestination,
+           download.localDestinationChecksum != nil {
+            // A queued local failure describes earlier bytes. Recheck after
+            // the MainActor suspension, immediately before destructive work.
+            // No checksum means the verifier's no-op cannot authorize reuse.
+            var reusesVerifiedDestination = false
+            do {
+                let attributes: [FileAttributeKey: Any]?
+                do {
+                    attributes = try FileManager.default.attributesOfItem(
+                        atPath: download.localDestination.path
+                    )
+                } catch let error as NSError {
+                    let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError
+                    guard (error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError)
+                            || (underlying?.domain == NSPOSIXErrorDomain && underlying?.code == Int(ENOENT)) else {
+                        throw error
+                    }
+                    // Earlier corrupt bytes may already have been removed.
+                    // Confirmed absence needs a replacement, not verification.
+                    attributes = nil
+                }
+                if let attributes {
+                    let inspectedIdentity = checksumVerificationFileIdentity(from: attributes)
+                    do {
+                        try download.ensureVerifiedLocalDestinationChecksum()
+                        reusesVerifiedDestination = true
+                    } catch DownloadableChecksumVerificationError.mismatch,
+                            DownloadableChecksumVerificationError.emptyFile {
+                        // A failed hash can describe an inode replaced while hashing.
+                        let currentIdentity = checksumVerificationFileIdentity(
+                            from: try FileManager.default.attributesOfItem(atPath: download.localDestination.path)
+                        )
+                        guard currentIdentity == inspectedIdentity else {
+                            throw DownloadableChecksumVerificationError.fileChangedDuringVerification(download.localDestination)
+                        }
+                    }
+                }
+            } catch {
+                // A changed file or unavailable proof is not corruption.
+                // Preserve the destination and complete existing waiters.
+                await markDownloadCancelled(download, error: error)
+                return nil
+            }
+            if reusesVerifiedDestination {
+                // The installed bytes supersede any retained transfer archive.
+                try? FileManager.default.removeItemIfPresent(at: download.compressedFileURL)
+                checksumRecoveriesReadyForProcessing.insert(download.id)
+                await finishDownloadedFile(
+                    download,
+                    recordSuccessfulDownload: false,
+                    transferredFileURL: nil
+                )
+                return nil
+            }
+        }
+        // No suspension between the failed proof and destination removal.
         guard !Task.isCancelled else { return nil }
         if !preserveInstalledDestination {
             try? FileManager.default.removeItemIfPresent(

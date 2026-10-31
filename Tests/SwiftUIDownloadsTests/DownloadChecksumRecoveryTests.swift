@@ -1,4 +1,5 @@
 import CryptoKit
+import Combine
 import XCTest
 import Brotli
 @testable import SwiftUIDownloads
@@ -1366,6 +1367,182 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         )
         let attemptCount = await attemptExecutor.recordedAttemptCount()
         XCTAssertEqual(attemptCount, 1)
+    }
+
+    @MainActor
+    func testDelayedChecksumRecoveryPreservesHealthyReplacement() async throws {
+        for compressed in [false, true] {
+            for hasMarker in [false, true] {
+                try await withLocalChecksumRecoveryFixture(compressed: compressed) {
+                    download, controller, attempts, payload in
+                    try Data("old-corrupt-payload".utf8).write(to: download.localDestination, options: .atomic)
+                    XCTAssertThrowsError(try download.ensureVerifiedLocalDestinationChecksum())
+
+                    // The old failure's recovery request has not run yet.
+                    try payload.write(to: download.localDestination, options: .atomic)
+                    if hasMarker { try download.ensureVerifiedLocalDestinationChecksum() }
+                    XCTAssertEqual(download.hasVerifiedLocalDestinationChecksumMarker(), hasMarker)
+                    if compressed {
+                        try Data("superseded-transfer".utf8).write(to: download.compressedFileURL)
+                    }
+                    let previousDownload = Date(timeIntervalSince1970: 123)
+                    download.lastDownloaded = previousDownload
+                    download.lastDownloadedETag = "replacement-etag"
+                    download.isFailed = true
+                    controller.failedDownloads.insert(download)
+
+                    await controller.recoverLocalChecksumFailure(for: download)
+
+                    let completed = try await download.awaitCompletionOrFailure()
+                    let count = await attempts.recordedAttemptCount()
+                    XCTAssertTrue(completed)
+                    XCTAssertEqual(count, 0)
+                    XCTAssertEqual(try Data(contentsOf: download.localDestination), payload)
+                    XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+                    XCTAssertFalse(download.isFailed)
+                    XCTAssertTrue(controller.finishedDownloads.contains(download))
+                    XCTAssertFalse(controller.failedDownloads.contains(download))
+                    XCTAssertEqual(download.lastDownloaded, previousDownload)
+                    XCTAssertEqual(download.lastDownloadedETag, "replacement-etag")
+                }
+            }
+        }
+    }
+
+    @MainActor
+    func testChecksumRecoveryRechecksReplacementDuringMainActorReset() async throws {
+        try await withLocalChecksumRecoveryFixture { download, controller, attempts, payload in
+            try Data("old-corrupt-payload".utf8).write(to: download.localDestination, options: .atomic)
+            XCTAssertThrowsError(try download.ensureVerifiedLocalDestinationChecksum())
+            download.isFinishedProcessing = true
+            var installedReplacement = false
+            // @Published sends synchronously inside the pre-delete MainActor
+            // reset. Install before that actor hop returns, without timed races.
+            let observation = download.$isFinishedProcessing.dropFirst().sink { finished in
+                guard !finished, !installedReplacement else { return }
+                installedReplacement = true
+                do {
+                    try payload.write(to: download.localDestination, options: .atomic)
+                } catch {
+                    XCTFail("Could not install replacement: \(error)")
+                }
+            }
+            defer { observation.cancel() }
+
+            await controller.recoverLocalChecksumFailure(for: download)
+
+            let completed = try await download.awaitCompletionOrFailure()
+            let count = await attempts.recordedAttemptCount()
+            XCTAssertTrue(installedReplacement)
+            XCTAssertTrue(completed)
+            XCTAssertEqual(count, 0)
+            XCTAssertEqual(try Data(contentsOf: download.localDestination), payload)
+            XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+            XCTAssertTrue(controller.finishedDownloads.contains(download))
+        }
+    }
+
+    @MainActor
+    func testDelayedChecksumRecoveryDownloadsWhenCorruptDestinationWasRemoved() async throws {
+        try await withLocalChecksumRecoveryFixture { download, controller, attempts, payload in
+            try Data("old-corrupt-payload".utf8).write(to: download.localDestination, options: .atomic)
+            XCTAssertThrowsError(try download.ensureVerifiedLocalDestinationChecksum())
+            let retiredURL = download.localDestination.appendingPathExtension("retired")
+            try FileManager.default.moveItem(at: download.localDestination, to: retiredURL)
+
+            await controller.recoverLocalChecksumFailure(for: download)
+
+            let completed = try await download.awaitCompletionOrFailure()
+            let count = await attempts.recordedAttemptCount()
+            XCTAssertTrue(completed)
+            XCTAssertEqual(count, 1)
+            XCTAssertEqual(try Data(contentsOf: download.localDestination), payload)
+            XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+            XCTAssertTrue(controller.finishedDownloads.contains(download))
+            XCTAssertFalse(download.isFailed)
+        }
+    }
+
+    @MainActor
+    func testChecksumRecoveryPreservesBytesWhenVerificationMarkerIsUnavailable() async throws {
+        try await withLocalChecksumRecoveryFixture { download, controller, attempts, payload in
+            try payload.write(to: download.localDestination, options: .atomic)
+            // A directory cannot accept the verifier's atomic marker write.
+            try FileManager.default.createDirectory(
+                at: download.checksumVerificationMarkerURL, withIntermediateDirectories: true
+            )
+            try Data("block-marker-replacement".utf8).write(
+                to: download.checksumVerificationMarkerURL.appendingPathComponent("blocker")
+            )
+
+            await controller.recoverLocalChecksumFailure(for: download)
+
+            let completed = try await download.awaitCompletionOrFailure()
+            let count = await attempts.recordedAttemptCount()
+            XCTAssertFalse(completed)
+            XCTAssertEqual(count, 0)
+            XCTAssertEqual(try Data(contentsOf: download.localDestination), payload)
+            XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+            XCTAssertTrue(download.isFailed)
+            XCTAssertFalse(controller.finishedDownloads.contains(download))
+            guard case let .completed(_, _, error) = download.downloadProgress else {
+                return XCTFail("Expected terminal verification failure")
+            }
+            XCTAssertNotNil(error)
+        }
+    }
+
+    @MainActor
+    func testChecksumRecoveryWithoutExpectedChecksumDoesNotReuseUnverifiedBytes() async throws {
+        try await withLocalChecksumRecoveryFixture(hasExpectedChecksum: false) {
+            download, controller, attempts, payload in
+            try Data("unverified-existing-payload".utf8).write(to: download.localDestination)
+            // This API is intentionally a no-op without an expected checksum.
+            try download.ensureVerifiedLocalDestinationChecksum()
+
+            await controller.recoverLocalChecksumFailure(for: download)
+
+            let completed = try await download.awaitCompletionOrFailure()
+            let count = await attempts.recordedAttemptCount()
+            XCTAssertTrue(completed)
+            XCTAssertEqual(count, 1)
+            XCTAssertEqual(try Data(contentsOf: download.localDestination), payload)
+            XCTAssertNotNil(download.validInstalledArtifactReceipt())
+        }
+    }
+
+    @MainActor
+    private func withLocalChecksumRecoveryFixture(
+        hasExpectedChecksum: Bool = true,
+        compressed: Bool = false,
+        operation: @MainActor (Downloadable, DownloadController, ChecksumRecoveryAttemptExecutor, Data) async throws -> Void
+    ) async throws {
+        let identifier = UUID().uuidString
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-local-recovery-\(identifier)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let suite = "download-local-recovery-\(identifier)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let payload = Data("verified-replacement-payload".utf8)
+        let download = Downloadable(
+            url: URL(string: "https://checksum-recovery.test/\(identifier)/payload.bin\(compressed ? ".br" : "")")!,
+            name: "Isolated local checksum recovery",
+            localDestination: directory.appendingPathComponent("payload.bin"),
+            localDestinationChecksum: hasExpectedChecksum ? sha1Hex(payload) : nil,
+            metadataStore: UserDefaultsDownloadableMetadataStore(userDefaults: defaults, metadataCacheNamespace: suite)
+        )
+        let attempts = ChecksumRecoveryAttemptExecutor(payload: payload)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, session in
+            try await attempts.execute(download: download, session: session)
+        })
+        await download.waitForDownloadMetadata()
+        try await operation(download, controller, attempts, payload)
+        try await download.waitForDownloadMetadataPersistence()
     }
 
     func testDirectChecksumFailureCanRequestCleanRecovery() async throws {
