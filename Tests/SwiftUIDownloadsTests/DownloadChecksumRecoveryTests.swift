@@ -226,6 +226,68 @@ private actor AsyncCompletionFlag {
 
 final class DownloadChecksumRecoveryTests: XCTestCase {
 
+    @MainActor
+    private func assertRetainedInputSurvivesChecksumCancellation(usesSHA256: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "retained-checksum-cancellation-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = Data("retained input awaiting checksum verification 日本語".utf8)
+        let destination = directory.appendingPathComponent("payload.bin")
+        try payload.write(to: destination)
+        let checksum = usesSHA256
+            ? SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
+            : sha1Hex(payload)
+        let download = Downloadable(url: URL(string: "https://retained-checksum.test/\(UUID()).bin")!,
+            name: "Retained input", localDestination: destination, localDestinationChecksum: checksum)
+        let executor = ChecksumRecoveryAttemptExecutor(payload: payload)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session, attemptExecutor: { download, session in
+            try await executor.execute(download: download, session: session)
+        })
+        let entered = expectation(description: "checksum read before verified marker")
+        let release = DispatchSemaphore(value: 0)
+        let preparation = Task {
+            await DownloadController.$checksumReadObserver.withValue({
+                entered.fulfill()
+                XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+            }) {
+                await controller.finishDownload(download, recordSuccessfulDownload: false)
+            }
+        }
+        await fulfillment(of: [entered], timeout: 2)
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        preparation.cancel()
+        release.signal()
+        await preparation.value
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: download.checksumVerificationMarkerURL.path))
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertNil(DownloadController.checksumReadObserver)
+        let attemptsAfterCancellation = await executor.recordedAttemptCount()
+        XCTAssertEqual(attemptsAfterCancellation, 0)
+
+        await controller.finishDownload(download, recordSuccessfulDownload: false)
+
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertTrue(download.isReadyForImmediateLocalRead())
+        XCTAssertTrue(download.isFinishedProcessing)
+        let attemptsAfterRetry = await executor.recordedAttemptCount()
+        XCTAssertEqual(attemptsAfterRetry, 0, "Retry must use retained bytes without a transfer")
+    }
+
+    @MainActor
+    func testRetainedSHA1InputSurvivesCancelledVerificationAndOfflineRetry() async throws {
+        try await assertRetainedInputSurvivesChecksumCancellation(usesSHA256: false)
+    }
+
+    @MainActor
+    func testRetainedSHA256InputSurvivesCancelledVerificationAndOfflineRetry() async throws {
+        try await assertRetainedInputSurvivesChecksumCancellation(usesSHA256: true)
+    }
+
     func testEmptyCompressedReplacementCannotInheritPriorImportSuccess() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "download-empty-replacement-\(UUID().uuidString)", isDirectory: true

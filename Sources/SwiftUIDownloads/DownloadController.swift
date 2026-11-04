@@ -66,12 +66,18 @@ private func sha1Checksum(for fileURL: URL) throws -> String {
     let fileHandle = try FileHandle(forReadingFrom: fileURL)
     defer { try? fileHandle.close() }
 
+    let readObserver = DownloadController.checksumReadObserver
+    var isFirstRead = true
     var hasher = Insecure.SHA1()
     while autoreleasepool(invoking: {
         guard !Task.isCancelled else { return false }
         let data = fileHandle.readData(ofLength: 64 * 1024)
         guard !data.isEmpty else { return false }
         hasher.update(data: data)
+        if isFirstRead {
+            isFirstRead = false
+            readObserver?()
+        }
         return true
     }) {}
 
@@ -83,12 +89,18 @@ private func sha256Checksum(for fileURL: URL) throws -> String {
     let fileHandle = try FileHandle(forReadingFrom: fileURL)
     defer { try? fileHandle.close() }
 
+    let readObserver = DownloadController.checksumReadObserver
+    var isFirstRead = true
     var hasher = SHA256()
     while autoreleasepool(invoking: {
         guard !Task.isCancelled else { return false }
         let data = fileHandle.readData(ofLength: 64 * 1024)
         guard !data.isEmpty else { return false }
         hasher.update(data: data)
+        if isFirstRead {
+            isFirstRead = false
+            readObserver?()
+        }
         return true
     }) {}
 
@@ -1520,6 +1532,10 @@ private final class DownloadAttemptTerminalWaiter: @unchecked Sendable {
 }
 
 public class DownloadController: NSObject, ObservableObject, @unchecked Sendable {
+    // Scoped checksum-worker interception for cancellation behavior tests.
+    // Called once per hash; never a process-global replacement.
+    @TaskLocal static var checksumReadObserver: (@Sendable () -> Void)?
+
     public let objectWillChange = ObservableObjectPublisher()
     
     typealias DownloadAttemptExecutor = @Sendable (
@@ -3452,15 +3468,18 @@ extension DownloadController {
 
             try Task.checkCancellation()
             let verifiesStagedCandidate = stagedUncompressedFileURL != nil
+            let checksumObserver = Self.checksumReadObserver
             let checksumTask = Task.detached(priority: .utility) {
                 () throws -> ChecksumVerificationFileIdentity? in
-                if verifiesStagedCandidate {
-                    return try download.ensureVerifiedChecksum(
-                        of: processingFileURL
-                    )
-                } else {
-                    try download.ensureVerifiedLocalDestinationChecksum()
-                    return nil
+                try Self.$checksumReadObserver.withValue(checksumObserver) {
+                    if verifiesStagedCandidate {
+                        return try download.ensureVerifiedChecksum(
+                            of: processingFileURL
+                        )
+                    } else {
+                        try download.ensureVerifiedLocalDestinationChecksum()
+                        return nil
+                    }
                 }
             }
             let verifiedStagedIdentity = try await withTaskCancellationHandler(operation: {
@@ -3706,15 +3725,13 @@ extension DownloadController {
             }
             checksumRedownloadAttempted.remove(download.id)
             if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                let preservesInstalledDestination =
-                    stagedUncompressedFileURL != nil
-                    || finishStartedWithCompressedFile
                 if processingTasks[download.id]?.id == processingTaskID {
+                    // Cancellation is not corruption. Retain installed bytes
+                    // even before their checksum marker can be written;
+                    // attempt-owned staging has separate cleanup.
                     try? removeAllLocalArtifacts(
                         for: download,
-                        includingDestination: !preservesInstalledDestination
-                            && download.localDestinationChecksum != nil
-                            && !download.hasVerifiedLocalDestinationChecksumMarker()
+                        includingDestination: false
                     )
                 }
 
