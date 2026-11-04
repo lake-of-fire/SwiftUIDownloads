@@ -3875,12 +3875,21 @@ extension DownloadController {
             }
             if error is CancellationError || (error as? URLError)?.code == .cancelled {
                 if processingTasks[download.id]?.id == processingTaskID {
-                    // Cancellation is not corruption. Retain installed bytes
-                    // even before their checksum marker can be written;
-                    // attempt-owned staging has separate cleanup.
+                    // Retain useful installed input even before checksum marker
+                    // publication. An empty source captured by this finish owner
+                    // is invalid, but its identity must still match after the
+                    // asynchronous imported-state callback. Staged/compressed
+                    // candidates have separate cleanup and cannot own this path.
+                    let discardsOwnedEmptyDestination =
+                        stagedUncompressedFileURL == nil
+                        && !finishStartedWithCompressedFile
+                        && !lostInstalledFileOwnership
+                        && processingFileOwnership.map {
+                            $0.url == download.localDestination && $0.identity.fileSize == 0
+                        } == true
                     try? removeAllLocalArtifacts(
                         for: download,
-                        includingDestination: false
+                        includingDestination: discardsOwnedEmptyDestination
                     )
                 }
 
