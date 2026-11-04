@@ -335,8 +335,21 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
     }
 
     @MainActor
+    func testOrdinaryCompletionCancellationDoesNotAdvanceSuccessfulDownloadMetadata() async throws {
+        try await exerciseFinalFileSizeAdmission(ordinaryCompletion: true,
+            replacesArtifact: false, recordsSuccessfulDownload: true)
+    }
+
+    @MainActor
+    func testOrdinaryCompletionReplacementDoesNotAdvanceSuccessfulDownloadMetadata() async throws {
+        try await exerciseFinalFileSizeAdmission(ordinaryCompletion: true,
+            replacesArtifact: true, recordsSuccessfulDownload: true)
+    }
+
+    @MainActor
     private func exerciseFinalFileSizeAdmission(
-        ordinaryCompletion: Bool, replacesArtifact: Bool
+        ordinaryCompletion: Bool, replacesArtifact: Bool,
+        recordsSuccessfulDownload: Bool = false
     ) async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("final-completion-admission-\(UUID().uuidString)", isDirectory: true)
@@ -394,7 +407,9 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         let settled = expectation(description: "Final completion admission settles")
         operation = Task {
             defer { settled.fulfill() }
-            await controller.finishDownload(download, recordSuccessfulDownload: false)
+            await controller.finishDownload(download,
+                etag: recordsSuccessfulDownload ? "candidate-etag" : nil,
+                recordSuccessfulDownload: recordsSuccessfulDownload)
         }
         let completion = await XCTWaiter.fulfillment(of: [settled], timeout: 5)
         if completion != .completed {
