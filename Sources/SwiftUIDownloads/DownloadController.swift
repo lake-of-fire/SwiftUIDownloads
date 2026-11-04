@@ -3729,8 +3729,12 @@ extension DownloadController {
             let successfulMetadata = pendingInstalledArtifactReceipts[
                 receiptKey
             ]?.successfulDownloadMetadata
-            await MainActor.run {
+            try await MainActor.run {
                 download.fileSize = UInt64(fileSize)
+                // Published observers can cancel this owner or replace its file.
+                // Revalidate after their callbacks, before advancing validators.
+                try self.requireCompletionAdmission(download,
+                    requiringInstalledArtifact: completionReceipt)
 
                 // This timestamp is queued as the baseline for Last-Modified                // comparisons, so advance it only after the downloaded bytes
                 // have decompressed, verified, and imported successfully. A
@@ -3926,9 +3930,9 @@ extension DownloadController {
     }
 
     @MainActor
-    private func publishSuccessfulCompletion(
+    private func requireCompletionAdmission(
         _ download: Downloadable,
-        requiringInstalledArtifact receipt: InstalledArtifactReceipt? = nil
+        requiringInstalledArtifact receipt: InstalledArtifactReceipt?
     ) throws {
         // Every caller, including ordinary completion, can be cancelled while
         // waiting for MainActor. Admit success here, immediately before its
@@ -3952,6 +3956,14 @@ extension DownloadController {
         }
         // A concurrent caller may cancel while the synchronous stat runs.
         try Task.checkCancellation()
+    }
+
+    @MainActor
+    private func publishSuccessfulCompletion(
+        _ download: Downloadable,
+        requiringInstalledArtifact receipt: InstalledArtifactReceipt? = nil
+    ) throws {
+        try requireCompletionAdmission(download, requiringInstalledArtifact: receipt)
         failedDownloads.remove(download)
         activeDownloads.remove(download)
         finishedDownloads.insert(download)
