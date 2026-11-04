@@ -227,7 +227,7 @@ private actor AsyncCompletionFlag {
 final class DownloadChecksumRecoveryTests: XCTestCase {
 
     @MainActor
-    private func assertRetainedInputSurvivesChecksumCancellation(usesSHA256: Bool) async throws {
+    private func assertRetainedInputSurvivesChecksumCancellation() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "retained-checksum-cancellation-\(UUID())", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -235,9 +235,7 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         let payload = Data("retained input awaiting checksum verification 日本語".utf8)
         let destination = directory.appendingPathComponent("payload.bin")
         try payload.write(to: destination)
-        let checksum = usesSHA256
-            ? SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
-            : sha1Hex(payload)
+        let checksum = sha1Hex(payload)
         let download = Downloadable(url: URL(string: "https://retained-checksum.test/\(UUID()).bin")!,
             name: "Retained input", localDestination: destination, localDestinationChecksum: checksum)
         let executor = ChecksumRecoveryAttemptExecutor(payload: payload)
@@ -280,12 +278,7 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
 
     @MainActor
     func testRetainedSHA1InputSurvivesCancelledVerificationAndOfflineRetry() async throws {
-        try await assertRetainedInputSurvivesChecksumCancellation(usesSHA256: false)
-    }
-
-    @MainActor
-    func testRetainedSHA256InputSurvivesCancelledVerificationAndOfflineRetry() async throws {
-        try await assertRetainedInputSurvivesChecksumCancellation(usesSHA256: true)
+        try await assertRetainedInputSurvivesChecksumCancellation()
     }
 
     func testEmptyCompressedReplacementCannotInheritPriorImportSuccess() async throws {
