@@ -1643,6 +1643,10 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     )]()
     private var remoteModificationChecksPaused = false
     private var remoteModificationGeneration: UInt64 = 0
+#if DEBUG
+    /// Lets lifecycle tests hold a real drain after its owner snapshot.
+    @DownloadActor var backgroundDrainDidCaptureWork: (@Sendable () async -> Void)?
+#endif
     private var downloadAttemptIDs = [DownloadOperationKey: UUID]()
     private var activeTransferStagingURLs = Set<URL>()
     private var checksumRecoveriesReadyForProcessing = Set<DownloadOperationKey>()
@@ -2807,7 +2811,12 @@ extension DownloadController {
         let remoteChecks = remoteModificationTasks.values.map(\.task)
         work.forEach { $0.task.cancel() }
         remoteChecks.forEach { $0.cancel() }
-        try? await cancelInProgressDownloads(inApp: true)
+#if DEBUG
+        await backgroundDrainDidCaptureWork?()
+#endif
+        // These owners propagate cancellation to their own HEAD/native transfer
+        // tasks. A later session or registry sweep could cancel work admitted by
+        // foregrounding while this drain is suspended. Join only captured owners.
         for record in work { await record.task.value }
         for check in remoteChecks { _ = await check.value }
     }
