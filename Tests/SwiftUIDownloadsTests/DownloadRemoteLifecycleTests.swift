@@ -1045,6 +1045,68 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         XCTAssertNil(validators.1)
     }
 
+    func testBackgroundCancellationSettlesRemoteModificationCheck() async throws {
+        let started = expectation(description: "HEAD started")
+        let stopped = expectation(description: "HEAD cancelled by background drain")
+        let settled = expectation(description: "HEAD caller settled")
+        HangingDownloadURLProtocol.didStart = { started.fulfill() }
+        HangingDownloadURLProtocol.didStop = { stopped.fulfill() }
+        defer {
+            HangingDownloadURLProtocol.didStart = nil
+            HangingDownloadURLProtocol.didStop = nil
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingDownloadURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let download = Downloadable(
+            url: URL(string: "https://background-head.test/payload.bin")!,
+            name: "Background HEAD",
+            localDestination: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString).appendingPathComponent("payload.bin")
+        )
+        let check = Task {
+            let result = await controller.checkRemoteModification(for: download)
+            settled.fulfill()
+            return result
+        }
+        await fulfillment(of: [started], timeout: 3)
+        await controller.cancelLongRunningWorkForBackgrounding()
+        await fulfillment(of: [stopped, settled], timeout: 3)
+        // Always release the request even when the pre-fix drain fails to own it.
+        check.cancel()
+        let result = await check.value
+        guard case .unavailable = result else {
+            return XCTFail("A cancelled HEAD must not authorize remote metadata")
+        }
+    }
+
+    func testRemoteModificationCheckWaitsForBackgroundAdmissionToReopen() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ModifiedHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let download = Downloadable(
+            url: URL(string: "https://background-head.test/payload.bin")!,
+            name: "Suspended HEAD",
+            localDestination: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString).appendingPathComponent("payload.bin")
+        )
+        await controller.cancelLongRunningWorkForBackgrounding()
+        let suspended = await controller.checkRemoteModification(for: download)
+        if case .available = suspended {
+            XCTFail("A paused controller must not perform a remote freshness check")
+        }
+        await controller.resumeRecoverableDownloadsAfterForegrounding()
+        let resumed = await controller.checkRemoteModification(for: download)
+        guard case .available(let modified, _, _) = resumed else {
+            return XCTFail("Reopened admission must permit a fresh HEAD")
+        }
+        XCTAssertTrue(modified)
+    }
+
     func testUnavailableHEADDoesNotAdvanceSuccessfulCheckTimestamp() async throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
