@@ -40,12 +40,15 @@ private final class HangingDownloadURLProtocol: URLProtocol {
 }
 
 private final class ModifiedHEADURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var didStart: (() -> Void)?
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest {
         request
     }
 
     override func startLoading() {
+        Self.didStart?()
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: 200,
@@ -64,6 +67,23 @@ private final class ModifiedHEADURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private final class HEADRequestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func recordRequest() {
+        lock.lock()
+        defer { lock.unlock() }
+        count += 1
+    }
+
+    var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
 }
 
 private final class UnknownLengthHEADURLProtocol: URLProtocol {
@@ -1043,6 +1063,114 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         }
         XCTAssertNil(validators.0)
         XCTAssertNil(validators.1)
+    }
+
+    func testBackgroundCancellationSettlesRemoteModificationCheck() async throws {
+        let started = expectation(description: "HEAD started")
+        let stopped = expectation(description: "HEAD cancelled by background drain")
+        let settled = expectation(description: "HEAD caller settled")
+        HangingDownloadURLProtocol.didStart = { started.fulfill() }
+        HangingDownloadURLProtocol.didStop = { stopped.fulfill() }
+        defer {
+            HangingDownloadURLProtocol.didStart = nil
+            HangingDownloadURLProtocol.didStop = nil
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingDownloadURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let download = Downloadable(
+            url: URL(string: "https://background-head.test/payload.bin")!,
+            name: "Background HEAD",
+            localDestination: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString).appendingPathComponent("payload.bin")
+        )
+        let check = Task {
+            let result = await controller.checkRemoteModification(for: download)
+            settled.fulfill()
+            return result
+        }
+        await fulfillment(of: [started], timeout: 3)
+        await controller.cancelLongRunningWorkForBackgrounding()
+        await fulfillment(of: [stopped, settled], timeout: 3)
+        // Always release the request even when the pre-fix drain fails to own it.
+        check.cancel()
+        let result = await check.value
+        guard case .unavailable = result else {
+            return XCTFail("A cancelled HEAD must not authorize remote metadata")
+        }
+    }
+
+    func testRemoteModificationCheckWaitsForBackgroundAdmissionToReopen() async throws {
+        let requests = HEADRequestCounter()
+        ModifiedHEADURLProtocol.didStart = { requests.recordRequest() }
+        defer { ModifiedHEADURLProtocol.didStart = nil }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ModifiedHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let download = Downloadable(
+            url: URL(string: "https://background-head.test/payload.bin")!,
+            name: "Suspended HEAD",
+            localDestination: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString).appendingPathComponent("payload.bin")
+        )
+        await controller.cancelLongRunningWorkForBackgrounding()
+        let suspended = await controller.checkRemoteModification(for: download)
+        if case .available = suspended {
+            XCTFail("A paused controller must not perform a remote freshness check")
+        }
+        XCTAssertEqual(requests.requestCount, 0,
+                       "Paused admission must prevent the network request itself")
+        await controller.resumeRecoverableDownloadsAfterForegrounding()
+        let resumed = await controller.checkRemoteModification(for: download)
+        guard case .available(let modified, _, _) = resumed else {
+            return XCTFail("Reopened admission must permit a fresh HEAD")
+        }
+        XCTAssertTrue(modified)
+        XCTAssertEqual(requests.requestCount, 1)
+    }
+
+    func testCancellingOneRemoteModificationCheckPreservesAnotherCheck() async throws {
+        let started = expectation(description: "both HEAD requests started")
+        started.expectedFulfillmentCount = 2
+        let stopped = expectation(description: "both HEAD requests eventually cancelled")
+        stopped.expectedFulfillmentCount = 2
+        HangingDownloadURLProtocol.didStart = { started.fulfill() }
+        HangingDownloadURLProtocol.didStop = { stopped.fulfill() }
+        defer {
+            HangingDownloadURLProtocol.didStart = nil
+            HangingDownloadURLProtocol.didStop = nil
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingDownloadURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let first = Downloadable(url: URL(string: "https://head-isolation.test/first")!,
+                                 name: "First HEAD", localDestination: directory.appendingPathComponent("first"))
+        let second = Downloadable(url: URL(string: "https://head-isolation.test/second")!,
+                                  name: "Second HEAD", localDestination: directory.appendingPathComponent("second"))
+        let firstCheck = Task { await controller.checkRemoteModification(for: first) }
+        let secondCheck = Task { await controller.checkRemoteModification(for: second) }
+        defer { firstCheck.cancel(); secondCheck.cancel() }
+        await fulfillment(of: [started], timeout: 3)
+
+        firstCheck.cancel()
+        let firstResult = await firstCheck.value
+        if case .available = firstResult { XCTFail("The cancelled caller must not receive freshness authority") }
+        let remaining = await session.allTasks
+        XCTAssertEqual(remaining.filter {
+            $0.originalRequest?.url == second.url && $0.state == .running
+        }.count, 1, "Cancelling one HEAD must preserve another caller's request")
+
+        secondCheck.cancel()
+        let secondResult = await secondCheck.value
+        if case .available = secondResult { XCTFail("The second cancelled caller must not receive freshness authority") }
+        await fulfillment(of: [stopped], timeout: 3)
     }
 
     func testUnavailableHEADDoesNotAdvanceSuccessfulCheckTimestamp() async throws {
