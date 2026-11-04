@@ -74,12 +74,18 @@ private func sha1Checksum(for fileURL: URL) throws -> String {
     let fileHandle = try FileHandle(forReadingFrom: fileURL)
     defer { try? fileHandle.close() }
 
+    let readObserver = DownloadController.checksumReadObserver
+    var isFirstRead = true
     var hasher = Insecure.SHA1()
     while autoreleasepool(invoking: {
         guard !Task.isCancelled else { return false }
         let data = fileHandle.readData(ofLength: 64 * 1024)
         guard !data.isEmpty else { return false }
         hasher.update(data: data)
+        if isFirstRead {
+            isFirstRead = false
+            readObserver?()
+        }
         return true
     }) {}
 
@@ -1553,6 +1559,10 @@ private final class DownloadAttemptTerminalWaiter: @unchecked Sendable {
 }
 
 public class DownloadController: NSObject, ObservableObject, @unchecked Sendable {
+    // Scoped checksum-worker interception for cancellation behavior tests.
+    // Called once per SHA-1 hash; never a process-global replacement.
+    @TaskLocal static var checksumReadObserver: (@Sendable () -> Void)?
+
     public let objectWillChange = ObservableObjectPublisher()
     
     typealias DownloadAttemptExecutor = @Sendable (
@@ -1638,6 +1648,15 @@ public class DownloadController: NSObject, ObservableObject, @unchecked Sendable
     private var processingTasks = [DownloadOperationKey: ProcessingTaskRecord]()
     private var checksumRecoveryTasks = [DownloadOperationKey: ProcessingTaskRecord]()
     private var downloadTasks = [DownloadOperationKey: ProcessingTaskRecord]()
+    private var remoteModificationTasks = [UUID: (
+        key: DownloadOperationKey, task: Task<RemoteModificationCheckResult, Never>
+    )]()
+    private var remoteModificationChecksPaused = false
+    private var remoteModificationGeneration: UInt64 = 0
+#if DEBUG
+    /// Lets lifecycle tests hold a real drain after its owner snapshot.
+    @DownloadActor var backgroundDrainDidCaptureWork: (@Sendable () async -> Void)?
+#endif
     private var downloadAttemptIDs = [DownloadOperationKey: UUID]()
     private var activeTransferStagingURLs = Set<URL>()
     private var checksumRecoveriesReadyForProcessing = Set<DownloadOperationKey>()
@@ -1969,12 +1988,15 @@ public extension DownloadController {
         let downloadRecord = downloadTasks[download.id]
         let processingRecord = processingTasks[download.id]
         let recoveryRecord = checksumRecoveryTasks[download.id]
+        let remoteChecks = remoteModificationTasks.values
+            .filter { $0.key == download.id }.map(\.task)
         processingRecord?.task.cancel()
         recoveryRecord?.task.cancel()
         await cancelInProgressDownload(download)
         await downloadRecord?.task.value
         await processingRecord?.task.value
         await recoveryRecord?.task.value
+        for check in remoteChecks { _ = await check.value }
 
         // Do not let cleanup from this deletion race a newer processor that
         // has taken ownership of the same logical download.
@@ -2754,6 +2776,8 @@ extension DownloadController {
             + processingTasks.filter { matches($0.key) }.map(\.value)
             + checksumRecoveryTasks.filter { matches($0.key) }.map(\.value)
         records.forEach { $0.task.cancel() }
+        remoteModificationTasks.values.filter { matches($0.key) }
+            .forEach { $0.task.cancel() }
         // Each owner removes only its candidates and publishes its terminal
         // cancellation. Ownership remains until it drains. Cancellation itself
         // must not await an importer that may have requested this cancellation.
@@ -2788,11 +2812,28 @@ extension DownloadController {
 
     @DownloadActor
     func cancelLongRunningWorkForBackgrounding() async {
-        try? await cancelInProgressDownloads(inApp: true)
+        remoteModificationChecksPaused = true
+        remoteModificationGeneration &+= 1
+        // Capture before the first actor hop: registry cleanup or foreground
+        // replacement must not change which producers this drain joins.
+        let work = Array(downloadTasks.values) + Array(processingTasks.values)
+            + Array(checksumRecoveryTasks.values)
+        let remoteChecks = remoteModificationTasks.values.map(\.task)
+        work.forEach { $0.task.cancel() }
+        remoteChecks.forEach { $0.cancel() }
+#if DEBUG
+        await backgroundDrainDidCaptureWork?()
+#endif
+        // These owners propagate cancellation to their own HEAD/native transfer
+        // tasks. A later session or registry sweep could cancel work admitted by
+        // foregrounding while this drain is suspended. Join only captured owners.
+        for record in work { await record.task.value }
+        for check in remoteChecks { _ = await check.value }
     }
 
     @DownloadActor
     func resumeRecoverableDownloadsAfterForegrounding() async {
+        remoteModificationChecksPaused = false
         let downloads = await MainActor.run { Array(assuredDownloads) }
         for download in downloads {
             let state = await MainActor.run {
@@ -3544,15 +3585,18 @@ extension DownloadController {
 
             try Task.checkCancellation()
             let verifiesStagedCandidate = stagedUncompressedFileURL != nil
+            let checksumObserver = Self.checksumReadObserver
             let checksumTask = Task.detached(priority: .utility) {
                 () throws -> ChecksumVerificationFileIdentity? in
-                if verifiesStagedCandidate {
-                    return try download.ensureVerifiedChecksum(
-                        of: processingFileURL
-                    )
-                } else {
-                    try download.ensureVerifiedLocalDestinationChecksum()
-                    return nil
+                try Self.$checksumReadObserver.withValue(checksumObserver) {
+                    if verifiesStagedCandidate {
+                        return try download.ensureVerifiedChecksum(
+                            of: processingFileURL
+                        )
+                    } else {
+                        try download.ensureVerifiedLocalDestinationChecksum()
+                        return nil
+                    }
                 }
             }
             let verifiedStagedIdentity = try await withTaskCancellationHandler(operation: {
@@ -3830,16 +3874,22 @@ extension DownloadController {
                 return
             }
             if error is CancellationError || (error as? URLError)?.code == .cancelled {
-                let preservesInstalledDestination =
-                    stagedUncompressedFileURL != nil
-                    || finishStartedWithCompressedFile
-                    || lostInstalledFileOwnership
                 if processingTasks[download.id]?.id == processingTaskID {
+                    // Retain useful installed input even before checksum marker
+                    // publication. An empty source captured by this finish owner
+                    // is invalid, but its identity must still match after the
+                    // asynchronous imported-state callback. Staged/compressed
+                    // candidates have separate cleanup and cannot own this path.
+                    let discardsOwnedEmptyDestination =
+                        stagedUncompressedFileURL == nil
+                        && !finishStartedWithCompressedFile
+                        && !lostInstalledFileOwnership
+                        && processingFileOwnership.map {
+                            $0.url == download.localDestination && $0.identity.fileSize == 0
+                        } == true
                     try? removeAllLocalArtifacts(
                         for: download,
-                        includingDestination: !preservesInstalledDestination
-                            && download.localDestinationChecksum != nil
-                            && !download.hasVerifiedLocalDestinationChecksumMarker()
+                        includingDestination: discardsOwnedEmptyDestination
                     )
                 }
 
@@ -3988,7 +4038,7 @@ extension DownloadController {
         clearDownloadStatusObservers(forDownloadID: download.id)
     }
     
-    enum RemoteModificationCheckResult {
+    enum RemoteModificationCheckResult: Sendable {
         case available(modified: Bool, modifiedAt: Date?, etag: String?)
         case unavailable
     }
@@ -4009,7 +4059,30 @@ extension DownloadController {
     func checkRemoteModification(
         for download: Downloadable
     ) async -> RemoteModificationCheckResult {
+        guard !Task.isCancelled, !remoteModificationChecksPaused else { return .unavailable }
+        let generation = remoteModificationGeneration
+        let id = UUID()
+        let task = Task { @DownloadActor in
+            await self.performRemoteModificationCheck(for: download)
+        }
+        remoteModificationTasks[id] = (download.id, task)
+        defer { remoteModificationTasks[id] = nil }
+        let result = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        guard !Task.isCancelled, !task.isCancelled, !remoteModificationChecksPaused,
+              remoteModificationGeneration == generation else { return .unavailable }
+        return result
+    }
+
+    @DownloadActor
+    private func performRemoteModificationCheck(
+        for download: Downloadable
+    ) async -> RemoteModificationCheckResult {
         await download.waitForDownloadMetadata()
+        guard !Task.isCancelled, !remoteModificationChecksPaused else { return .unavailable }
         var request = URLRequest(url: download.url)
         request.httpMethod = "HEAD"
         do {
