@@ -1890,6 +1890,55 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
     }
 
+    @MainActor
+    func testForcedRecheckRepairsCorruptionWithUnchangedFileIdentity() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("forced-checksum-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = Data("verified".utf8)
+        let corrupt = Data("replaced".utf8)
+        XCTAssertEqual(payload.count, corrupt.count)
+        let source = directory.appendingPathComponent("source.bin")
+        let destination = directory.appendingPathComponent("installed.bin")
+        try payload.write(to: source)
+        try payload.write(to: destination)
+        let modified = Date(timeIntervalSince1970: 1_000_000)
+        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: destination.path)
+        let download = Downloadable(url: source, name: "Forced checksum recheck",
+            localDestination: destination, localDestinationChecksum: sha1Hex(payload))
+        download.shouldCheckForUpdates = false
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        await controller.ensureDownloaded(download: download)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        let original = try FileManager.default.attributesOfItem(atPath: destination.path)
+
+        let handle = try FileHandle(forWritingTo: destination)
+        try handle.write(contentsOf: corrupt)
+        try handle.close()
+        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: destination.path)
+        let changed = try FileManager.default.attributesOfItem(atPath: destination.path)
+        XCTAssertEqual(changed[.size] as? NSNumber, original[.size] as? NSNumber)
+        XCTAssertEqual(changed[.systemFileNumber] as? NSNumber, original[.systemFileNumber] as? NSNumber)
+        XCTAssertEqual(changed[.modificationDate] as? Date, original[.modificationDate] as? Date)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker(), "Exercise a metadata-preserving corruption")
+        XCTAssertThrowsError(try download.ensureVerifiedLocalDestinationChecksum(forceRecheck: true)) { error in
+            guard case DownloadableChecksumVerificationError.mismatch = error else {
+                return XCTFail("Expected checksum mismatch, got \(error)")
+            }
+        }
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+
+        await controller.ensureDownloaded(download: download)
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertEqual(try Data(contentsOf: source), payload)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertFalse(download.isFailed)
+    }
+
     func testRapidSameSizeReplacementCannotReuseChecksumMarker() throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
