@@ -798,6 +798,13 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
     }
 
     public func ensureVerifiedLocalDestinationChecksum() throws {
+        try ensureVerifiedLocalDestinationChecksum(forceRecheck: false)
+    }
+
+    /// Recheck bytes when a consumer independently detects corruption despite
+    /// matching file metadata. A failed check clears the marker so ordinary
+    /// controller admission can own recovery without consumer-side deletion.
+    public func ensureVerifiedLocalDestinationChecksum(forceRecheck: Bool) throws {
         guard let expectedChecksum = localDestinationChecksum?.lowercased() else { return }
         let startedAt = Date()
         let fileAttributes = try FileManager.default.attributesOfItem(atPath: localDestination.path)
@@ -807,7 +814,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             )
         }
 
-        if let verification = try loadChecksumVerificationMarker(),
+        if !forceRecheck, let verification = try loadChecksumVerificationMarker(),
            verification.expectedChecksum == expectedChecksum,
            checksumVerificationMarker(verification, matches: initialIdentity) {
             logReaderOptimizationDiagnostic(
@@ -821,7 +828,7 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         }
 
         logReaderOptimizationDiagnostic(
-            "download.checksum.markerMiss",
+            forceRecheck ? "download.checksum.forcedRecheck" : "download.checksum.markerMiss",
             [
                 "expectedChecksumPrefix": String(expectedChecksum.prefix(8)),
                 "fileSize": String(initialIdentity.fileSize),
