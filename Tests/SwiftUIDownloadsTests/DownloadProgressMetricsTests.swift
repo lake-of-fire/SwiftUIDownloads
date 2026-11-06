@@ -87,4 +87,23 @@ final class DownloadProgressMetricsTests: XCTestCase {
         )
     }
 
+
+    func testZeroTotalWithTransferredBytesUsesIndeterminateStatus() {
+        let progress = Progress(totalUnitCount: 0)
+        progress.completedUnitCount = 1_500_000
+
+        let text = DownloadProgressMetrics.statusText(for: progress)
+
+        XCTAssertTrue(text.contains("1.5MB downloaded"))
+        XCTAssertFalse(text.contains(" of 0.0MB"))
+    }
+
+    func testActualEmptyZeroTotalKeepsKnownStatus() {
+        let progress = Progress(totalUnitCount: 0)
+        XCTAssertTrue(
+            DownloadProgressMetrics.statusText(for: progress)
+                .contains("0.0MB of 0.0MB")
+        )
+    }
+
 }
