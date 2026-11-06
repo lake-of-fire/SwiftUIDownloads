@@ -18,8 +18,11 @@ enum DownloadProgressMetrics {
     static func statusText(for progress: Progress) -> String {
         let completed = megabytes(progress.completedUnitCount)
         var text: String
-        if progress.totalUnitCount >= 0 {
-            text = completed + "MB of " + megabytes(progress.totalUnitCount) + "MB"
+        if let knownTotal = knownByteCount(
+            totalUnitCount: progress.totalUnitCount,
+            completedUnitCount: progress.completedUnitCount
+        ) {
+            text = completed + "MB of " + megabytes(Int64(knownTotal)) + "MB"
         } else {
             text = completed + "MB downloaded"
         }
