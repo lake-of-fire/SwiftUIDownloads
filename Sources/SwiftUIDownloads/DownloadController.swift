@@ -797,7 +797,11 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
         )
     }
 
-    public func ensureVerifiedLocalDestinationChecksum() throws {
+    /// Set `forceRecheck` to rehash the bytes even when a matching marker exists.
+    /// A failed checksum still invalidates the marker for normal recovery.
+    public func ensureVerifiedLocalDestinationChecksum(
+        forceRecheck: Bool = false
+    ) throws {
         guard let expectedChecksum = localDestinationChecksum?.lowercased() else { return }
         let startedAt = Date()
         let fileAttributes = try FileManager.default.attributesOfItem(atPath: localDestination.path)
@@ -807,7 +811,8 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
             )
         }
 
-        if let verification = try loadChecksumVerificationMarker(),
+        if !forceRecheck,
+           let verification = try loadChecksumVerificationMarker(),
            verification.expectedChecksum == expectedChecksum,
            checksumVerificationMarker(verification, matches: initialIdentity) {
             logReaderOptimizationDiagnostic(

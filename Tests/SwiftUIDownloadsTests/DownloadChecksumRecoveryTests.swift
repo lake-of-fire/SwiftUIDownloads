@@ -1890,6 +1890,103 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
     }
 
+    func testMatchingChecksumMarkerIsReusedUnlessRecheckIsForced() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-marker-recheck-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("payload.bin")
+        let payload = Data("verified-local-payload".utf8)
+        try payload.write(to: destination, options: .atomic)
+        let download = Downloadable(
+            url: URL(string: "https://download-marker.test/\(UUID().uuidString)")!,
+            name: "Cached checksum recheck",
+            localDestination: destination,
+            localDestinationChecksum: sha1Hex(payload)
+        )
+        try download.ensureVerifiedLocalDestinationChecksum()
+
+        // An ignored JSON field makes a rewrite observable without relying on
+        // filesystem timestamp precision or checksum diagnostic logging.
+        let markerURL = download.checksumVerificationMarkerURL
+        var marker = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: markerURL)) as? [String: Any]
+        )
+        marker["cacheReuseSentinel"] = true
+        let cachedMarker = try JSONSerialization.data(withJSONObject: marker, options: .sortedKeys)
+        try cachedMarker.write(to: markerURL, options: .atomic)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+
+        try download.ensureVerifiedLocalDestinationChecksum()
+        XCTAssertEqual(try Data(contentsOf: markerURL), cachedMarker)
+        try download.ensureVerifiedLocalDestinationChecksum(forceRecheck: false)
+        XCTAssertEqual(try Data(contentsOf: markerURL), cachedMarker)
+
+        try download.ensureVerifiedLocalDestinationChecksum(forceRecheck: true)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+        let refreshedMarker = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: markerURL)) as? [String: Any]
+        )
+        XCTAssertNil(refreshedMarker["cacheReuseSentinel"])
+    }
+
+    func testForcedChecksumRecheckRejectsCorruptionWithMatchingMarkerIdentity() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-marker-corruption-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("payload.bin")
+        let payload = Data("verified".utf8)
+        let corruptPayload = Data("tampered".utf8)
+        XCTAssertEqual(payload.count, corruptPayload.count)
+        try payload.write(to: destination, options: .atomic)
+        let fixedModificationDate = Date(timeIntervalSince1970: 1_000_000)
+        try FileManager.default.setAttributes(
+            [.modificationDate: fixedModificationDate], ofItemAtPath: destination.path
+        )
+        let download = Downloadable(
+            url: URL(string: "https://download-marker.test/\(UUID().uuidString)")!,
+            name: "Forced checksum corruption recovery",
+            localDestination: destination,
+            localDestinationChecksum: sha1Hex(payload)
+        )
+        try download.ensureVerifiedLocalDestinationChecksum()
+        let original = try FileManager.default.attributesOfItem(atPath: destination.path)
+        let modificationDate = try XCTUnwrap(original[.modificationDate] as? Date)
+
+        // Preserve the inode, byte count and modification time so the existing
+        // marker remains admissible; forced verification must inspect the bytes.
+        do {
+            let handle = try FileHandle(forWritingTo: destination)
+            defer { try? handle.close() }
+            try handle.write(contentsOf: corruptPayload)
+        }
+        try FileManager.default.setAttributes(
+            [.modificationDate: modificationDate], ofItemAtPath: destination.path
+        )
+        let corrupted = try FileManager.default.attributesOfItem(atPath: destination.path)
+        XCTAssertEqual(corrupted[.size] as? NSNumber, original[.size] as? NSNumber)
+        XCTAssertEqual(corrupted[.modificationDate] as? Date, modificationDate)
+        XCTAssertEqual(corrupted[.systemNumber] as? NSNumber, original[.systemNumber] as? NSNumber)
+        XCTAssertEqual(corrupted[.systemFileNumber] as? NSNumber, original[.systemFileNumber] as? NSNumber)
+        XCTAssertTrue(download.hasVerifiedLocalDestinationChecksumMarker())
+
+        XCTAssertThrowsError(
+            try download.ensureVerifiedLocalDestinationChecksum(forceRecheck: true)
+        ) { error in
+            XCTAssertEqual(
+                error as? DownloadableChecksumVerificationError,
+                .mismatch(expected: sha1Hex(payload), actual: sha1Hex(corruptPayload))
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: download.checksumVerificationMarkerURL.path))
+        XCTAssertFalse(download.hasVerifiedLocalDestinationChecksumMarker())
+        XCTAssertEqual(try Data(contentsOf: destination), corruptPayload)
+        XCTAssertThrowsError(try download.ensureVerifiedLocalDestinationChecksum())
+    }
+
     func testRapidSameSizeReplacementCannotReuseChecksumMarker() throws {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
