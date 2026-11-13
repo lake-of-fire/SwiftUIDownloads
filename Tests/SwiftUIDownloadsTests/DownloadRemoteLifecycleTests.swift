@@ -40,12 +40,15 @@ private final class HangingDownloadURLProtocol: URLProtocol {
 }
 
 private final class ModifiedHEADURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var didStart: (() -> Void)?
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest {
         request
     }
 
     override func startLoading() {
+        Self.didStart?()
         let response = HTTPURLResponse(
             url: request.url!,
             statusCode: 200,
@@ -65,6 +68,41 @@ private final class ModifiedHEADURLProtocol: URLProtocol {
 
     override func stopLoading() {}
 }
+
+private final class HEADRequestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func recordRequest() {
+        lock.lock()
+        defer { lock.unlock() }
+        count += 1
+    }
+
+    var requestCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
+#if DEBUG
+private actor BackgroundHEADDrainGate {
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
+    }
+}
+#endif
 
 private final class UnknownLengthHEADURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -1043,6 +1081,190 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
         }
         XCTAssertNil(validators.0)
         XCTAssertNil(validators.1)
+    }
+
+    func testBackgroundCancellationSettlesRemoteModificationCheck() async throws {
+        let started = expectation(description: "HEAD started")
+        let stopped = expectation(description: "HEAD cancelled by background drain")
+        let settled = expectation(description: "HEAD caller settled")
+        HangingDownloadURLProtocol.didStart = { started.fulfill() }
+        HangingDownloadURLProtocol.didStop = { stopped.fulfill() }
+        defer {
+            HangingDownloadURLProtocol.didStart = nil
+            HangingDownloadURLProtocol.didStop = nil
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingDownloadURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let download = Downloadable(
+            url: URL(string: "https://background-head.test/payload.bin")!,
+            name: "Background HEAD",
+            localDestination: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString).appendingPathComponent("payload.bin")
+        )
+        let check = Task {
+            let result = await controller.checkRemoteModification(for: download)
+            settled.fulfill()
+            return result
+        }
+        await fulfillment(of: [started], timeout: 3)
+        await controller.cancelLongRunningWorkForBackgrounding()
+        await fulfillment(of: [stopped, settled], timeout: 3)
+        // Always release the request even when the pre-fix drain fails to own it.
+        check.cancel()
+        let result = await check.value
+        guard case .unavailable = result else {
+            return XCTFail("A cancelled HEAD must not authorize remote metadata")
+        }
+    }
+
+#if DEBUG
+    func testOldBackgroundDrainPreservesForegroundSuccessorHEAD() async throws {
+        let oldStarted = expectation(description: "old HEAD started")
+        let successorStarted = expectation(description: "foreground successor HEAD started")
+        let captured = expectation(description: "real background helper captured old owners")
+        let oldStopped = expectation(description: "old HEAD physically cancelled")
+        let oldSettled = expectation(description: "old HEAD caller settled")
+        let gate = BackgroundHEADDrainGate()
+        let stops = HEADRequestCounter()
+        HangingDownloadURLProtocol.didStart = { oldStarted.fulfill() }
+        HangingDownloadURLProtocol.didStop = {
+            stops.recordRequest()
+            oldStopped.fulfill()
+        }
+        defer {
+            HangingDownloadURLProtocol.didStart = nil
+            HangingDownloadURLProtocol.didStop = nil
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingDownloadURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        await Task { @DownloadActor in
+            controller.backgroundDrainDidCaptureWork = {
+                captured.fulfill()
+                await gate.wait()
+            }
+        }.value
+        let download = Downloadable(
+            url: URL(string: "https://background-overlap.test/payload.bin")!,
+            name: "Lifecycle overlap HEAD",
+            localDestination: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString).appendingPathComponent("payload.bin")
+        )
+        let oldCheck = Task {
+            let result = await controller.checkRemoteModification(for: download)
+            oldSettled.fulfill()
+            return result
+        }
+        defer { oldCheck.cancel() }
+        await fulfillment(of: [oldStarted], timeout: 3)
+        let background = Task { await controller.cancelLongRunningWorkForBackgrounding() }
+        await fulfillment(of: [captured], timeout: 3)
+
+        // Exercise the actual foreground admission while the old helper holds
+        // its captured owners. Reuse the descriptor to require producer identity.
+        await controller.resumeRecoverableDownloadsAfterForegrounding()
+        HangingDownloadURLProtocol.didStart = { successorStarted.fulfill() }
+        let successor = Task { await controller.checkRemoteModification(for: download) }
+        defer { successor.cancel() }
+        await fulfillment(of: [successorStarted], timeout: 3)
+        await gate.release()
+        await background.value
+        await fulfillment(of: [oldStopped, oldSettled], timeout: 3)
+        let oldResult = await oldCheck.value
+        if case .available = oldResult {
+            XCTFail("The captured old HEAD must drain without freshness authority")
+        }
+        XCTAssertEqual(stops.requestCount, 1, "Only the captured old producer may be cancelled")
+        let remaining = await session.allTasks
+        XCTAssertEqual(remaining.filter {
+            $0.originalRequest?.url == download.url && $0.state == .running
+        }.count, 1, "The foreground successor must survive completion of the old drain")
+
+        let successorStopped = expectation(description: "successor cancelled by its own caller")
+        HangingDownloadURLProtocol.didStop = { successorStopped.fulfill() }
+        successor.cancel()
+        let successorResult = await successor.value
+        if case .available = successorResult {
+            XCTFail("Explicit caller cancellation must still retire its own HEAD")
+        }
+        await fulfillment(of: [successorStopped], timeout: 3)
+    }
+#endif
+
+    func testRemoteModificationCheckWaitsForBackgroundAdmissionToReopen() async throws {
+        let requests = HEADRequestCounter()
+        ModifiedHEADURLProtocol.didStart = { requests.recordRequest() }
+        defer { ModifiedHEADURLProtocol.didStart = nil }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ModifiedHEADURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let download = Downloadable(
+            url: URL(string: "https://background-head.test/payload.bin")!,
+            name: "Suspended HEAD",
+            localDestination: FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString).appendingPathComponent("payload.bin")
+        )
+        await controller.cancelLongRunningWorkForBackgrounding()
+        let suspended = await controller.checkRemoteModification(for: download)
+        if case .available = suspended {
+            XCTFail("A paused controller must not perform a remote freshness check")
+        }
+        XCTAssertEqual(requests.requestCount, 0,
+                       "Paused admission must prevent the network request itself")
+        await controller.resumeRecoverableDownloadsAfterForegrounding()
+        let resumed = await controller.checkRemoteModification(for: download)
+        guard case .available(let modified, _, _) = resumed else {
+            return XCTFail("Reopened admission must permit a fresh HEAD")
+        }
+        XCTAssertTrue(modified)
+        XCTAssertEqual(requests.requestCount, 1)
+    }
+
+    func testCancellingOneRemoteModificationCheckPreservesAnotherCheck() async throws {
+        let started = expectation(description: "both HEAD requests started")
+        started.expectedFulfillmentCount = 2
+        let stopped = expectation(description: "both HEAD requests eventually cancelled")
+        stopped.expectedFulfillmentCount = 2
+        HangingDownloadURLProtocol.didStart = { started.fulfill() }
+        HangingDownloadURLProtocol.didStop = { stopped.fulfill() }
+        defer {
+            HangingDownloadURLProtocol.didStart = nil
+            HangingDownloadURLProtocol.didStop = nil
+        }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingDownloadURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let first = Downloadable(url: URL(string: "https://head-isolation.test/first")!,
+                                 name: "First HEAD", localDestination: directory.appendingPathComponent("first"))
+        let second = Downloadable(url: URL(string: "https://head-isolation.test/second")!,
+                                  name: "Second HEAD", localDestination: directory.appendingPathComponent("second"))
+        let firstCheck = Task { await controller.checkRemoteModification(for: first) }
+        let secondCheck = Task { await controller.checkRemoteModification(for: second) }
+        defer { firstCheck.cancel(); secondCheck.cancel() }
+        await fulfillment(of: [started], timeout: 3)
+
+        firstCheck.cancel()
+        let firstResult = await firstCheck.value
+        if case .available = firstResult { XCTFail("The cancelled caller must not receive freshness authority") }
+        let remaining = await session.allTasks
+        XCTAssertEqual(remaining.filter {
+            $0.originalRequest?.url == second.url && $0.state == .running
+        }.count, 1, "Cancelling one HEAD must preserve another caller's request")
+
+        secondCheck.cancel()
+        let secondResult = await secondCheck.value
+        if case .available = secondResult { XCTFail("The second cancelled caller must not receive freshness authority") }
+        await fulfillment(of: [stopped], timeout: 3)
     }
 
     func testUnavailableHEADDoesNotAdvanceSuccessfulCheckTimestamp() async throws {
