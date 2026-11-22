@@ -209,6 +209,80 @@ private final class SuccessfulGETURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+private final class EffectiveValidatorURLProtocol: URLProtocol {
+    struct Response {
+        let url: URL
+        let headETag: String
+        let headLastModified: String
+        let getStatus: Int
+    }
+
+    private struct Fixture {
+        let response: Response
+        var methods: [String] = []
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var fixtures: [URL: Fixture] = [:]
+    static let downloadedBytes = Data("updated effective resource".utf8)
+
+    static func register(_ response: Response, for requestURL: URL) {
+        lock.withLock { fixtures[requestURL] = Fixture(response: response) }
+    }
+
+    static func unregister(_ requestURL: URL) {
+        lock.withLock { fixtures[requestURL] = nil }
+    }
+
+    static func methods(for requestURL: URL) -> [String] {
+        lock.withLock { fixtures[requestURL]?.methods ?? [] }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let method = request.httpMethod ?? "GET"
+        guard let url = request.url,
+              let response = Self.lock.withLock({
+                  Self.fixtures[url]?.methods.append(method)
+                  return Self.fixtures[url]?.response
+              }), method == "HEAD" || method == "GET" else {
+            client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
+            return
+        }
+        let headers = method == "HEAD"
+            ? ["ETag": response.headETag, "Last-Modified": response.headLastModified]
+            : ["ETag": "\"get-v2\"", "Last-Modified": "Sun, 06 Nov 1994 09:49:37 GMT"]
+        // Exercise admission of a final response URL through URLSession
+        // without relying on a custom URLProtocol redirect callback.
+        guard let httpResponse = HTTPURLResponse(
+            url: response.url, statusCode: method == "HEAD" ? 200 : response.getStatus,
+            httpVersion: "HTTP/1.1", headerFields: headers
+        ) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
+        if method == "GET" {
+            client?.urlProtocol(self, didLoad: Self.downloadedBytes)
+        }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private actor DeletedValidatorSourceImport {
+    private(set) var payloads: [Data] = []
+
+    func hasImported() -> Bool { !payloads.isEmpty }
+
+    func recordImport(from source: URL) throws {
+        payloads.append(try Data(contentsOf: source))
+    }
+}
+
 private actor EmptyCompressedRemoteAttemptExecutor {
     private var invocationCount = 0
 
@@ -837,6 +911,189 @@ final class DownloadRemoteLifecycleTests: XCTestCase {
             UInt64(Data("get-response-payload".utf8).count)
         )
         XCTAssertTrue(download.isReadyForImmediateLocalRead())
+    }
+
+    func testEqualValidatorsFromDifferentEffectiveResourceRequireGET() async throws {
+        let installedURL = try XCTUnwrap(URL(string: "https://old.example.invalid/book"))
+        let responseURL = try XCTUnwrap(URL(string: "https://new.example.invalid/book"))
+        let result = try await checkEffectiveResource(installedURL: installedURL, responseURL: responseURL)
+
+        XCTAssertEqual(result.methods, ["HEAD", "GET"])
+        XCTAssertEqual(result.bytes, EffectiveValidatorURLProtocol.downloadedBytes)
+        XCTAssertEqual(result.receipt.finalResponseURL, responseURL)
+        XCTAssertEqual(result.metadata.lastDownloadedETag, "\"get-v2\"")
+        XCTAssertEqual(result.metadata.lastModifiedAt, Date(timeIntervalSince1970: 784_115_377))
+        XCTAssertNotNil(result.metadata.lastCheckedETagAt)
+        XCTAssertFalse(result.failed)
+    }
+
+    func testEqualValidatorsFromSameEffectiveResourceSkipGETDespiteFragmentChange() async throws {
+        let installedURL = try XCTUnwrap(URL(string: "https://cdn.example.invalid/book?edition=7#download"))
+        let responseURL = try XCTUnwrap(URL(string: "https://cdn.example.invalid/book?edition=7#check"))
+        let result = try await checkEffectiveResource(installedURL: installedURL, responseURL: responseURL)
+
+        XCTAssertEqual(result.methods, ["HEAD"])
+        XCTAssertEqual(result.bytes, Data("installed effective resource".utf8))
+        XCTAssertEqual(result.receipt.finalResponseURL, installedURL)
+        XCTAssertEqual(result.metadata.lastDownloadedETag, "\"shared-v1\"")
+        XCTAssertNotNil(result.metadata.lastCheckedETagAt)
+        XCTAssertFalse(result.failed)
+    }
+
+    func testEqualValidatorsDoNotHideAChangedEffectiveResourceQuery() async throws {
+        let installedURL = try XCTUnwrap(URL(string: "https://cdn.example.invalid/book?edition=7"))
+        let responseURL = try XCTUnwrap(URL(string: "https://cdn.example.invalid/book?edition=8"))
+        let result = try await checkEffectiveResource(installedURL: installedURL, responseURL: responseURL)
+
+        XCTAssertEqual(result.methods, ["HEAD", "GET"])
+        XCTAssertEqual(result.bytes, EffectiveValidatorURLProtocol.downloadedBytes)
+        XCTAssertEqual(result.receipt.finalResponseURL, responseURL)
+        XCTAssertFalse(result.failed)
+    }
+
+    func testFailedGETAfterEffectiveResourceChangesDoesNotAdoptHEADValidators() async throws {
+        let installedURL = try XCTUnwrap(URL(string: "https://old.example.invalid/book"))
+        let responseURL = try XCTUnwrap(URL(string: "https://new.example.invalid/book"))
+        let result = try await checkEffectiveResource(
+            installedURL: installedURL, responseURL: responseURL,
+            headETag: "\"not-installed\"", headLastModified: "Sun, 06 Nov 1994 10:49:37 GMT",
+            getStatus: 404
+        )
+
+        XCTAssertEqual(result.methods, ["HEAD", "GET"])
+        XCTAssertEqual(result.bytes, Data("installed effective resource".utf8))
+        XCTAssertEqual(result.receipt.finalResponseURL, installedURL)
+        XCTAssertEqual(result.metadata.lastDownloadedETag, "\"shared-v1\"")
+        XCTAssertEqual(result.metadata.lastModifiedAt, Date(timeIntervalSince1970: 784_111_777))
+        XCTAssertNil(result.metadata.lastCheckedETagAt)
+        XCTAssertTrue(result.failed)
+    }
+
+    func testAlreadyImportedSourceDoesNotRedownloadWhenItsStableRedirectHasNoRetainedReceipt() async throws {
+        let id = UUID().uuidString
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("deleted-validator-source-" + id, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let destination = root.appendingPathComponent("import.bin")
+        let suiteName = "deleted-validator-source-" + id
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let metadataStore = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults, metadataCacheNamespace: suiteName
+        )
+        let source = try XCTUnwrap(URL(string: "https://subscription.example.invalid/import/" + id))
+        let effectiveURL = try XCTUnwrap(URL(string: "https://cdn.example.invalid/import"))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [EffectiveValidatorURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        EffectiveValidatorURLProtocol.register(.init(
+            url: effectiveURL, headETag: "\"get-v2\"",
+            headLastModified: "Sun, 06 Nov 1994 09:49:37 GMT", getStatus: 200
+        ), for: source)
+        defer {
+            session.invalidateAndCancel()
+            EffectiveValidatorURLProtocol.unregister(source)
+        }
+
+        let importState = DeletedValidatorSourceImport()
+        func makeDownload() -> ImportableDownloadable {
+            ImportableDownloadable(
+                url: source, name: "Deleted source", localDestination: destination,
+                deleteAfterImport: true, metadataStore: metadataStore,
+                isImported: { await importState.hasImported() },
+                importHandler: { file, _ in try await importState.recordImport(from: file) }
+            )
+        }
+
+        let first = makeDownload()
+        let initial = DownloadController(session: session)
+        await initial.download(first)
+        try await first.waitForDownloadMetadataPersistence()
+        XCTAssertEqual(EffectiveValidatorURLProtocol.methods(for: source), ["GET"])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertNil(try metadataStore.installedArtifactReceipt(sourceURL: source, destinationURL: destination))
+        let initialMetadata = metadataStore.loadMetadata(sourceURL: source, destinationURL: destination)
+        XCTAssertEqual(initialMetadata.lastDownloadedETag, "\"get-v2\"")
+        XCTAssertNil(initialMetadata.lastCheckedETagAt)
+
+        let successor = makeDownload()
+        let freshController = DownloadController(session: session)
+        await freshController.ensureDownloaded(download: successor)
+        try await successor.waitForDownloadMetadataPersistence()
+
+        XCTAssertEqual(EffectiveValidatorURLProtocol.methods(for: source), ["GET", "HEAD"])
+        let importedPayloads = await importState.payloads
+        XCTAssertEqual(importedPayloads, [EffectiveValidatorURLProtocol.downloadedBytes])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertNil(try metadataStore.installedArtifactReceipt(sourceURL: source, destinationURL: destination))
+        let refreshedMetadata = metadataStore.loadMetadata(sourceURL: source, destinationURL: destination)
+        XCTAssertNotNil(refreshedMetadata.lastCheckedETagAt)
+    }
+
+    private struct EffectiveResourceCheck {
+        let methods: [String]
+        let bytes: Data
+        let receipt: InstalledArtifactReceipt
+        let metadata: DownloadMetadata
+        let failed: Bool
+    }
+
+    private func checkEffectiveResource(
+        installedURL: URL, responseURL: URL,
+        headETag: String = "\"shared-v1\"",
+        headLastModified: String = "Sun, 06 Nov 1994 08:49:37 GMT",
+        getStatus: Int = 200
+    ) async throws -> EffectiveResourceCheck {
+        let id = UUID().uuidString
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("validator-scope-" + id, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let destination = root.appendingPathComponent("book.bin")
+        try Data("installed effective resource".utf8).write(to: destination)
+
+        let suiteName = "validator-scope-" + id
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let metadataStore = UserDefaultsDownloadableMetadataStore(
+            userDefaults: defaults, metadataCacheNamespace: suiteName
+        )
+        let source = try XCTUnwrap(URL(string: "https://subscription.example.invalid/book/" + id))
+        let download = Downloadable(url: source, name: "Effective resource", localDestination: destination,
+                                    metadataStore: metadataStore)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [EffectiveValidatorURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        EffectiveValidatorURLProtocol.register(.init(
+            url: responseURL, headETag: headETag, headLastModified: headLastModified, getStatus: getStatus
+        ), for: source)
+        defer {
+            session.invalidateAndCancel()
+            EffectiveValidatorURLProtocol.unregister(source)
+        }
+
+        let setup = DownloadController(session: session)
+        await setup.finishDownload(download, etag: "\"shared-v1\"",
+                                   remoteModifiedAt: Date(timeIntervalSince1970: 784_111_777),
+                                   finalResponseURL: installedURL)
+        let initialReceipt = try XCTUnwrap(
+            metadataStore.installedArtifactReceipt(sourceURL: source, destinationURL: destination)
+        )
+        XCTAssertEqual(initialReceipt.finalResponseURL, installedURL)
+
+        let controller = DownloadController(session: session)
+        await controller.ensureDownloaded(download: download)
+        try await download.waitForDownloadMetadataPersistence()
+
+        let receipt = try XCTUnwrap(
+            metadataStore.installedArtifactReceipt(sourceURL: source, destinationURL: destination)
+        )
+        return EffectiveResourceCheck(
+            methods: EffectiveValidatorURLProtocol.methods(for: source),
+            bytes: try Data(contentsOf: destination),
+            receipt: receipt,
+            metadata: metadataStore.loadMetadata(sourceURL: source, destinationURL: destination),
+            failed: await MainActor.run { download.isFailed }
+        )
     }
 
     func testSuccessfulLastModifiedReplacementAdvancesInstalledBaseline()
