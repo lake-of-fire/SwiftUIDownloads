@@ -114,6 +114,11 @@ private func standardizedArtifactSourceURL(_ url: URL) -> URL {
     url.isFileURL ? url.standardizedFileURL : url.standardized
 }
 
+private func downloadValidatorResourceKey(_ url: URL) -> Substring {
+    let absoluteString = url.absoluteString
+    return absoluteString.prefix { $0 != "#" }
+}
+
 private func installedArtifactReceipt(
     _ receipt: InstalledArtifactReceipt,
     matches identity: ChecksumVerificationFileIdentity
@@ -2396,7 +2401,10 @@ extension DownloadController {
             if shouldCheckForUpdates,
                download.lastCheckedETagAt == nil
                 || (download.lastCheckedETagAt ?? Date()).distance(to: Date()) > updateCheckInterval {
-                switch await checkRemoteModification(for: download) {
+                switch await checkRemoteModification(
+                    for: download,
+                    importedWithoutRetainedSource: importedWithoutRetainedSource
+                ) {
                 case let .available(modified, modifiedAt, etag):
                     if !modified {
                         download.lastCheckedETagAt = Date()
@@ -4062,13 +4070,17 @@ extension DownloadController {
 
     @DownloadActor
     func checkRemoteModification(
-        for download: Downloadable
+        for download: Downloadable,
+        importedWithoutRetainedSource: Bool = false
     ) async -> RemoteModificationCheckResult {
         guard !Task.isCancelled, !remoteModificationChecksPaused else { return .unavailable }
         let generation = remoteModificationGeneration
         let id = UUID()
         let task = Task { @DownloadActor in
-            await self.performRemoteModificationCheck(for: download)
+            await self.performRemoteModificationCheck(
+                for: download,
+                importedWithoutRetainedSource: importedWithoutRetainedSource
+            )
         }
         remoteModificationTasks[id] = (download.id, task)
         defer { remoteModificationTasks[id] = nil }
@@ -4084,7 +4096,8 @@ extension DownloadController {
 
     @DownloadActor
     private func performRemoteModificationCheck(
-        for download: Downloadable
+        for download: Downloadable,
+        importedWithoutRetainedSource: Bool
     ) async -> RemoteModificationCheckResult {
         await download.waitForDownloadMetadata()
         guard !Task.isCancelled, !remoteModificationChecksPaused else { return .unavailable }
@@ -4093,7 +4106,8 @@ extension DownloadController {
         do {
             let (_, response) = try await session.data(for: request)
             guard let httpURLResponse = response as? HTTPURLResponse,
-                  httpURLResponse.statusCode == 200 else {
+                  httpURLResponse.statusCode == 200,
+                  let responseURL = httpURLResponse.url else {
                 return .unavailable
             }
 
@@ -4104,12 +4118,32 @@ extension DownloadController {
             let localModificationDate = (try? download.localDestination.resourceValues(
                 forKeys: [.contentModificationDateKey]
             ).contentModificationDate) ?? nil
-            let metadataBaseline = await MainActor.run {
-                download.lastModifiedAt ?? download.lastDownloaded
+            let (metadataBaseline, lastDownloadedETag) = await MainActor.run {
+                (download.lastModifiedAt ?? download.lastDownloaded, download.lastDownloadedETag)
             }
             let baseline = metadataBaseline ?? localModificationDate ?? Date(timeIntervalSince1970: 0)
-            let lastDownloadedETag = await MainActor.run {
-                download.lastDownloadedETag
+
+            // Validators belong to the effective resource that supplied the
+            // installed bytes, even when the original request URL stays fixed.
+            let requestedSourceURL = standardizedArtifactSourceURL(download.url)
+            let receipt = try download.metadataStore.installedArtifactReceipt(
+                sourceURL: download.url,
+                destinationURL: download.localDestination
+            )
+            if let receipt,
+               receipt.schemaVersion != InstalledArtifactReceipt.currentSchemaVersion
+                    || receipt.requestedSourceURL != requestedSourceURL
+                    || receipt.destinationURL != download.localDestination.standardizedFileURL {
+                return .available(modified: true, modifiedAt: nil, etag: nil)
+            }
+            // A verified import that deletes its source has no installed
+            // receipt. Keep its existing validator behavior when no scope survived.
+            if receipt != nil || !importedWithoutRetainedSource {
+                let installedResourceURL = receipt?.finalResponseURL ?? requestedSourceURL
+                guard downloadValidatorResourceKey(responseURL)
+                    == downloadValidatorResourceKey(installedResourceURL) else {
+                    return .available(modified: true, modifiedAt: nil, etag: nil)
+                }
             }
 
             if let remoteModifiedAt, remoteModifiedAt > baseline {
