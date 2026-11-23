@@ -103,4 +103,30 @@ final class DownloadProgressMetricsTests: XCTestCase {
         XCTAssertEqual(DownloadProgressMetrics.statusText(for: progress), "0.0MB of 0.0MB")
     }
 
+    func testCompactTransferStaysIndeterminateUntilTheTotalIsKnown() {
+        let unknown = downloadTransferProgress(expectedByteCount: -1, receivedByteCount: 1_500_000)
+        let known = downloadTransferProgress(expectedByteCount: 4_000_000, receivedByteCount: 1_500_000)
+
+        XCTAssertNil(DownloadProgressMetrics.determinateFraction(for: .uninitiated))
+        XCTAssertNil(DownloadProgressMetrics.determinateFraction(for: .waitingForResponse))
+        XCTAssertNil(DownloadProgressMetrics.determinateFraction(for: .downloading(progress: unknown)))
+        XCTAssertEqual(
+            DownloadProgressMetrics.determinateFraction(for: .downloading(progress: known)),
+            0.375
+        )
+    }
+
+    func testCompactTerminalTransferKeepsExistingFractions() {
+        let destination = URL(fileURLWithPath: "/downloaded.epub")
+        let success = URLResourceDownloadTaskProgress.completed(
+            destinationLocation: destination, etag: nil, error: nil
+        )
+        let failure = URLResourceDownloadTaskProgress.completed(
+            destinationLocation: nil, etag: nil, error: URLError(.cancelled)
+        )
+
+        XCTAssertEqual(DownloadProgressMetrics.determinateFraction(for: success), 1)
+        XCTAssertEqual(DownloadProgressMetrics.determinateFraction(for: failure), 0)
+    }
+
 }

@@ -21,6 +21,17 @@ enum DownloadProgressMetrics {
         return progress.fractionCompleted
     }
 
+    static func determinateFraction(for transfer: URLResourceDownloadTaskProgress) -> Double? {
+        switch transfer {
+        case .uninitiated, .waitingForResponse:
+            return nil
+        case .downloading(let progress):
+            return determinateFraction(for: progress)
+        case .completed:
+            return transfer.fractionCompleted
+        }
+    }
+
     static func statusText(for progress: Progress) -> String {
         let completedCount = progress.completedUnitCount
         let completed = megabytes(completedCount)
