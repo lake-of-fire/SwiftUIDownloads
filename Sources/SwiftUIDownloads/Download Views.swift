@@ -72,7 +72,10 @@ public struct DownloadProgress: View {
         }
         switch download.downloadProgress {
         case .downloading(let progress):
-            return .determinate(progress.fractionCompleted)
+            if let fraction = DownloadProgressMetrics.determinateFraction(for: progress) {
+                return .determinate(fraction)
+            }
+            return .indeterminate
         case .completed(let destinationLocation, _, let error):
             guard destinationLocation != nil, error == nil else { return .none }
             if let importable = download as? ImportableDownloadable,

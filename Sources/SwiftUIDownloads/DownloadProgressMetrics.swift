@@ -6,20 +6,30 @@ enum DownloadProgressMetrics {
         completedUnitCount: Int64
     ) -> UInt64? {
         guard totalUnitCount >= 0 else { return nil }
-        // The hardened URLSession adapter clamps Foundation's unknown -1
-        // total to zero so Progress remains well-behaved. Once bytes arrive,
-        // zero cannot describe the whole response and remains unknown.
+        // A zero total cannot describe a transfer that has already delivered bytes.
         if totalUnitCount == 0, completedUnitCount > 0 {
             return nil
         }
         return UInt64(totalUnitCount)
     }
 
+    static func determinateFraction(for progress: Progress) -> Double? {
+        guard knownByteCount(
+            totalUnitCount: progress.totalUnitCount,
+            completedUnitCount: progress.completedUnitCount
+        ) != nil else { return nil }
+        return progress.fractionCompleted
+    }
+
     static func statusText(for progress: Progress) -> String {
-        let completed = megabytes(progress.completedUnitCount)
+        let completedCount = progress.completedUnitCount
+        let completed = megabytes(completedCount)
         var text: String
-        if progress.totalUnitCount >= 0 {
-            text = completed + "MB of " + megabytes(progress.totalUnitCount) + "MB"
+        if let knownTotal = knownByteCount(
+            totalUnitCount: progress.totalUnitCount,
+            completedUnitCount: completedCount
+        ) {
+            text = completed + "MB of " + megabytes(Int64(knownTotal)) + "MB"
         } else {
             text = completed + "MB downloaded"
         }
