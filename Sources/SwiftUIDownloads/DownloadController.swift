@@ -3315,30 +3315,29 @@ extension DownloadController {
                 } else {
                     false
                 }
-                var completionReceipt: InstalledArtifactReceipt?
-                if !importDeletedSource {
-                    if let pendingReceipt = pendingInstalledArtifactReceipts[receiptKey] {
-                        guard download.installedArtifactMatches(pendingReceipt.receipt) else {
-                            throw InstalledArtifactReceiptValidationError
-                                .missingOrInvalid(download.localDestination)
-                        }
-                        try download.persistInstalledArtifactReceipt(
-                            pendingReceipt.receipt
-                        )
-                        completionReceipt = pendingReceipt.receipt
-                    } else {
-                        guard let receipt = download.validInstalledArtifactReceipt() else {
-                            throw InstalledArtifactReceiptValidationError
-                                .missingOrInvalid(download.localDestination)
-                        }
-                        completionReceipt = receipt
+                let completionReceipt: InstalledArtifactReceipt?
+                if importDeletedSource {
+                    completionReceipt = nil
+                } else if let pendingReceipt = pendingInstalledArtifactReceipts[receiptKey] {
+                    guard download.installedArtifactMatches(pendingReceipt.receipt) else {
+                        throw InstalledArtifactReceiptValidationError
+                            .missingOrInvalid(download.localDestination)
                     }
+                    try download.persistInstalledArtifactReceipt(pendingReceipt.receipt)
+                    completionReceipt = pendingReceipt.receipt
+                } else {
+                    guard let receipt = download.validInstalledArtifactReceipt() else {
+                        throw InstalledArtifactReceiptValidationError
+                            .missingOrInvalid(download.localDestination)
+                    }
+                    completionReceipt = receipt
                 }
                 let metadata = download.cachedDownloadMetadata
                 let successfulMetadata = pendingInstalledArtifactReceipts[
                     receiptKey
                 ]?.successfulDownloadMetadata
-                await MainActor.run {
+                try await MainActor.run {
+                    try self.requireCompletionAdmission(download, requiringInstalledArtifact: completionReceipt)
                     if let successfulMetadata {
                         download.lastDownloadedETag = successfulMetadata.etag
                         download.lastDownloaded = successfulMetadata.downloadedAt
