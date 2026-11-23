@@ -17,6 +17,7 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
     private let firstSaveMayFinish = DispatchSemaphore(value: 0)
     private let pausesBulkLoad: Bool
     private let pausesFirstSave: Bool
+    private let didSaveReceipt: (@Sendable (Int) -> Void)?
     private var remainingSaveFailures: Int
     private var remainingReceiptSaveFailures: Int
     private var installedArtifactReceipts: [String: InstalledArtifactReceipt] = [:]
@@ -31,12 +32,14 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
         pausesBulkLoad: Bool = false,
         pausesFirstSave: Bool = false,
         saveFailureCount: Int = 0,
-        receiptSaveFailureCount: Int = 0
+        receiptSaveFailureCount: Int = 0,
+        didSaveReceipt: (@Sendable (Int) -> Void)? = nil
     ) {
         self.metadata = metadata
         self.failsBulkLoad = failsBulkLoad
         self.pausesBulkLoad = pausesBulkLoad
         self.pausesFirstSave = pausesFirstSave
+        self.didSaveReceipt = didSaveReceipt
         self.remainingSaveFailures = saveFailureCount
         self.remainingReceiptSaveFailures = receiptSaveFailureCount
     }
@@ -114,7 +117,7 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
         sourceURL: URL,
         destinationURL: URL
     ) throws {
-        try withLock {
+        let saveCount = try withLock {
             receiptSaveCount += 1
             if remainingReceiptSaveFailures > 0 {
                 remainingReceiptSaveFailures -= 1
@@ -124,7 +127,9 @@ private final class RecordingDownloadMetadataStore: DownloadableMetadataStore, @
                 sourceURL: sourceURL,
                 destinationURL: destinationURL
             )] = receipt
+            return receiptSaveCount
         }
+        didSaveReceipt?(saveCount)
     }
 
     func removeInstalledArtifactReceipt(
@@ -495,6 +500,112 @@ final class DownloadMetadataCacheTests: XCTestCase {
         )
         let retriedImportCount = await importInvocations.count
         XCTAssertEqual(retriedImportCount, 1)
+    }
+
+    @MainActor
+    func testCancelledReceiptPersistenceRetryCannotAdvanceDownloadMetadata() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swiftui-downloads-cancelled-receipt-retry-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let destination = directory.appendingPathComponent("downloaded.txt")
+        let payload = Data("installed artifact".utf8)
+        try payload.write(to: destination)
+        let baseline = DownloadMetadata(
+            lastDownloadedETag: "installed-etag",
+            lastCheckedETagAt: Date(timeIntervalSince1970: 100),
+            lastDownloadedAt: Date(timeIntervalSince1970: 200),
+            lastModifiedAt: Date(timeIntervalSince1970: 300)
+        )
+        let store = RecordingDownloadMetadataStore(
+            metadata: baseline,
+            receiptSaveFailureCount: 1,
+            didSaveReceipt: { attempt in
+                // The retry has accepted the retained input and stored its receipt.
+                // Retire the real processing task before its MainActor metadata write.
+                if attempt == 2 { withUnsafeCurrentTask { $0?.cancel() } }
+            }
+        )
+        let importInvocations = ImportInvocationRecorder()
+        let download = ImportableDownloadable(
+            url: URL(string: "https://example.com/cancelled-receipt-retry.txt")!,
+            name: "Cancelled receipt retry",
+            localDestination: destination,
+            deleteAfterImport: false,
+            metadataStore: store,
+            isImported: { await importInvocations.count > 0 },
+            importHandler: { url, _ in
+                _ = try Data(contentsOf: url)
+                await importInvocations.recordInvocation()
+            }
+        )
+        download.shouldCheckForUpdates = false
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(session: session)
+        let candidateModifiedAt = Date(timeIntervalSince1970: 500)
+
+        await controller.finishDownload(
+            download,
+            etag: "candidate-etag",
+            remoteModifiedAt: candidateModifiedAt,
+            updatesRemoteModifiedAt: true
+        )
+        XCTAssertTrue(download.isFailed)
+        XCTAssertEqual(store.receiptSaveCount, 1)
+        XCTAssertEqual(store.saveCount, 0)
+
+        await controller.ensureDownloaded(download: download)
+        try await download.waitForDownloadMetadataPersistence()
+
+        XCTAssertEqual(store.receiptSaveCount, 2)
+        XCTAssertEqual(store.saveCount, 0, "A cancelled retry must not queue metadata persistence")
+        XCTAssertEqual(download.cachedDownloadMetadata, baseline)
+        XCTAssertEqual(store.storedMetadata, baseline)
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        let retainedReceipt = try XCTUnwrap(store.installedArtifactReceipt(
+            sourceURL: download.url,
+            destinationURL: destination
+        ))
+        XCTAssertTrue(download.installedArtifactMatches(retainedReceipt))
+        XCTAssertTrue(download.isFailed)
+        XCTAssertFalse(download.isFinishedProcessing)
+        XCTAssertFalse(controller.finishedDownloads.contains(download))
+        guard case let .completed(_, _, error) = download.downloadProgress else {
+            return XCTFail("The cancelled persistence retry must publish terminal cancellation")
+        }
+        XCTAssertTrue(error is CancellationError)
+
+        await controller.ensureDownloaded(download: download)
+
+        XCTAssertEqual(store.receiptSaveCount, 3)
+        XCTAssertGreaterThan(store.saveCount, 0)
+        XCTAssertFalse(download.isFailed)
+        XCTAssertTrue(download.isFinishedProcessing)
+        XCTAssertTrue(controller.finishedDownloads.contains(download))
+        XCTAssertFalse(controller.failedDownloads.contains(download))
+        guard case let .completed(location, etag, retryError) = download.downloadProgress else {
+            return XCTFail("The fresh retry must replace cancellation with terminal success")
+        }
+        XCTAssertEqual(location, destination)
+        XCTAssertEqual(etag, "candidate-etag")
+        XCTAssertNil(retryError)
+        let published = store.storedMetadata
+        XCTAssertEqual(published.lastDownloadedETag, "candidate-etag")
+        XCTAssertEqual(published.lastModifiedAt, candidateModifiedAt)
+        XCTAssertNotNil(published.lastDownloadedAt)
+        XCTAssertNotNil(published.lastCheckedETagAt)
+        XCTAssertNotEqual(published.lastDownloadedAt, baseline.lastDownloadedAt)
+        XCTAssertNotEqual(published.lastCheckedETagAt, baseline.lastCheckedETagAt)
+        XCTAssertEqual(download.cachedDownloadMetadata, published)
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+        XCTAssertEqual(try store.installedArtifactReceipt(
+            sourceURL: download.url,
+            destinationURL: destination
+        ), retainedReceipt)
+        let importCount = await importInvocations.count
+        XCTAssertEqual(importCount, 1, "Metadata retries must not reimport retained bytes")
     }
 
     @MainActor
