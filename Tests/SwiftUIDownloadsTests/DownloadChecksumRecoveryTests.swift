@@ -403,8 +403,20 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
     }
 
     @MainActor
+    func testCancelledCompletionFileSizeObserverCannotAdvanceDownloadMetadata() async throws {
+        try await exerciseFinalFileSizeAdmission(
+            ordinaryCompletion: true, replacesArtifact: false, recordSuccessfulDownload: true)
+    }
+
+    @MainActor
+    func testReplacementDuringCompletionFileSizeObservationCannotAdvanceDownloadMetadata() async throws {
+        try await exerciseFinalFileSizeAdmission(
+            ordinaryCompletion: true, replacesArtifact: true, recordSuccessfulDownload: true)
+    }
+
+    @MainActor
     private func exerciseFinalFileSizeAdmission(
-        ordinaryCompletion: Bool, replacesArtifact: Bool
+        ordinaryCompletion: Bool, replacesArtifact: Bool, recordSuccessfulDownload: Bool = false
     ) async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("final-completion-admission-\(UUID().uuidString)", isDirectory: true)
@@ -428,9 +440,15 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
             isImported: { true },
             importHandler: { _, _ in await imports.recordImport() })
         await download.waitForDownloadMetadata()
-        let baselineDate = Date(timeIntervalSince1970: 123)
-        download.lastDownloaded = baselineDate
-        download.lastDownloadedETag = "installed-etag"
+        let baselineMetadata = DownloadMetadata(
+            lastDownloadedETag: "installed-etag",
+            lastCheckedETagAt: Date(timeIntervalSince1970: 130),
+            lastDownloadedAt: Date(timeIntervalSince1970: 123),
+            lastModifiedAt: Date(timeIntervalSince1970: 120))
+        download.lastDownloaded = baselineMetadata.lastDownloadedAt
+        download.lastDownloadedETag = baselineMetadata.lastDownloadedETag
+        download.lastModifiedAt = baselineMetadata.lastModifiedAt
+        download.lastCheckedETagAt = baselineMetadata.lastCheckedETagAt
         download.shouldCheckForUpdates = false
         try await download.waitForDownloadMetadataPersistence()
         let receipt = try download.makeInstalledArtifactReceipt(finalResponseURL: source)
@@ -462,7 +480,12 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         let settled = expectation(description: "Final completion admission settles")
         operation = Task {
             defer { settled.fulfill() }
-            await controller.finishDownload(download, recordSuccessfulDownload: false)
+            await controller.finishDownload(
+                download,
+                etag: recordSuccessfulDownload ? "candidate-etag" : nil,
+                remoteModifiedAt: recordSuccessfulDownload ? Date(timeIntervalSince1970: 456) : nil,
+                updatesRemoteModifiedAt: recordSuccessfulDownload,
+                recordSuccessfulDownload: recordSuccessfulDownload)
         }
         let completion = await XCTWaiter.fulfillment(of: [settled], timeout: 5)
         if completion != .completed {
@@ -484,11 +507,9 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertFalse(download.isFinishedDownloading)
         XCTAssertFalse(controller.finishedDownloads.contains(download))
         XCTAssertTrue(controller.failedDownloads.contains(download))
-        XCTAssertEqual(download.lastDownloaded, baselineDate)
-        XCTAssertEqual(download.lastDownloadedETag, "installed-etag")
-        let persisted = store.loadMetadata(sourceURL: source, destinationURL: destination)
-        XCTAssertEqual(persisted.lastDownloadedAt, baselineDate)
-        XCTAssertEqual(persisted.lastDownloadedETag, "installed-etag")
+        try await download.waitForDownloadMetadataPersistence()
+        XCTAssertEqual(download.cachedDownloadMetadata, baselineMetadata)
+        XCTAssertEqual(store.loadMetadata(sourceURL: source, destinationURL: destination), baselineMetadata)
 
         if replacesArtifact {
             // Atomic replacement gives the second artifact its own inode. The
@@ -532,6 +553,9 @@ final class DownloadChecksumRecoveryTests: XCTestCase {
         XCTAssertTrue(controller.finishedDownloads.contains(download))
         XCTAssertFalse(controller.failedDownloads.contains(download))
         XCTAssertEqual(try Data(contentsOf: destination), payload)
+        try await download.waitForDownloadMetadataPersistence()
+        XCTAssertEqual(download.cachedDownloadMetadata, baselineMetadata)
+        XCTAssertEqual(store.loadMetadata(sourceURL: source, destinationURL: destination), baselineMetadata)
         XCTAssertEqual(RetryOwnershipURLProtocol.requests.count(for: source), 0)
         let importsAfterRetry = await imports.value()
         XCTAssertEqual(importsAfterRetry, ordinaryCompletion ? 2 : 0,

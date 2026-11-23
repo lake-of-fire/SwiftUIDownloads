@@ -3765,10 +3765,13 @@ extension DownloadController {
             let successfulMetadata = pendingInstalledArtifactReceipts[
                 receiptKey
             ]?.successfulDownloadMetadata
-            await MainActor.run {
+            try await MainActor.run {
                 download.fileSize = UInt64(fileSize)
+                // File-size observers can cancel this attempt or replace its file.
+                try self.requireCompletionAdmission(download, requiringInstalledArtifact: completionReceipt)
 
-                // This timestamp is queued as the baseline for Last-Modified                // comparisons, so advance it only after the downloaded bytes
+                // This timestamp is queued as the baseline for Last-Modified
+                // comparisons, so advance it only after the downloaded bytes
                 // have decompressed, verified, and imported successfully. A
                 // failed replacement may deliberately preserve the prior
                 // usable destination and must not make that older artifact
@@ -3968,13 +3971,12 @@ extension DownloadController {
     }
 
     @MainActor
-    private func publishSuccessfulCompletion(
+    private func requireCompletionAdmission(
         _ download: Downloadable,
-        requiringInstalledArtifact receipt: InstalledArtifactReceipt? = nil
+        requiringInstalledArtifact receipt: InstalledArtifactReceipt?
     ) throws {
-        // Every caller, including ordinary completion, can be cancelled while
-        // waiting for MainActor. Admit success here, immediately before its
-        // synchronous effects, so the existing processing owner settles rejection.
+        // Check cancellation and artifact ownership after crossing to MainActor
+        // and immediately before publishing validators or completion.
         try Task.checkCancellation()
         if let receipt {
             let identity = ChecksumVerificationFileIdentity(
@@ -3994,6 +3996,14 @@ extension DownloadController {
         }
         // A concurrent caller may cancel while the synchronous stat runs.
         try Task.checkCancellation()
+    }
+
+    @MainActor
+    private func publishSuccessfulCompletion(
+        _ download: Downloadable,
+        requiringInstalledArtifact receipt: InstalledArtifactReceipt? = nil
+    ) throws {
+        try requireCompletionAdmission(download, requiringInstalledArtifact: receipt)
         failedDownloads.remove(download)
         activeDownloads.remove(download)
         finishedDownloads.insert(download)
