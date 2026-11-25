@@ -2723,20 +2723,38 @@ extension DownloadController {
     
     @MainActor
     public func cancelInProgressDownload(_ download: Downloadable) async {
+        await cancelExactDownload(download) { [session] in await session.allTasks }
+    }
+
+    @DownloadActor
+    func cancelExactDownload(
+        _ download: Downloadable,
+        sessionTasks: @Sendable () async -> [URLSessionTask]
+    ) async {
+        let key = download.id
+        let owner = admittedDownloads[key]
         switch await admit(download, registeringIfNeeded: false) {
         case .owner, .compatibleReplay:
             break
         case .rejected:
             return
         }
-        let allTasks = await session.allTasks
-        let matchingTasks = allTasks.filter {
-            $0.taskDescription == download.id.taskDescription
-        }
-        for task in matchingTasks {
+        guard admittedDownloads[key] === owner else { return }
+
+        // An owned producer cancels its native transfer through its existing
+        // cancellation handler. Retire it before any session enumeration can
+        // suspend and let another producer take the same operation key.
+        let hasOwnedWork = currentWork(for: key) != nil
+        cancelOwnedDownloadWork(matching: key)
+        if hasOwnedWork { return }
+
+        // Retain cancellation of matching session tasks with no logical owner.
+        // A successor established during enumeration owns its own transport.
+        let tasks = await sessionTasks()
+        guard admittedDownloads[key] === owner, currentWork(for: key) == nil else { return }
+        for task in tasks where task.taskDescription == key.taskDescription {
             task.cancel()
         }
-        await cancelOwnedDownloadWork(matching: download.id)
     }
 
     /// Cancels every operation whose canonical source URL matches `sourceURL`,
