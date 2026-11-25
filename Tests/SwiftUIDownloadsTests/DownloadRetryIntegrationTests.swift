@@ -590,6 +590,53 @@ final class DownloadRetryIntegrationTests: XCTestCase {
         XCTAssertTrue(state.2)
     }
 
+    func testSuspendedExactCancellationCannotRetireAReplacementDownload() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-stale-cancel-" + UUID().uuidString, isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = URL(string: "https://download-stale-cancel.test/book")!
+        let destination = directory.appendingPathComponent("payload.bin")
+        let original = Downloadable(url: source, name: "Original", localDestination: destination)
+        let replacement = Downloadable(url: source, name: "Replacement", localDestination: destination)
+        let enumerating = expectation(description: "Original cancellation reached session enumeration")
+        let transferStarted = expectation(description: "Replacement owns the active transfer")
+        let enumerationGate = DownloadAttemptReleaseGate()
+        let transferGate = DownloadAttemptReleaseGate()
+        let payload = Data("replacement".utf8)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let controller = DownloadController(
+            session: session,
+            attemptExecutor: { download, _ in
+                transferStarted.fulfill()
+                await transferGate.wait()
+                try Task.checkCancellation()
+                let candidate = download.localDestination.appendingPathExtension("downloading.test")
+                try payload.write(to: candidate)
+                return DownloadTransferResult(destinationLocation: candidate, etag: nil, lastModified: nil)
+            }
+        )
+
+        let cancellation = Task {
+            await controller.cancelExactDownload(original) {
+                enumerating.fulfill()
+                await enumerationGate.wait()
+                return []
+            }
+        }
+        await fulfillment(of: [enumerating], timeout: 2)
+        let transfer = Task { await controller.download(replacement) }
+        await fulfillment(of: [transferStarted], timeout: 2)
+        await enumerationGate.release()
+        await cancellation.value
+        await transferGate.release()
+        await transfer.value
+
+        XCTAssertEqual(try Data(contentsOf: destination), payload)
+    }
+
     func testScopedCancellationDuringRetryBackoffStopsLogicalOperationAndAllowsFreshDownload() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("download-backoff-cancel-\(UUID().uuidString)", isDirectory: true)
