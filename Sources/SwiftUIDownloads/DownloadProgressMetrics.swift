@@ -15,11 +15,33 @@ enum DownloadProgressMetrics {
         return UInt64(totalUnitCount)
     }
 
+    static func determinateFraction(for progress: Progress) -> Double? {
+        guard knownByteCount(
+            totalUnitCount: progress.totalUnitCount,
+            completedUnitCount: progress.completedUnitCount
+        ) != nil else { return nil }
+        return progress.fractionCompleted
+    }
+
+    static func determinateFraction(for transfer: URLResourceDownloadTaskProgress) -> Double? {
+        switch transfer {
+        case .uninitiated, .waitingForResponse:
+            return nil
+        case .downloading(let progress):
+            return determinateFraction(for: progress)
+        case .completed:
+            return transfer.fractionCompleted
+        }
+    }
+
     static func statusText(for progress: Progress) -> String {
         let completed = megabytes(progress.completedUnitCount)
         var text: String
-        if progress.totalUnitCount >= 0 {
-            text = completed + "MB of " + megabytes(progress.totalUnitCount) + "MB"
+        if let knownTotal = knownByteCount(
+            totalUnitCount: progress.totalUnitCount,
+            completedUnitCount: progress.completedUnitCount
+        ) {
+            text = completed + "MB of " + megabytes(Int64(knownTotal)) + "MB"
         } else {
             text = completed + "MB downloaded"
         }
