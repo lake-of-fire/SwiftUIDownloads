@@ -22,12 +22,7 @@ public struct DownloadProgress: View {
         }
         switch download.downloadProgress {
         case .downloading(let progress):
-            var str = "\(round((Double(progress.completedUnitCount) / 1_000_000) * 10) / 10)MB of \(round((Double(progress.totalUnitCount) / 1_000_000) * 10) / 10)MB"
-//              TODO: print("File size = " + ByteCountFormatter().string(fromByteCount: Int64(fileSize)))
-            if let throughput = progress.throughput {
-                str += " at \(round((Double(throughput) / 1_000_000) * 10) / 10)MB/s"
-            }
-            return str
+            return DownloadProgressMetrics.statusText(for: progress)
         case .waitingForResponse:
             return "Waiting for response from server…"
         case .completed(let destinationLocation, _, let error):
@@ -77,7 +72,10 @@ public struct DownloadProgress: View {
         }
         switch download.downloadProgress {
         case .downloading(let progress):
-            return .determinate(progress.fractionCompleted)
+            if let fraction = DownloadProgressMetrics.determinateFraction(for: progress) {
+                return .determinate(fraction)
+            }
+            return .indeterminate
         case .completed(let destinationLocation, _, let error):
             guard destinationLocation != nil, error == nil else { return .none }
             if let importable = download as? ImportableDownloadable,
@@ -290,7 +288,12 @@ public struct DownloadProgressView: View {
     }
 
     public var body: some View {
-        InnerDownloadProgressView(size: size, url: downloadable.url, fractionCompleted: downloadable.fractionCompleted, downloadURLs: $downloadURLs)
+        InnerDownloadProgressView(
+            size: size,
+            url: downloadable.url,
+            fractionCompleted: DownloadProgressMetrics.determinateFraction(for: downloadable.downloadProgress),
+            downloadURLs: $downloadURLs
+        )
     }
 }
 
@@ -397,7 +400,7 @@ public struct FailureMessagesButton: View {
 struct InnerDownloadProgressView: View {
     let size: CGFloat // Size parameter for circle, path, and stop image
     let url: URL
-    let fractionCompleted: Double
+    let fractionCompleted: Double?
     @Binding var downloadURLs: [String]
 
     public var body: some View {
@@ -410,25 +413,32 @@ struct InnerDownloadProgressView: View {
             ZStack {
                 Color.init(white: 1, opacity: 0.00000000001) // Clickability
                 
-                let radius = size / 2 - size / 20
-                Path { path in
-                    path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: Angle(degrees: 0), endAngle: Angle(degrees: 360), clockwise: false)
-                }
-                .stroke(style: StrokeStyle(lineWidth: size / 7, lineCap: .round, lineJoin: .round))
-                .foregroundColor(.gray)
-                .opacity(0.5)
-                .frame(width: size, height: size) // Use the size parameter
+                if let fractionCompleted {
+                    let radius = size / 2 - size / 20
+                    Path { path in
+                        path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: Angle(degrees: 0), endAngle: Angle(degrees: 360), clockwise: false)
+                    }
+                    .stroke(style: StrokeStyle(lineWidth: size / 7, lineCap: .round, lineJoin: .round))
+                    .foregroundColor(.gray)
+                    .opacity(0.5)
+                    .frame(width: size, height: size) // Use the size parameter
 
-                Path { path in
-                    let startAngle = Angle(degrees: 0)
-                    let endAngle = Angle(degrees: Double(360 * min(fractionCompleted, 1.0)))
-                    path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
+                    Path { path in
+                        let startAngle = Angle(degrees: 0)
+                        let endAngle = Angle(degrees: Double(360 * min(fractionCompleted, 1.0)))
+                        path.addArc(center: CGPoint(x: size / 2, y: size / 2), radius: radius, startAngle: startAngle, endAngle: endAngle, clockwise: false)
+                    }
+                    .stroke(style: StrokeStyle(lineWidth: size / 7, lineCap: .round, lineJoin: .round))
+                    .foregroundColor(.accentColor)
+                    .frame(width: size, height: size) // Use the size parameter
+                    .rotationEffect(Angle(degrees: -90))
+                    .animation(.linear, value: fractionCompleted)
+                } else {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.small)
+                        .allowsHitTesting(false)
                 }
-                .stroke(style: StrokeStyle(lineWidth: size / 7, lineCap: .round, lineJoin: .round))
-                .foregroundColor(.accentColor)
-                .frame(width: size, height: size) // Use the size parameter
-                .rotationEffect(Angle(degrees: -90))
-                .animation(.linear, value: fractionCompleted)
 
 //                Image(systemName: "stop.fill")
 //                    .resizable()
