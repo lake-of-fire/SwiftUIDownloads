@@ -622,7 +622,10 @@ public class Downloadable: ObservableObject, Identifiable, Hashable, @unchecked 
                     //                isActive = false
                     //                isFailed = false
                 case .downloading(let progress):
-                    fileSize = UInt64(progress.totalUnitCount)
+                    fileSize = DownloadProgressMetrics.knownByteCount(
+                        totalUnitCount: progress.totalUnitCount,
+                        completedUnitCount: progress.completedUnitCount
+                    )
                     if !progress.isFinished, !progress.isCancelled {
                         isFailed = false
                         isActive = true
